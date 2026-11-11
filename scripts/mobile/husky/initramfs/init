@@ -169,20 +169,14 @@ AllowHibernation=no
 AllowSuspendThenHibernate=no
 AllowHybridSleep=no
 EOF
-# The login screen runs its own settings daemon on GDM's dconf profile.
+# The login screen runs its own settings daemon on GDM's dconf profile: it
+# gets Luma's shared handheld login-screen defaults, where the Fairphone
+# package installs them.
+greeter_dst=/sysroot/etc/dconf/db/gdm.d/10-luma-handheld
 mkdir -p /sysroot/etc/dconf/db/gdm.d
-cat > /sysroot/etc/dconf/db/gdm.d/10-luma-husky-power <<'EOF'
-# Luma husky: the login screen must not suspend on the power key.
-[org/gnome/settings-daemon/plugins/power]
-power-button-action='nothing'
-sleep-inactive-ac-type='nothing'
-sleep-inactive-battery-type='nothing'
-
-# The Shell's greeter power button (Luma patch 0335) blanks and wakes; without
-# this gsd-media-keys wins the boot-time race for XF86PowerOff.
-[org/gnome/settings-daemon/plugins/media-keys]
-power-static=@as []
-EOF
+cmp -s /luma/handheld/luma-greeter-handheld.dconf "$greeter_dst" ||
+	cp /luma/handheld/luma-greeter-handheld.dconf "$greeter_dst" ||
+	say "could not install the login screen's handheld defaults"
 echo LUMA_DEVICE_CLASS=handheld > /run/environment.d/90-luma-handheld.conf
 # Panel outline (rounded corners, camera) for the Shell. A device package
 # would ship it as /usr/share/luma/display-geometry.json; until there is one
