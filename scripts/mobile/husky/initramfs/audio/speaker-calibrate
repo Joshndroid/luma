@@ -1,0 +1,212 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: Apache-2.0
+"""Luma husky: arm the CS35L41 speaker protection with this phone's
+own factory calibration, then leave both amplifiers muted.
+
+A port of Pixel 9's luma-tokay-speaker-calibrate. The amplifiers run Cirrus's
+speaker-protection firmware (CSPL, cs35l41-dsp1-spk-prot from husky's vendor
+partition), which needs each speaker's measured resistance and ambient
+temperature before it starts. Those come from persist/audio/speaker.cal,
+written at the factory; persist is only ever read here, through a read-only
+loop device. The UCM speaker route refuses to unmute (speaker-ready) unless
+this script wrote its report.
+"""
+from pathlib import Path
+import ctypes as C
+import json
+import os
+import stat
+import struct
+import subprocess
+import time
+
+CARD = 'aocaudio'
+REPORT_DIR = Path('/run/luma-husky-audio')
+REPORT = REPORT_DIR / 'speaker-calibration.json'
+PREFIXES = ('', 'R ')
+
+
+def run(*args):
+    return subprocess.run(args, check=True, capture_output=True, text=True)
+
+
+def amixer(name, value):
+    run('amixer', '-q', '-c', CARD, 'cset', 'name=' + name, value)
+
+
+def mute():
+    for prefix in PREFIXES:
+        amixer(prefix + 'Digital PCM Volume', '0')
+
+
+def read_factory_calibration():
+    nodes = [n for n in Path('/sys/class/block').glob('sd*')
+             if 'PARTNAME=persist' in (n / 'uevent').read_text().splitlines()]
+    assert len(nodes) == 1, 'need exactly one persist partition'
+    node = nodes[0]
+    assert int((node / 'size').read_text()) * 512 == 134217728
+    # persist is writable at the block layer on this phone: read it only
+    # through a read-only loop device, so nothing below can write to it.
+    loop = run('/usr/sbin/losetup', '-r', '-f', '--show',
+               '/dev/' + node.name).stdout.strip()
+    mount = Path('/run/luma-husky-audio/persist')
+    try:
+        mount.mkdir(mode=0o700)
+        try:
+            run('mount', '-t', 'f2fs', '-o', 'ro,norecovery,nodev,nosuid,noexec',
+                loop, str(mount))
+            try:
+                assert not (mount / 'audio').is_symlink()
+                fd = os.open(mount / 'audio/speaker.cal', os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    st = os.fstat(fd)
+                    assert stat.S_ISREG(st.st_mode) and st.st_size == 48
+                    data = os.read(fd, 49)
+                finally:
+                    os.close(fd)
+            finally:
+                run('umount', str(mount))
+        finally:
+            mount.rmdir()
+    finally:
+        run('/usr/sbin/losetup', '-d', loop)
+    assert len(data) == 48
+    records = [struct.unpack_from('<6I', data, i * 24) for i in range(2)]
+    for resistance, status, checksum, ambient, analog, digital in records:
+        assert 0 < resistance < 65533 and status == 1 and checksum == resistance + 1
+        assert ambient <= 85 and analog <= 31 and digital <= 913
+    return records
+
+
+class Controls:
+    """Big-endian 32-bit words in the DSP's coefficient (bytes) controls."""
+
+    def __init__(self):
+        self.lib = C.CDLL('libasound.so.2')
+        ptr, integer, unsigned = C.c_void_p, C.c_int, C.c_uint
+        for name, args, result in [
+            ('snd_ctl_open', [C.POINTER(ptr), C.c_char_p, integer], integer),
+            ('snd_ctl_close', [ptr], integer),
+            ('snd_ctl_elem_id_malloc', [C.POINTER(ptr)], integer),
+            ('snd_ctl_elem_id_free', [ptr], None),
+            ('snd_ctl_elem_id_set_interface', [ptr, integer], None),
+            ('snd_ctl_elem_id_set_name', [ptr, C.c_char_p], None),
+            ('snd_ctl_elem_value_malloc', [C.POINTER(ptr)], integer),
+            ('snd_ctl_elem_value_free', [ptr], None),
+            ('snd_ctl_elem_value_set_id', [ptr, ptr], None),
+            ('snd_ctl_elem_read', [ptr, ptr], integer),
+            ('snd_ctl_elem_write', [ptr, ptr], integer),
+            ('snd_ctl_elem_value_get_byte', [ptr, unsigned], C.c_ubyte),
+            ('snd_ctl_elem_value_set_byte', [ptr, unsigned, C.c_ubyte], None),
+        ]:
+            f = getattr(self.lib, name)
+            f.argtypes, f.restype = args, result
+        self.handle = ptr()
+        assert self.lib.snd_ctl_open(C.byref(self.handle),
+                                     ('hw:' + CARD).encode(), 0) >= 0
+
+    def word(self, name, value=None):
+        lib = self.lib
+        ident, element = C.c_void_p(), C.c_void_p()
+        assert lib.snd_ctl_elem_id_malloc(C.byref(ident)) >= 0
+        try:
+            assert lib.snd_ctl_elem_value_malloc(C.byref(element)) >= 0
+            try:
+                lib.snd_ctl_elem_id_set_interface(ident, 2)  # MIXER
+                lib.snd_ctl_elem_id_set_name(ident, name.encode())
+                lib.snd_ctl_elem_value_set_id(element, ident)
+                assert lib.snd_ctl_elem_read(self.handle, element) >= 0, name
+                if value is not None:
+                    for i, byte in enumerate(struct.pack('>I', value)):
+                        lib.snd_ctl_elem_value_set_byte(element, i, byte)
+                    assert lib.snd_ctl_elem_write(self.handle, element) >= 0, name
+                return int.from_bytes(bytes(lib.snd_ctl_elem_value_get_byte(element, i)
+                                            for i in range(4)), 'big')
+            finally:
+                lib.snd_ctl_elem_value_free(element)
+        finally:
+            lib.snd_ctl_elem_id_free(ident)
+
+    def close(self):
+        self.lib.snd_ctl_close(self.handle)
+
+
+def dsp_dirs():
+    base = Path('/sys/kernel/debug/asoc') / 'aoc-audio'
+    dirs = []
+    for index in (0, 1):
+        found = sorted(base.glob('spi*.%d/DSP1' % index))
+        assert len(found) == 1, 'amp %d DSP not found in debugfs' % index
+        dirs.append(found[0])
+    return dirs
+
+
+def main():
+    REPORT_DIR.mkdir(mode=0o755, exist_ok=True)
+    st = REPORT_DIR.lstat()
+    assert stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+    assert not REPORT.is_symlink()
+    REPORT.unlink(missing_ok=True)
+    assert Path('/sys/class/sound/card0/id').read_text().strip() == CARD
+
+    # Route both amps through their DSP and preload (not start) the firmware,
+    # as Pixel 9's capture-start does. Volumes first, so nothing is audible.
+    for prefix in PREFIXES:
+        amixer(prefix + 'Digital PCM Volume', '0')
+        amixer(prefix + 'Analog PCM Volume', '0')
+        amixer(prefix + 'PCM Source', 'DSP')
+        amixer(prefix + 'DSP RX2 Source', 'ASPRX1')
+        amixer(prefix + 'PCM Soft Ramp', '.5ms')
+        amixer(prefix + 'DSP1 Preload Switch', 'on')
+
+    records = read_factory_calibration()
+    dirs = dsp_dirs()
+    for _ in range(50):
+        if all((d / 'booted').read_text().strip() == 'Y' for d in dirs):
+            break
+        time.sleep(0.1)
+    for d in dirs:
+        assert (d / 'booted').read_text().strip() == 'Y', 'DSP firmware did not load'
+        assert (d / 'running').read_text().strip() == 'N', 'calibration needs a stopped DSP'
+
+    controls = Controls()
+    player = None
+    try:
+        # The same pre-start writes as the kernel's cs35l41_hda_fw_load.
+        for prefix, rec in zip(PREFIXES, records):
+            for name, value in [('CAL_AMBIENT', rec[3]), ('CAL_R', rec[0]),
+                                ('CAL_STATUS', rec[1]), ('CAL_CHECKSUM', rec[2])]:
+                controls.word(prefix + 'DSP1 Protection cd ' + name, value)
+        # Start the DSPs on two seconds of silence (and muted amps).
+        player = subprocess.Popen(['aplay', '-q', '-D', 'hw:%s,0' % CARD, '-t', 'raw',
+                                   '-f', 'S16_LE', '-r', '48000', '-c', '2', '-d', '2',
+                                   '/dev/zero'],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        assert player.poll() is None, 'silence stream did not start'
+        for prefix, rec in zip(PREFIXES, records):
+            base = prefix + 'DSP1 Protection '
+            assert controls.word(base + 'cd CAL_R_SELECTED') == rec[0]
+            assert controls.word(base + 'cd CAL_SET_STATUS') == 2
+            assert controls.word(base + '400a4 HALO_STATE') == 2
+            assert controls.word(base + 'cd CSPL_STATE') == 0
+            assert controls.word(base + 'cd CSPL_ERRORNO') == 0
+        _, err = player.communicate(timeout=5)
+        assert player.returncode == 0 and not err
+        REPORT.write_text(json.dumps({
+            'source': 'read-only persist/audio/speaker.cal',
+            'both_unit_calibrations_selected': True,
+            'protection_errors': False,
+            'startup_output_muted': True,
+            'phone_partition_writes': []}) + '\n')
+        REPORT.chmod(0o644)
+    finally:
+        if player is not None and player.poll() is None:
+            player.terminate()
+            player.wait(timeout=3)
+        controls.close()
+        mute()
+
+
+if __name__ == '__main__':
+    main()
