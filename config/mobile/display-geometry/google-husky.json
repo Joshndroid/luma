@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "connector": "DSI-1",
+  "nativeWidth": 1344,
+  "nativeHeight": 2992,
+  "cutouts": [
+    {"x": 615, "y": 0, "width": 111, "height": 151},
+    {"x": 0, "y": 0, "width": 48, "height": 48},
+    {"x": 1296, "y": 0, "width": 48, "height": 48},
+    {"x": 0, "y": 2944, "width": 48, "height": 48},
+    {"x": 1296, "y": 2944, "width": 48, "height": 48}
+  ],
+  "provenance": "Pixel 8 Pro (husky) HK3 panel, DSI-1, 1344x2992 native. From the vendor overlay framework-res__husky_beta__auto_generated_rro_vendor.apk: config_mainDisplayShape (the panel outline) and config_mainBuiltInDisplayCutoutRectApproximation (camera: 615.5..725.5 x 0..151, a 86.5 px hole centred at (672, 75)). Top corners are curves 120 px long, bottom corners 115 px; each curve's 45-degree point lies about 36 px in, and the 48 px corner squares also keep the on-screen keyboard's outer keycaps (2-3 logical px from the side, radius 8, scale 4) clear of the bottom curves, which need 45 px (left) and 37 px (right)."
+}

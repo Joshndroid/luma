@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: Apache-2.0
+schema = 1
+vendor = "google"
+codename = "husky"
+name = "Google Pixel 8 Pro"
+marketing_name = "Pixel 8 Pro"
+form_factor = "phone"
+year = 2023
+soc = "google/zuma"
+tier = "experimental"
+maintainers = ["@Joshndroid"]
+fastboot_product = "husky"
+
+[kernel]
+# Not yet published: the tag is created on SimplyLuma/linux branch `zuma`
+# when the husky work there is pushed. Working on the phone: 9 CPUs, UFS,
+# watchdogs, s2mpg14/15 PMICs, the HK3 panel through DECON/DSIM (120 Hz
+# default), FTM5 touch with double-tap wake, buttons, USB peripheral, the
+# Mali-G715 GPU (panthor), cpufreq and thermal (ACPM DVFS, TMU zones held at
+# 70 C), the MAX77759 fuel gauge, USB-C (sink) and charging, CS40L26 haptics,
+# BCM4398 Wi-Fi, and through the AoC the sensors, speakers, microphones and
+# Bluetooth.
+#
+# cpufreq/thermal: the OPP tables come from the phone's ECT (levels) and
+# ACPM's fvmap (voltages, Energy Model only; ACPM sets the real voltage);
+# luma/husky/tools/ect-decode.py and fvmap-decode.py in the kernel tree
+# regenerate them. Thermal budgets are downstream zuma's (LITTLE 200, BIG
+# 2000 mW) or measured on the phone (MID 2500, GPU 1300 mW).
+tag = "luma-husky-alpha1-7.3.0-rc5-zuma-luma-husky"
+release = "7.3.0-rc5-zuma-luma-husky"
+config = "luma/husky/alpha1/config-7.3.0-rc5-zuma-luma-husky"
+# Relative to the SoC's dts_directory (arch/arm64/boot/dts/exynos): the
+# schema allows one directory level and Exynos boards sit at exynos/google/.
+dtb = "google/zuma-husky.dtb"
+
+[boot]
+config = "boot.toml"
+
+[firmware]
+# No files shipped by Luma yet. The GPU's CSF firmware
+# (arm/mali/arch11.8/mali_csffw.bin.xz) comes from Luma's linux-firmware.
+# Everything else husky needs is Google's and not redistributable, so it stays
+# on the phone's vendor partition and is read from there, never shipped here:
+# the CS40L26 haptics firmware (cs40l26.wmfw, cs40l26*.bin), the BCM4398
+# Wi-Fi firmware, NVRAM and CLM blobs (/vendor/firmware/*bcmdhd*_4398_*,
+# bcmdhd.cal_USI_*), the Bluetooth patch file (BCM.hcd), the AoC image
+# (aoc.bin) and the CS35L41 speaker amplifier firmware; the speakers'
+# calibration comes from the phone's persist partition, read-only. How an
+# image picks these up from the phone is still open. The modem will add rows.
+manifest = "firmware.manifest"
+manifest_sha256 = "ef1745f080208fc4b524522f3402b3d12a8abdb56b83005222171a62006e16db"
+files = 0
+store = "/usr/lib/firmware"
+
+[install]
+guide = "INSTALL.md"
+method = "fastboot"
+# Partitions the install must never erase or write: modem, radio calibration
+# and identity (IMEI) data, and everything Google's factory image needs to
+# restore the phone.
+preserve = ["efs", "efs_backup", "modem_userdata", "persist", "devinfo", "vbmeta_a", "vbmeta_b", "dtbo_a", "dtbo_b", "vendor_boot_a", "vendor_boot_b", "init_boot_a", "init_boot_b", "super"]
+
+[updates]
+# The one ARM OS commit, unchanged.
+ostree_ref = "luma/1/aarch64/nightly"
+
+[kit]
+compatible = ["google,husky"]
+# The boot image is started from RAM, never written to boot_a/boot_b.
+flash = [
+  "flash userdata {userdata}",
+  "boot {boot}",
+]
