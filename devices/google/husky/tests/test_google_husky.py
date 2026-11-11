@@ -64,6 +64,14 @@ class HuskyProfile(unittest.TestCase):
         self.assertIn("pmos_root_uuid=", init)
         self.assertNotIn("03797c05-cf87-4eda-adc4-6ce111baf2d3", init)
 
+    def test_login_screen_gets_the_shared_handheld_defaults(self):
+        init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
+        build = (ROOT / "scripts/mobile/husky/build-boot.sh").read_text()
+        self.assertIn("config/mobile/luma-greeter-handheld.dconf", build)
+        self.assertIn("/luma/handheld/luma-greeter-handheld.dconf", init)
+        self.assertIn("/etc/dconf/db/gdm.d/10-luma-handheld", init)
+        self.assertNotIn("power-button-action=", init)
+
     def test_firmware_manifest_is_exact(self):
         device = load("device.toml")
         manifest = (DEVICE / "firmware.manifest").read_bytes()
