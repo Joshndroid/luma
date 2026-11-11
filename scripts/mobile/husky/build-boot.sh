@@ -70,6 +70,25 @@ patch_level=$(toml "$device/boot.toml" os_patch_level | cut -c1-7)
 partition_size=$(toml "$device/boot.toml" partition_size)
 rollback_index=$(toml "$device/boot.toml" avb rollback_index)
 [ -f "$config" ] || { echo "no kernel config at $config (is --kernel the zuma branch?)" >&2; exit 1; }
+# The kernel forces its built-in command line: boot.toml's fixed arguments,
+# then the generic phone userdata image's filesystems (the UUIDs the device
+# kit builder checks for) and ostree=aboot. The config must carry exactly that.
+cmdline=$(python3 - "$device/boot.toml" "$luma/scripts/devices/build-device-kit.py" <<'EOF'
+import importlib.util, sys, tomllib
+spec = importlib.util.spec_from_file_location("kit", sys.argv[2])
+kit = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(kit)
+boot = tomllib.load(open(sys.argv[1], "rb"))["cmdline"]
+values = {"pmos_root_uuid": kit.ROOT_UUID, "pmos_boot_uuid": kit.BOOT_UUID, "ostree": "aboot"}
+print(" ".join(boot["args"] + [f"{k}={values[k]}" for k in boot["generated"]]))
+EOF
+)
+[ "$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "$config")" = "$cmdline" ] || {
+	echo "CONFIG_CMDLINE in $config is not boot.toml's command line:" >&2
+	echo "  $cmdline" >&2
+	exit 1
+}
+grep -qx 'CONFIG_CMDLINE_FORCE=y' "$config" || { echo "$config does not force its command line" >&2; exit 1; }
 
 echo "$busybox_rpm_sha256  $busybox_rpm" | sha256sum -c --quiet
 echo "$mali_fw_sha256  $mali_fw" | sha256sum -c --quiet
@@ -136,4 +155,7 @@ mkbootimg --header_version 4 --kernel "$obj/arch/arm64/boot/Image" \
 avbtool add_hash_footer --image "$img" --partition_name boot \
 	--partition_size "$partition_size" --key "$avb_key" --algorithm SHA256_RSA4096 \
 	--rollback_index "$rollback_index"
+# The command line is inside the kernel; build-device-kit.py --boot-cmdline
+# reads this record of it.
+printf '%s\n' "$cmdline" > "$out/luma-husky-boot.cmdline"
 sha256sum "$img"

@@ -53,6 +53,17 @@ class HuskyProfile(unittest.TestCase):
         self.assertEqual(boot["dtbo"]["policy"], "stock")
         self.assertIn("arm64.nomte", boot["cmdline"]["args"])
 
+    def test_command_line_names_the_phone_image(self):
+        # Every phone boot image names the generic userdata image's
+        # filesystems; the initramfs reads the root's UUID from there.
+        cmdline = load("boot.toml")["cmdline"]
+        self.assertEqual(cmdline["generated"], ["pmos_root_uuid", "pmos_boot_uuid", "ostree"])
+        for arg in cmdline["args"]:
+            self.assertFalse(arg.startswith(("pmos_", "ostree=")), arg)
+        init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
+        self.assertIn("pmos_root_uuid=", init)
+        self.assertNotIn("03797c05-cf87-4eda-adc4-6ce111baf2d3", init)
+
     def test_firmware_manifest_is_exact(self):
         device = load("device.toml")
         manifest = (DEVICE / "firmware.manifest").read_bytes()
