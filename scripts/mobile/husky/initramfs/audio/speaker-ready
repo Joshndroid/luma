@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Luma husky: the UCM speaker route runs this before it unmutes.
+# Refuse unless speaker-calibrate armed the amplifiers' protection this boot.
+r=/run/luma-husky-audio/speaker-calibration.json
+[ -f "$r" ] && [ ! -L "$r" ] && [ "$(stat -c %u "$r")" = 0 ] || exit 1
+grep -q '"both_unit_calibrations_selected": true' "$r" &&
+	grep -q '"protection_errors": false' "$r"

@@ -1,0 +1,303 @@
+#!/luma/bin/busybox sh
+# Luma husky (Pixel 8 Pro) initramfs: boot the OSTree deployment on userdata.
+#
+# userdata holds Luma's generic phone image (scripts/mobile/build-phone-userdata.sh):
+# a GPT with 4096-byte sectors, LumaBoot (FAT32, 1 MiB + 480 MiB) and LumaRoot
+# (ext4, UUID 03797c05-..., from 481 MiB to the end).  The kernel does not scan
+# a partition table nested inside a partition, so LumaRoot is reached through a
+# loop device at its offset.
+#
+# The deployment is chosen by Luma's shared resolver (/luma/lib/ostree-boot.sh)
+# and mounted by that deployment's own ostree-prepare-root, run through its own
+# dynamic loader (kernel command line: ostree=aboot androidboot.slot_suffix=_a).
+#
+# The firmware Google does not let Luma redistribute is in /lib/firmware here,
+# put in by the boot image build from Google's factory image
+# (scripts/mobile/husky/firmware.py); this script keeps a copy for the booted
+# system. On any failure it shows the reason on the screen and powers off.
+
+/luma/bin/busybox --install -s /luma/bin
+export PATH=/luma/bin
+
+mkdir -p /proc /sys /dev /tmp /run /sysroot
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mkdir -p /run/luma
+
+say() {
+	echo "luma-boot: $*" > /dev/kmsg
+	echo "luma-boot: $*" > /dev/tty0 2>/dev/null
+}
+
+fallback() {
+	say "FAILED: $*"
+	say "Luma cannot start. Hold Power and Volume Down for the Fastboot screen."
+	umount -R /sysroot 2>/dev/null
+	sync
+	sleep 300
+	poweroff -f
+}
+
+root_uuid=03797c05-cf87-4eda-adc4-6ce111baf2d3
+root_offset=$((481 * 1024 * 1024))
+
+say "starting (kernel $(uname -r))"
+
+# --- 1. userdata ------------------------------------------------------------
+userdata=""
+for i in $(seq 1 50); do
+	for u in /sys/class/block/sd*/uevent; do
+		grep -qx 'PARTNAME=userdata' "$u" 2>/dev/null || continue
+		userdata=/dev/$(sed -n 's/^DEVNAME=//p' "$u")
+		break
+	done
+	[ -n "$userdata" ] && [ -b "$userdata" ] && break
+	sleep 0.1
+done
+[ -b "$userdata" ] || fallback "no userdata partition"
+say "userdata is $userdata"
+
+# --- 2. LumaRoot --------------------------------------------------------------
+loop=$(losetup -f) || fallback "no free loop device"
+losetup -o "$root_offset" "$loop" "$userdata" || fallback "losetup $userdata"
+uuid=$(blkid "$loop" | sed -n 's/.*UUID="\([^"]*\)".*/\1/p')
+[ "$uuid" = "$root_uuid" ] || fallback "LumaRoot not found at 481 MiB (UUID '$uuid')"
+mount -t ext4 -o rw,noatime "$loop" /sysroot || fallback "mount LumaRoot"
+say "LumaRoot mounted from $loop"
+
+# --- 3. choose the deployment ---------------------------------------------------
+. /luma/lib/ostree-boot.sh
+cmdline=$(cat /proc/cmdline)
+luma_ostree_resolve /sysroot || fallback "no usable OSTree deployment"
+luma_ostree_apply /sysroot "$cmdline" || fallback "cannot point root.a at $LUMA_OSTREE_DEPLOY"
+deploy=/sysroot/ostree/$LUMA_OSTREE_DEPLOY
+say "deployment $LUMA_OSTREE_DEPLOY ($LUMA_OSTREE_REASON)"
+
+# --- 4. ostree-prepare-root, from the deployment ---------------------------------
+# Its configuration is read from the initramfs, so take the deployment's.
+mkdir -p /usr/lib/ostree /etc/ostree
+[ -f "$deploy/usr/lib/ostree/prepare-root.conf" ] &&
+	cp "$deploy/usr/lib/ostree/prepare-root.conf" /usr/lib/ostree/
+[ -f "$deploy/etc/ostree/prepare-root.conf" ] &&
+	cp "$deploy/etc/ostree/prepare-root.conf" /etc/ostree/
+# The loader and its symlinks live inside the deployment; an absolute link
+# target is relative to the deployment, not to this initramfs.
+in_deploy() {
+	local p=$1 l n=0
+	while [ -L "$p" ] && [ $n -lt 8 ]; do
+		l=$(readlink "$p")
+		case "$l" in
+			/*) p=$deploy$l ;;
+			*) p=${p%/*}/$l ;;
+		esac
+		n=$((n + 1))
+	done
+	echo "$p"
+}
+loader=$(in_deploy "$deploy/usr/lib/ld-linux-aarch64.so.1")
+[ -e "$loader" ] || loader=$(in_deploy "$deploy/usr/lib64/ld-linux-aarch64.so.1")
+[ -e "$loader" ] || fallback "no dynamic loader in the deployment"
+prepare=$deploy/usr/lib/ostree/ostree-prepare-root
+[ -x "$prepare" ] || fallback "no ostree-prepare-root in the deployment"
+in_deploy_run() {
+	"$loader" --library-path "$deploy/usr/lib64:$deploy/usr/lib" "$@"
+}
+
+# --- 3b. grow LumaRoot to the end of userdata (first boot) -------------------------
+# The image's GPT covers only its own ~12 GB. Move the backup GPT to the end of
+# userdata, extend LumaRoot to the last usable sector and grow ext4 online to
+# exactly that size (the loop device also covers the backup GPT). Uses the
+# deployment's sfdisk and resize2fs. A failure is logged and the boot goes on.
+grow_root() {
+	local sfdisk resize2fs dump sectors last line start size want
+	sfdisk=$(in_deploy "$deploy/usr/bin/sfdisk")
+	resize2fs=$(in_deploy "$deploy/usr/bin/resize2fs")
+	[ -e "$sfdisk" ] && [ -e "$resize2fs" ] || { say "grow: no sfdisk/resize2fs"; return 1; }
+	sectors=$(( $(cat "/sys/class/block/${userdata#/dev/}/size") / 8 ))
+	dump=$(in_deploy_run "$sfdisk" -d "$userdata" 2>/dev/null) || return 1
+	last=$(echo "$dump" | sed -n 's/^last-lba: *//p')
+	if [ "$last" -lt $((sectors - 5)) ]; then
+		in_deploy_run "$sfdisk" --no-reread --no-tell-kernel --relocate gpt-bak-std \
+			"$userdata" > /dev/kmsg 2>&1 || return 1
+		dump=$(in_deploy_run "$sfdisk" -d "$userdata" 2>/dev/null) || return 1
+		last=$(echo "$dump" | sed -n 's/^last-lba: *//p')
+	fi
+	line=$(echo "$dump" | grep 'name="LumaRoot"') || return 1
+	start=$(echo "$line" | sed -n 's/.*start= *\([0-9]*\),.*/\1/p')
+	size=$(echo "$line" | sed -n 's/.*size= *\([0-9]*\),.*/\1/p')
+	want=$((last - start + 1))
+	if [ "$size" -lt "$want" ]; then
+		say "grow: LumaRoot $size -> $want sectors"
+		echo "$dump" | sed "/name=\"LumaRoot\"/s/size= *$size,/size=$want,/" |
+			in_deploy_run "$sfdisk" --no-reread --no-tell-kernel "$userdata" \
+			> /dev/kmsg 2>&1 || return 1
+	fi
+	# ext4 blocks are 4 KiB, the same as the GPT's sectors; a no-op when grown.
+	in_deploy_run "$resize2fs" "$loop" "$want" > /dev/kmsg 2>&1
+}
+grow_root || say "grow: LumaRoot not grown (continuing)"
+"$loader" --library-path "$deploy/usr/lib64:$deploy/usr/lib" "$prepare" /sysroot \
+	> /run/luma/prepare-root.log 2>&1 || {
+	cat /run/luma/prepare-root.log > /dev/kmsg
+	fallback "ostree-prepare-root"
+}
+cat /run/luma/prepare-root.log > /dev/kmsg
+[ -x /sysroot/usr/lib/systemd/systemd ] || fallback "no systemd in the prepared root"
+
+# --- 5. handheld defaults ------------------------------------------------------
+# Until husky has a device package (as luma-fp6-platform is for the Fairphone),
+# apply Luma's shared handheld defaults: the power key blanks and wakes the
+# screen instead of suspending, and logind leaves a short press to the Shell.
+# logind and the session environment read them from /run (this boot only);
+# dconf reads only /etc, so the profile goes where the Fairphone package puts
+# it and is compiled before the display manager starts.
+mkdir -p /run/systemd/system/multi-user.target.wants /run/systemd/logind.conf.d \
+	/run/environment.d /run/systemd/sleep.conf.d /run/systemd/user-environment-generators
+cp /luma/handheld/logind-handheld.conf /run/systemd/logind.conf.d/50-luma-handheld.conf
+# The kernel cannot resume from suspend yet: a suspend leaves the phone dark
+# until a forced restart. Refuse every sleep state, so logind reports none and
+# no session, greeter or timeout can start one.
+cat > /run/systemd/sleep.conf.d/50-luma-husky-no-sleep.conf <<'EOF'
+[Sleep]
+AllowSuspend=no
+AllowHibernation=no
+AllowSuspendThenHibernate=no
+AllowHybridSleep=no
+EOF
+# The login screen runs its own settings daemon on GDM's dconf profile.
+mkdir -p /sysroot/etc/dconf/db/gdm.d
+cat > /sysroot/etc/dconf/db/gdm.d/10-luma-husky-power <<'EOF'
+# Luma husky: the login screen must not suspend on the power key.
+[org/gnome/settings-daemon/plugins/power]
+power-button-action='nothing'
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-type='nothing'
+
+# The Shell's greeter power button (Luma patch 0335) blanks and wakes; without
+# this gsd-media-keys wins the boot-time race for XF86PowerOff.
+[org/gnome/settings-daemon/plugins/media-keys]
+power-static=@as []
+EOF
+echo LUMA_DEVICE_CLASS=handheld > /run/environment.d/90-luma-handheld.conf
+# Panel outline (rounded corners, camera) for the Shell. A device package
+# would ship it as /usr/share/luma/display-geometry.json; until there is one
+# it goes where the owner override lives.
+mkdir -p /sysroot/etc/luma
+cmp -s /luma/handheld/display-geometry.json /sysroot/etc/luma/display-geometry.json ||
+	cp /luma/handheld/display-geometry.json /sysroot/etc/luma/display-geometry.json ||
+	say "could not install the display geometry"
+dconf_dst=/sysroot/etc/dconf/db/luma.d/10-luma-handheld
+mkdir -p /sysroot/etc/dconf/db/luma.d
+cmp -s /luma/handheld/luma-shell-handheld.dconf "$dconf_dst" ||
+	cp /luma/handheld/luma-shell-handheld.dconf "$dconf_dst" ||
+	say "could not install the handheld dconf defaults"
+cat > /run/systemd/system/luma-husky-dconf-update.service <<'EOF'
+[Unit]
+Description=Luma husky: compile the dconf system databases
+DefaultDependencies=no
+After=local-fs.target
+Before=display-manager.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/dconf update
+
+[Install]
+WantedBy=multi-user.target
+EOF
+ln -sf ../luma-husky-dconf-update.service /run/systemd/system/multi-user.target.wants/
+# GPU: Fedora 44's Mesa 26.2 has no Mali-G715. When the private Mesa 26.3 from
+# scripts/mobile/husky/mesa is installed, user sessions use it.
+install -m 0755 /luma/mesa/90-luma-husky-gpu /run/systemd/user-environment-generators/
+# Haptics: feedbackd only drives vibra devices its udev rules name, and its
+# list lacks the CS40L26 (input name cs40l26_input). Numbered before
+# 73-seat-late so the uaccess tag becomes a seat ACL.
+mkdir -p /run/udev/rules.d
+cat > /run/udev/rules.d/72-luma-husky-haptics.rules <<'EOF'
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", SUBSYSTEMS=="input", ATTRS{name}=="cs40l26_input", TAG+="uaccess", ENV{FEEDBACKD_TYPE}="vibra"
+EOF
+
+# --- 6. firmware and modules ----------------------------------------------------
+# Drivers load firmware again after switch_root (Wi-Fi when wlan0 comes up, the
+# AoC and amplifiers when their modules load), where the initramfs is gone.
+# Keep a copy in /run, moved into the system below, and point the loader at it.
+mkdir -p /run/luma-husky-firmware /run/luma-husky-modules
+cp -r /lib/firmware/. /run/luma-husky-firmware/
+echo -n /run/luma-husky-firmware > /sys/module/firmware_class/parameters/path
+cp /luma/modules/*.ko /run/luma-husky-modules/ 2>/dev/null
+
+# --- 7. AoC: sensors, audio and Bluetooth ----------------------------------------
+# Audio: the calibration step and speaker-ready check, and the card's UCM
+# profile in a /run tree that PipeWire's alsa-lib reads (ALSA_CONFIG_UCM2; the
+# card is the only ALSA device, so the tree needs only ucm.conf and lib/).
+mkdir -p /run/luma-husky-audio /run/luma-husky-ucm2/conf.d/aoc-audio /run/luma-husky-ucm2/aoc-audio
+cp /luma/audio/speaker-calibrate /luma/audio/speaker-ready /run/luma-husky-audio/
+cp /luma/audio/aoc-audio.conf /run/luma-husky-ucm2/conf.d/aoc-audio/
+cp /luma/audio/HiFi.conf /run/luma-husky-ucm2/aoc-audio/
+cp /sysroot/usr/share/alsa/ucm2/ucm.conf /run/luma-husky-ucm2/ 2>/dev/null
+cp -r /sysroot/usr/share/alsa/ucm2/lib /run/luma-husky-ucm2/ 2>/dev/null  # ucm.conf includes lib/generic.conf
+printf '#!/bin/sh\necho ALSA_CONFIG_UCM2=/run/luma-husky-ucm2\n' \
+	> /run/systemd/user-environment-generators/91-luma-husky-audio
+chmod 0755 /run/systemd/user-environment-generators/91-luma-husky-audio
+# No ALSA state save/restore: alsactl restore runs when the card appears and
+# would put back whatever the amps had at the last shutdown, volumes included,
+# before speaker-calibrate has armed protection, and it races the calibration
+# itself. Only the unit below and the UCM route set amplifier controls.
+ln -sf /dev/null /run/systemd/system/alsa-restore.service
+ln -sf /dev/null /run/systemd/system/alsa-state.service
+cat > /run/systemd/system/luma-husky-aoc.service <<'EOF'
+[Unit]
+Description=Luma husky: AoC firmware, sensor hub, Bluetooth and audio drivers
+ConditionPathExists=/run/luma-husky-firmware/google/zuma/aoc.bin
+ConditionPathExists=!/var/lib/luma-husky/aoc-off
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'cd /run/luma-husky-modules && for m in aoc aoc-channel aoc-usf aoc-usf-iio; do /usr/sbin/insmod $m.ko || exit 1; done'
+# Bluetooth over the AoC (hci_aoc). A failure here must not stop audio.
+ExecStart=-/usr/sbin/insmod /run/luma-husky-modules/hci_aoc.ko
+# Speaker amplifiers (CS35L41 on spi_19) and the AoC sound card; off with
+# /var/lib/luma-husky/audio-off. Both amplifiers are muted as soon as the
+# card exists, before speaker protection is armed: their power-on default is
+# 0 dB.
+ExecStart=/bin/sh -c '[ -e /var/lib/luma-husky/audio-off ] && exit 0; cd /run/luma-husky-modules && for m in cs_dsp snd-soc-wm-adsp snd-soc-cs35l41-lib snd-soc-cs35l41 snd-soc-cs35l41-spi snd-soc-google-aoc; do /usr/sbin/insmod $m.ko || exit 1; done; for c in "Digital PCM Volume" "R Digital PCM Volume"; do /usr/bin/amixer -q -c aocaudio cset name="$c" 0 || exit 1; done'
+# Arm the amplifiers' speaker protection with this phone's factory
+# calibration (persist, read-only); leaves them muted, and the UCM route
+# checks its report before it unmutes.
+ExecStart=/bin/sh -c '[ -e /var/lib/luma-husky/audio-off ] && exit 0; [ -e /run/luma-husky-firmware/cirrus/cs35l41-dsp1-spk-prot-husky.wmfw ] || exit 0; exec /usr/bin/python3 /run/luma-husky-audio/speaker-calibrate'
+EOF
+ln -sf ../luma-husky-aoc.service /run/systemd/system/multi-user.target.wants/
+
+# --- 8. USB-C and charging -------------------------------------------------------
+# The MAX77759 port controller (sink-only, device-only, PD off in the DT) and
+# the mainline charger, which follows what the port controller reports and
+# keeps the bootloader's charge limits. Off with /var/lib/luma-husky/usbc-off,
+# in which case charging stays as the bootloader set it.
+cat > /run/systemd/system/luma-husky-usbc.service <<'EOF'
+[Unit]
+Description=Luma husky: USB-C port controller and charger
+ConditionPathExists=!/var/lib/luma-husky/usbc-off
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'cd /run/luma-husky-modules && /usr/sbin/insmod tcpci_maxim.ko && /usr/sbin/insmod max77759_charger.ko'
+EOF
+ln -sf ../luma-husky-usbc.service /run/systemd/system/multi-user.target.wants/
+
+# --- 9. Wi-Fi ----------------------------------------------------------------------
+# bcmdhd also registers wlan1 (a second interface for Android's concurrency
+# HAL) and aware_nmi0 (Wi-Fi Aware); NetworkManager would list them as extra
+# Wi-Fi adapters. Only wlan0 is for users.
+mkdir -p /run/NetworkManager/conf.d
+printf '[keyfile]\nunmanaged-devices=interface-name:wlan1;interface-name:aware_nmi0\n' \
+	> /run/NetworkManager/conf.d/91-luma-husky-wifi.conf
+
+say "switching to systemd"
+for m in /dev /run /proc /sys; do
+	mount --move "$m" "/sysroot$m" || fallback "move $m"
+done
+exec switch_root /sysroot /usr/lib/systemd/systemd
