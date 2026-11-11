@@ -32,9 +32,32 @@ installed and switched off.
 - A USB-C **data** cable and a computer with `fastboot` (Android platform
   tools, version 35 or newer).
 - The generic Luma phone system image, built from the ARM nightly with
-  `scripts/mobile/build-phone-userdata.sh`, and a husky boot image built from
-  the kernel tag named in `device.toml`.
+  `scripts/mobile/build-phone-userdata.sh`.
+- A husky boot image. It carries Google's firmware, which Luma may not
+  redistribute, so you build it yourself (see below).
 - A backup of everything on the phone.
+
+## Build the boot image
+
+1. Download Google's factory image named in `device.toml`
+   (`husky-cp4a.261105.040.a1-factory-03e02c8b.zip`) from
+   [Google's factory images page](https://developers.google.com/android/images#husky).
+   The page asks you to accept Google's terms.
+2. Extract the firmware. The script checks the download against the checksum
+   in `device.toml` and needs `unzip`, `simg2img`, `lpunpack` and `debugfs`:
+
+   ```
+   scripts/mobile/husky/firmware.py extract \
+       --factory husky-cp4a.261105.040.a1-factory-03e02c8b.zip \
+       --sha256 03e02c8b011c39546f058af2f9195a7ed0494b74e9dd253c37c576adc8b1a277 \
+       --out husky-firmware
+   ```
+
+3. Build the boot image from the kernel branch named in `socs/google/zuma/soc.toml`
+   with `scripts/mobile/husky/build-boot.sh` (its header lists the inputs). It
+   refuses firmware that differs from `firmware.manifest`.
+
+Keep the boot image to yourself: it contains Google's firmware.
 
 ## Install
 

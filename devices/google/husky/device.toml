@@ -37,19 +37,24 @@ dtb = "google/zuma-husky.dtb"
 config = "boot.toml"
 
 [firmware]
-# No files shipped by Luma yet. The GPU's CSF firmware
+# Google's firmware for the Pixel 8 Pro, not redistributable and never in git:
+# scripts/mobile/husky/firmware.py extracts it from the vendor image of
+# Google's factory image husky-cp4a.261105.040.a1-factory-03e02c8b.zip
+# (Android 17, CP4A.261105.040.A1; SHA-256
+# 03e02c8b011c39546f058af2f9195a7ed0494b74e9dd253c37c576adc8b1a277), and
+# scripts/mobile/husky/build-boot.sh refuses any tree that differs from this
+# manifest. It covers the CS40L26 haptics, the BCM4398 Wi-Fi (firmware, NVRAM,
+# CLM and TX-cap blobs for every chip revision and SKU), the Bluetooth patch
+# file, the AoC image and sensor registry, and the CS35L41 speaker-protection
+# firmware. The boot image carries it in its initramfs, as on the Pixel 9.
+# The speakers' factory calibration is per phone and is read on the phone,
+# read-only, from persist. The GPU's CSF firmware
 # (arm/mali/arch11.8/mali_csffw.bin.xz) comes from Luma's linux-firmware.
-# Everything else husky needs is Google's and not redistributable, so it stays
-# on the phone's vendor partition and is read from there, never shipped here:
-# the CS40L26 haptics firmware (cs40l26.wmfw, cs40l26*.bin), the BCM4398
-# Wi-Fi firmware, NVRAM and CLM blobs (/vendor/firmware/*bcmdhd*_4398_*,
-# bcmdhd.cal_USI_*), the Bluetooth patch file (BCM.hcd), the AoC image
-# (aoc.bin) and the CS35L41 speaker amplifier firmware; the speakers'
-# calibration comes from the phone's persist partition, read-only. How an
-# image picks these up from the phone is still open. The modem will add rows.
 manifest = "firmware.manifest"
-manifest_sha256 = "ef1745f080208fc4b524522f3402b3d12a8abdb56b83005222171a62006e16db"
-files = 0
+manifest_sha256 = "b3daeae84de9971eda5e015f1e65e5c3cb925fbbc333588ec1d4e3643fbb270a"
+files = 41
+# Where a device package would install it; until husky has one, the files
+# travel in the boot image and the initramfs points the loader at a copy.
 store = "/usr/lib/firmware"
 
 [install]
