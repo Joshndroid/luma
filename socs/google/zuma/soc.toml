@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Shared configuration for every device on the Google Tensor G3 (zuma) family:
+# Pixel 8 (shiba), Pixel 8 Pro (husky), Pixel 8a (akita).
+# A device on this SoC sets `soc = "google/zuma"` and only declares what differs.
+#
+# zuma shares its clock, power-domain and interrupt layout with zumapro
+# (Tensor G4, Pixel 9), so the kernel branch starts from Luma's zumapro tree
+# and arch/arm64/boot/dts/exynos/google/zuma.dtsi includes zumapro.dtsi,
+# overriding only what differs (9 CPUs, reserved memory, PMU, watchdogs).
+schema = 1
+vendor = "google"
+family = "zuma"
+name = "Google Tensor G3 (zuma)"
+arch = "aarch64"
+
+[kernel]
+repository = "https://github.com/SimplyLuma/linux"
+branch = "zuma"
+dts_directory = "arch/arm64/boot/dts/exynos"
+
+[boot]
+# Pixel ABL: boot image header v4, A/B slots. The DTB is built into the kernel
+# (CONFIG_LUMA_EMBEDDED_DTB) because ABL's own DTB carries no initrd range, so
+# the initramfs is built in as well (CONFIG_INITRAMFS_SOURCE).
+format = "android-boot-v4"
+page_size = 4096
+slots = "ab"
+dtb_in_boot_image = false
+
+[firmware]
+# Device firmware lives under this path on the phone, never in git.
+directory = "google/zuma"
