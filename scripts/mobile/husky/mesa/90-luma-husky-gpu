@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# systemd user environment generator: point user sessions (GNOME Shell, the
+# login screen, apps) at the private Mesa in /var/lib/luma-husky/mesa when it
+# is installed. `touch /var/lib/luma-husky/gpu-off` falls back to software
+# rendering. GTK stays on GL: the system Vulkan loader would pick lavapipe.
+m=/var/lib/luma-husky/mesa
+[ -f $m/BUILD-INFO ] && [ -f $m/share/glvnd/egl_vendor.d/50_mesa.json ] || exit 0
+[ -e /var/lib/luma-husky/gpu-off ] && exit 0
+echo "LD_LIBRARY_PATH=$m/lib64"
+echo "__EGL_VENDOR_LIBRARY_FILENAMES=$m/share/glvnd/egl_vendor.d/50_mesa.json"
+echo "GBM_BACKENDS_PATH=$m/lib64/gbm"
+echo "LIBGL_DRIVERS_PATH=$m/lib64/dri"
+echo "GSK_RENDERER=ngl"
+echo "GDK_DISABLE=vulkan"
