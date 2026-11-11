@@ -90,4 +90,4 @@ the kernel command line turns the service off for `fastboot boot` test kernels.
 |---|---|---|
 | Fairphone 6 | `luma-fairphone-fp6`: modules, firmware, platform, IMS, eSIM, modem stack | boot image + `…-kit.sparse` |
 | Pixel 9 (`google,tokay`) | none yet: modules and firmware are in the boot image | boot image only |
-| Pixel 8 Pro (`google,husky`) | none yet: drivers are in the boot image; Google's firmware stays on the phone | boot image only (`fastboot boot`) |
+| Pixel 8 Pro (`google,husky`) | none yet: modules and Google's firmware (from its factory image) are in the boot image | boot image only (`fastboot boot`) |
