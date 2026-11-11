@@ -8,24 +8,34 @@ os_version = "16.0.0"
 os_patch_level = "2026-10-01"
 
 [cmdline]
-# Fixed arguments, in order. For now the kernel forces its built-in command
-# line (CONFIG_CMDLINE_FORCE); these are the arguments it carries.
+# Fixed arguments, in order. ABL's own command line lives in the DTB the
+# kernel does not use, so the kernel forces its built-in one (CONFIG_CMDLINE,
+# SimplyLuma/linux zuma luma/husky/alpha1/): these arguments, then the
+# generated ones. scripts/mobile/husky/build-boot.sh refuses a kernel config
+# whose CONFIG_CMDLINE differs.
 args = [
+  # A warm reset keeps RAM (ramoops) across restarts.
+  "reboot=warm",
   "panic=0",
   "rdinit=/init",
-  "console=tty0",
-  "fbcon=font:TER16x32",
-  # MTE tag storage is not enabled by the firmware; Android sets this too.
-  "arm64.nomte",
+  "loglevel=7",
+  "printk.time=1",
   # Until the kernel models them all, clocks, power domains and regulators
   # it does not know stay as the bootloader left them.
   "clk_ignore_unused",
   "pd_ignore_unused",
   "regulator_ignore_unused",
+  # MTE tag storage is not enabled by the firmware; Android sets this too.
+  "arm64.nomte",
+  "fbcon=font:TER16x32",
+  # The bootloader's slot suffix never reaches the kernel: the OSTree aboot
+  # link is always root.a.
+  "androidboot.slot_suffix=_a",
+  "systemd.show_status=1",
 ]
-# Filled in per image and per deployment by the image builder and libostree;
-# androidboot.slot_suffix is appended by the bootloader.
-generated = ["ostree", "androidboot.slot_suffix"]
+# The generic phone userdata image's filesystems (as build-device-kit.py
+# checks) and ostree=aboot, which the initramfs replaces per deployment.
+generated = ["pmos_root_uuid", "pmos_boot_uuid", "ostree"]
 # Release images must keep SELinux enforcing; these may never appear.
 forbidden = ["selinux=0", "enforcing=0", "lsm="]
 

@@ -40,10 +40,13 @@ fallback() {
 	poweroff -f
 }
 
-root_uuid=03797c05-cf87-4eda-adc4-6ce111baf2d3
+# The command line names the generic phone userdata image's root filesystem
+# (pmos_root_uuid), as on every Luma phone.
+root_uuid=$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^pmos_root_uuid=//p' | tail -n 1)
 root_offset=$((481 * 1024 * 1024))
 
 say "starting (kernel $(uname -r))"
+[ -n "$root_uuid" ] || fallback "no pmos_root_uuid on the kernel command line"
 
 # --- 1. userdata ------------------------------------------------------------
 userdata=""
