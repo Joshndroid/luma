@@ -9,6 +9,7 @@ the layout, support tiers and how to add a device.
 |---|---|---|---|
 | Fairphone 6 | [fairphone/fp6](fairphone/fp6) | Qualcomm SM7635 (milos) | supported |
 | Raspberry Pi 5 | [raspberrypi/rpi5](raspberrypi/rpi5) | Broadcom BCM2712 | experimental |
+| Pixel 8 Pro | [google/husky](google/husky) | Google Tensor G3 (zuma) | experimental |
 
 ## Phones: one image plus a device kit
 
@@ -55,3 +56,4 @@ rollback, power lost before finalisation) it stops and logs why
 |---|---|---|
 | Fairphone 6 | `luma-fairphone-fp6`: modules, firmware, platform, IMS, eSIM, modem stack | boot image + `…-kit.sparse` |
 | Pixel 9 (`google,tokay`) | none yet: modules and firmware are in the boot image | boot image only |
+| Pixel 8 Pro (`google,husky`) | none yet: drivers are in the boot image; Google's firmware stays on the phone | boot image only (`fastboot boot`) |

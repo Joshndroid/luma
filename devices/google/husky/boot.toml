@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+# Boot policy for the Pixel 8 Pro. Format and page size come from
+# socs/google/zuma/soc.toml.
+schema = 1
+partition = "boot"
+partition_size = 67108864
+os_version = "16.0.0"
+os_patch_level = "2026-10-01"
+
+[cmdline]
+# Fixed arguments, in order. For now the kernel forces its built-in command
+# line (CONFIG_CMDLINE_FORCE); these are the arguments it carries.
+args = [
+  "panic=0",
+  "rdinit=/init",
+  "console=tty0",
+  "fbcon=font:TER16x32",
+  # MTE tag storage is not enabled by the firmware; Android sets this too.
+  "arm64.nomte",
+  # Until the kernel models them all, clocks, power domains and regulators
+  # it does not know stay as the bootloader left them.
+  "clk_ignore_unused",
+  "pd_ignore_unused",
+  "regulator_ignore_unused",
+]
+# Filled in per image and per deployment by the image builder and libostree;
+# androidboot.slot_suffix is appended by the bootloader.
+generated = ["ostree", "androidboot.slot_suffix"]
+# Release images must keep SELinux enforcing; these may never appear.
+forbidden = ["selinux=0", "enforcing=0", "lsm="]
+
+[avb]
+# husky's ABL refuses an image without an AVB hash footer, even unlocked, so
+# the image carries one signed with the public AOSP test key (an integrity
+# envelope, not verified boot). vbmeta stays as Google ships it.
+footer = "hash"
+algorithm = "SHA256_RSA4096"
+hash_algorithm = "sha256"
+rollback_index = 1791158400
+vbmeta = "untouched"
+
+[dtbo]
+# The kernel uses its embedded DTB and ignores the one ABL assembles, so the
+# stock overlays are left as Google ships them and never written.
+policy = "stock"
+partitions = ["dtbo_a", "dtbo_b"]

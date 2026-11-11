@@ -38,3 +38,9 @@ rectangle from the top edge, the inner camera together with its corner as
 136 × 136 at the top right. The corners are continuous curves; each square
 reaches past the curve's 45° point and clears status content whose top sits at
 half the square's height.
+
+The Pixel 8 Pro profile (`google-husky.json`) comes from the panel outline
+and camera rectangle in the device's vendor overlay (`config_mainDisplayShape`,
+`config_mainBuiltInDisplayCutoutRectApproximation`). Its 48 × 48 corner
+squares pass each curve's 45° point and keep the on-screen keyboard's outer
+keys clear of the bottom curves.
