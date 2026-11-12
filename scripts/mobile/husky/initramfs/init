@@ -208,6 +208,20 @@ ln -sf ../luma-husky-dconf-update.service /run/systemd/system/multi-user.target.
 # GPU: Fedora 44's Mesa 26.2 has no Mali-G715. When the private Mesa 26.3 from
 # scripts/mobile/husky/mesa is installed, user sessions use it.
 install -m 0755 /luma/mesa/90-luma-husky-gpu /run/systemd/user-environment-generators/
+# Flatpak apps: the same Mesa as a GL extension, refreshed before any session.
+mkdir -p /run/luma-husky-mesa
+install -m 0755 /luma/mesa/flatpak-gl-extension /run/luma-husky-mesa/
+cat > /run/systemd/system/luma-husky-flatpak-gl.service <<'EOF'
+[Unit]
+Description=Luma husky: offer the private Mesa to Flatpak apps
+Before=systemd-user-sessions.service display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/run/luma-husky-mesa/flatpak-gl-extension
+EOF
+ln -sf ../luma-husky-flatpak-gl.service /run/systemd/system/multi-user.target.wants/
 # Haptics: feedbackd only drives vibra devices its udev rules name, and its
 # list lacks the CS40L26 (input name cs40l26_input). Numbered before
 # 73-seat-late so the uaccess tag becomes a seat ACL.

@@ -1,0 +1,33 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Offer the private Mesa to Flatpak apps as the unmanaged GL extension
+# org.projectluma.Platform.GL.luma-husky. The runtime's own GL.default is
+# Fedora 44's Mesa 26.2, which has no Mali-G715, so Flatpak apps would draw
+# with llvmpipe on the CPU. The prefix was built in a Fedora 44 build root,
+# the same base as org.projectluma.Platform//44. 90-luma-husky-gpu selects
+# the extension with FLATPAK_GL_DRIVERS once it matches the prefix.
+# Rebuilt only when the prefix's BUILD-INFO changes; removed with gpu-off.
+set -eu
+m=/var/lib/luma-husky/mesa
+e=/var/lib/flatpak/extension/org.projectluma.Platform.GL.luma-husky/aarch64/44
+if [ -e /var/lib/luma-husky/gpu-off ] || [ ! -f $m/BUILD-INFO ]; then
+	rm -rf "$e"
+	exit 0
+fi
+[ "$(cat $m/BUILD-INFO)" = "$(cat "$e/BUILD-INFO" 2>/dev/null)" ] && exit 0
+rm -rf "$e.new"
+mkdir -p "$e.new/lib/gbm" "$e.new/glvnd/egl_vendor.d" "$e.new/vulkan/icd.d"
+cp -a $m/lib64/libEGL_mesa.so* $m/lib64/libgallium-*.so $m/lib64/libgbm.so* \
+	$m/lib64/libvulkan_panfrost.so "$e.new/lib/"
+cp -a $m/lib64/gbm/dri_gbm.so "$e.new/lib/gbm/"
+cp $m/share/glvnd/egl_vendor.d/50_mesa.json "$e.new/glvnd/egl_vendor.d/"
+# The prefix's ICD names its absolute host path; inside the sandbox the
+# extension's lib directory is on the library path.
+for icd in $m/share/vulkan/icd.d/*.json; do
+	sed 's#"library_path": *"[^"]*"#"library_path": "libvulkan_panfrost.so"#' "$icd" \
+		> "$e.new/vulkan/icd.d/$(basename "$icd")"
+done
+# BUILD-INFO last: 90-luma-husky-gpu treats a matching copy as complete.
+cp $m/BUILD-INFO "$e.new/"
+rm -rf "$e"
+mv "$e.new" "$e"
