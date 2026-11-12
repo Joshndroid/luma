@@ -20,9 +20,6 @@ args = [
   "rdinit=/init",
   "loglevel=7",
   "printk.time=1",
-  # Until the kernel models them all, clocks it does not know stay as the
-  # bootloader left them.
-  "clk_ignore_unused",
   # MTE tag storage is not enabled by the firmware; Android sets this too.
   "arm64.nomte",
   "fbcon=font:TER16x32",
