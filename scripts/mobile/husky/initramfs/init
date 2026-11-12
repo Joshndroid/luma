@@ -256,6 +256,11 @@ RemainAfterExit=yes
 ExecStart=/bin/sh -c 'cd /run/luma-husky-modules && for m in aoc aoc-channel aoc-usf aoc-usf-iio; do /usr/sbin/insmod $m.ko || exit 1; done'
 # Bluetooth over the AoC (hci_aoc). A failure here must not stop audio.
 ExecStart=-/usr/sbin/insmod /run/luma-husky-modules/hci_aoc.ko
+# Tap to wake: the Touch Bus Negotiator hands the touch bus to the AoC while
+# the panel is off, and aoc-gesture-wake arms the AoC's touch gesture sensor.
+# Touch works without either.
+ExecStart=-/usr/sbin/insmod /run/luma-husky-modules/touch_bus_negotiator.ko
+ExecStart=-/usr/sbin/insmod /run/luma-husky-modules/aoc-gesture-wake.ko
 # Speaker amplifiers (CS35L41 on spi_19) and the AoC sound card; off with
 # /var/lib/luma-husky/audio-off. Both amplifiers are muted as soon as the
 # card exists, before speaker protection is armed: their power-on default is
