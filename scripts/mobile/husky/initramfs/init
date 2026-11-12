@@ -290,6 +290,23 @@ ExecStart=/bin/sh -c 'cd /run/luma-husky-modules && /usr/sbin/insmod tcpci_maxim
 EOF
 ln -sf ../luma-husky-usbc.service /run/systemd/system/multi-user.target.wants/
 
+# --- 8b. Touch boost ------------------------------------------------------------
+# Applications draw on the Cortex-A520 cluster, where schedutil lags the
+# short per-frame bursts of a scroll. While the touchscreen is in use, and
+# for 3 s after (a fling keeps scrolling), its floor is 1704 MHz, its top
+# step. Off with /var/lib/luma-husky/touch-boost-off.
+cat > /run/systemd/system/luma-husky-touch-boost.service <<'EOF'
+[Unit]
+Description=Luma husky: raise the small cores' frequency floor while touching
+ConditionPathExists=!/var/lib/luma-husky/touch-boost-off
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/insmod /run/luma-husky-modules/cpufreq-touch-boost.ko freqs=1704000 hold_ms=3000
+EOF
+ln -sf ../luma-husky-touch-boost.service /run/systemd/system/multi-user.target.wants/
+
 # --- 9. Wi-Fi ----------------------------------------------------------------------
 # bcmdhd also registers wlan1 (a second interface for Android's concurrency
 # HAL) and aware_nmi0 (Wi-Fi Aware); NetworkManager would list them as extra
