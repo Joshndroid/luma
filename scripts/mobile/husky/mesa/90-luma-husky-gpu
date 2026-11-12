@@ -13,3 +13,9 @@ echo "GBM_BACKENDS_PATH=$m/lib64/gbm"
 echo "LIBGL_DRIVERS_PATH=$m/lib64/dri"
 echo "GSK_RENDERER=ngl"
 echo "GDK_DISABLE=vulkan"
+# Flatpak apps get the same Mesa through the GL extension that
+# flatpak-gl-extension builds from the prefix (once it matches the prefix).
+e=/var/lib/flatpak/extension/org.projectluma.Platform.GL.luma-husky/aarch64/44
+if [ "$(cat $m/BUILD-INFO)" = "$(cat $e/BUILD-INFO 2>/dev/null)" ]; then
+	echo "FLATPAK_GL_DRIVERS=luma-husky"
+fi

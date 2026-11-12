@@ -121,6 +121,7 @@ install -m 0644 "$luma/config/mobile/luma-shell-handheld.dconf" \
 install -m 0644 "$luma/config/mobile/display-geometry/google-husky.json" \
 	"$work/root/luma/handheld/display-geometry.json"
 install -m 0755 "$here/mesa/90-luma-husky-gpu" "$work/root/luma/mesa/"
+install -m 0755 "$here/mesa/flatpak-gl-extension" "$work/root/luma/mesa/"
 install -D -m 0755 "$here/initramfs/audio/speaker-calibrate" "$work/root/luma/audio/speaker-calibrate"
 install -D -m 0755 "$here/initramfs/audio/speaker-ready" "$work/root/luma/audio/speaker-ready"
 install -D -m 0644 "$here/initramfs/audio/aoc-audio.conf" "$work/root/luma/audio/aoc-audio.conf"
