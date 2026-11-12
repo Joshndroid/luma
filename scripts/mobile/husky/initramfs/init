@@ -229,6 +229,11 @@ mkdir -p /run/udev/rules.d
 cat > /run/udev/rules.d/72-luma-husky-haptics.rules <<'EOF'
 SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", SUBSYSTEMS=="input", ATTRS{name}=="cs40l26_input", TAG+="uaccess", ENV{FEEDBACKD_TYPE}="vibra"
 EOF
+# husky has no device kit yet (devices/README.md: boot image only), and
+# LumaRoot is a loop device over userdata, so LumaBoot never shows up as a
+# block device. luma-device-layer would wait 30 s for it on every boot,
+# holding back the display manager. Skip it until husky has a kit.
+ln -sf /dev/null /run/systemd/system/luma-device-layer.service
 
 # --- 6. firmware and modules ----------------------------------------------------
 # Drivers load firmware again after switch_root (Wi-Fi when wlan0 comes up, the
