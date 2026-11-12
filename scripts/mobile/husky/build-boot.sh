@@ -37,7 +37,8 @@ sound/soc/codecs/snd-soc-cs35l41-lib sound/soc/codecs/snd-soc-cs35l41
 sound/soc/codecs/snd-soc-cs35l41-spi sound/soc/google/snd-soc-google-aoc
 drivers/bluetooth/hci_aoc
 drivers/input/touchscreen/touch_bus_negotiator drivers/input/misc/aoc-gesture-wake
-drivers/usb/typec/tcpm/tcpci_maxim drivers/power/supply/max77759_charger"
+drivers/usb/typec/tcpm/tcpci_maxim drivers/power/supply/max77759_charger
+drivers/cpufreq/cpufreq-touch-boost"
 
 kernel="" firmware="" busybox_rpm="" mali_fw="" avb_key="" out=$PWD/out-husky
 while [ $# -gt 0 ]; do
