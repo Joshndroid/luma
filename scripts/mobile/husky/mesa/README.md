@@ -39,3 +39,14 @@ to apply it.
 
 To go back to software rendering, `touch /var/lib/luma-husky/gpu-off`
 (or remove the prefix) and restart the display manager.
+
+## Flatpak apps
+
+Flatpak apps do not see the prefix: they take Mesa from the runtime's GL
+extension, Fedora 44's 26.2, and draw with llvmpipe on the CPU. The boot
+image's `luma-husky-flatpak-gl.service` runs `flatpak-gl-extension` before
+any session: it copies the prefix into the unmanaged extension
+`/var/lib/flatpak/extension/org.projectluma.Platform.GL.luma-husky/aarch64/44`
+whenever the prefix's `BUILD-INFO` changes (the prefix was built against
+Fedora 44, the base of `org.projectluma.Platform//44`), and the generator
+then sets `FLATPAK_GL_DRIVERS=luma-husky`. `gpu-off` removes the extension.
