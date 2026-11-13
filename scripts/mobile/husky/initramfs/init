@@ -251,6 +251,16 @@ mkdir -p /run/udev/rules.d
 cat > /run/udev/rules.d/72-luma-husky-haptics.rules <<'EOF'
 SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", SUBSYSTEMS=="input", ATTRS{name}=="cs40l26_input", TAG+="uaccess", ENV{FEEDBACKD_TYPE}="vibra"
 EOF
+# The modem's device nodes carry its identity and traffic: AT/SIT/OEM ports
+# (can read the IMEI), the GNSS ports and the RFS file channel (NV data).
+# The kernel already creates them root-only (0600). Pin that, := so no later
+# rule can widen it, and drop any uaccess tag before 73-seat-late turns it
+# into a seat ACL. A service that needs one gets its own rule deliberately.
+cat > /run/udev/rules.d/72-luma-husky-modem-private.rules <<'EOF'
+SUBSYSTEM=="wwan", KERNEL=="wwan*", ENV{DEVNAME}!="", TAG-="uaccess", OWNER:="root", GROUP:="root", MODE:="0600"
+SUBSYSTEM=="gnss", SUBSYSTEMS=="wwan", TAG-="uaccess", OWNER:="root", GROUP:="root", MODE:="0600"
+SUBSYSTEM=="misc", KERNEL=="s5xxx-rfs-*", TAG-="uaccess", OWNER:="root", GROUP:="root", MODE:="0600"
+EOF
 # husky has no device kit yet (devices/README.md: boot image only), and
 # LumaRoot is a loop device over userdata, so LumaBoot never shows up as a
 # block device. luma-device-layer would wait 30 s for it on every boot,
