@@ -240,6 +240,8 @@ ln -sf /dev/null /run/systemd/system/luma-device-layer.service
 # AoC and amplifiers when their modules load), where the initramfs is gone.
 # Keep a copy in /run, moved into the system below, and point the loader at it.
 mkdir -p /run/luma-husky-firmware /run/luma-husky-modules
+# Files in /run are var_run_t, which SELinux will not load modules from: the
+# units that insmod from here relabel the copies modules_object_t first.
 cp -r /lib/firmware/. /run/luma-husky-firmware/
 echo -n /run/luma-husky-firmware > /sys/module/firmware_class/parameters/path
 cp /luma/modules/*.ko /run/luma-husky-modules/ 2>/dev/null
@@ -272,6 +274,7 @@ ConditionPathExists=!/var/lib/luma-husky/aoc-off
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=-/usr/bin/chcon -R -t modules_object_t /run/luma-husky-modules
 ExecStart=/bin/sh -c 'cd /run/luma-husky-modules && for m in aoc aoc-channel aoc-usf aoc-usf-iio; do /usr/sbin/insmod $m.ko || exit 1; done'
 # Bluetooth over the AoC (hci_aoc). A failure here must not stop audio.
 ExecStart=-/usr/sbin/insmod /run/luma-husky-modules/hci_aoc.ko
@@ -305,6 +308,7 @@ ConditionPathExists=!/var/lib/luma-husky/usbc-off
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=-/usr/bin/chcon -R -t modules_object_t /run/luma-husky-modules
 ExecStart=/bin/sh -c 'cd /run/luma-husky-modules && /usr/sbin/insmod tcpci_maxim.ko && /usr/sbin/insmod max77759_charger.ko'
 EOF
 ln -sf ../luma-husky-usbc.service /run/systemd/system/multi-user.target.wants/
@@ -325,6 +329,7 @@ ConditionPathExists=!/var/lib/luma-husky/touch-boost-off
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=-/usr/bin/chcon -R -t modules_object_t /run/luma-husky-modules
 ExecStart=/usr/sbin/insmod /run/luma-husky-modules/cpufreq-touch-boost.ko freqs=1704000,0,0,0,1572000,0,0,0,1885000 hold_ms=3000
 EOF
 ln -sf ../luma-husky-touch-boost.service /run/systemd/system/multi-user.target.wants/
