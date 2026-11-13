@@ -278,6 +278,71 @@ cp -r /lib/firmware/. /run/luma-husky-firmware/
 echo -n /run/luma-husky-firmware > /sys/module/firmware_class/parameters/path
 cp /luma/modules/*.ko /run/luma-husky-modules/ 2>/dev/null
 
+# --- 6b. modem calibration, root-only -------------------------------------------
+# The modem driver loads this phone's NV calibration (efs) and its CP signature
+# (persist) by firmware name, like any other blob. They exist once per phone and
+# must never sit in the world-readable firmware tree, in a log or on disk. So
+# the driver's directory is a ramfs (RAM only, never swapped), mode 0700 root:
+# the firmware loader reads it with kernel credentials, and no user can list or
+# open it. This runs before any other program has started. efs and persist are
+# read through read-only loop devices and nothing is ever written to them. A
+# file that is missing or the wrong size is reported and left out (the modem
+# then refuses to boot), never fatal. Contents are never printed. (The .md5
+# files next to the NV images are not plain MD5s of them, so they go unchecked.)
+modem_fw=/run/luma-husky-firmware/google/s5300
+partdev() {
+	for u in /sys/class/block/sd*/uevent; do
+		grep -qx "PARTNAME=$1" "$u" 2>/dev/null || continue
+		echo "/dev/$(sed -n 's/^DEVNAME=//p' "$u")"
+		return
+	done
+}
+# A regular file of the expected size, reached without following a symlink.
+modem_file_ok() {
+	case $3 in */*) [ ! -L "${1%/*}" ] || return 1 ;; esac
+	[ ! -L "$1" ] && [ -f "$1" ] && [ "$(stat -c %s "$1")" = "$2" ]
+}
+# stage_modem PARTITION FILE:SIZE:NAME... copies each FILE on PARTITION to
+# $modem_fw/NAME.
+stage_modem() {
+	part=$1 dev=$(partdev "$1") mnt=/tmp/luma-$1 loop=""
+	shift
+	[ -b "$dev" ] && loop=$(losetup -f) && losetup -r "$loop" "$dev" ||
+		{ say "WARNING: cannot open $part; modem files from it not staged"; return; }
+	mkdir -p "$mnt"
+	if mount -t f2fs -o ro,norecovery,nodev,nosuid,noexec "$loop" "$mnt"; then
+		for spec; do
+			file=${spec%%:*} size=${spec#*:}
+			name=${size#*:} size=${size%%:*}
+			if modem_file_ok "$mnt/$file" "$size" "$file" &&
+				mkdir -p "$modem_fw/${name%/*}" &&
+				cat "$mnt/$file" > "$modem_fw/$name" &&
+				chmod 0400 "$modem_fw/$name"; then
+				say "$part:$file staged for the modem (root only)"
+			else
+				rm -f "$modem_fw/$name"
+				say "WARNING: $part:$file missing or damaged; not staged"
+			fi
+		done
+		umount "$mnt"
+	else
+		say "WARNING: cannot mount $part; modem files from it not staged"
+	fi
+	rmdir "$mnt"
+	losetup -d "$loop"
+}
+mkdir -p "$modem_fw"
+if mount -t ramfs -o mode=0700,nodev,nosuid,noexec ramfs "$modem_fw"; then
+	(
+		umask 077
+		stage_modem persist modem/cpsha:64:persist/modem/cpsha
+		stage_modem efs nv_normal.bin:524288:efs/nv_normal.bin \
+			nv_protected.bin:524288:efs/nv_protected.bin
+	)
+else
+	say "WARNING: no private modem directory; modem calibration not staged"
+fi
+
 # --- 7. AoC: sensors, audio and Bluetooth ----------------------------------------
 # Audio: the calibration step and speaker-ready check, and the card's UCM
 # profile in a /run tree that PipeWire's alsa-lib reads (ALSA_CONFIG_UCM2; the
