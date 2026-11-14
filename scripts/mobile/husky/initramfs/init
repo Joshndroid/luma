@@ -266,6 +266,12 @@ EOF
 # block device. luma-device-layer would wait 30 s for it on every boot,
 # holding back the display manager. Skip it until husky has a kit.
 ln -sf /dev/null /run/systemd/system/luma-device-layer.service
+# FUSE is built in, and husky has no userspace I2C device consumer. Mask only
+# the Fedora package defaults that would ask kmod for absent modules.
+mkdir -p /run/modules-load.d
+for name in fuse-overlayfs open-vm-tools fwupd-i2c i2c-tools; do
+	ln -sf /dev/null "/run/modules-load.d/$name.conf"
+done
 
 # --- 6. firmware and modules ----------------------------------------------------
 # Drivers load firmware again after switch_root (Wi-Fi when wlan0 comes up, the

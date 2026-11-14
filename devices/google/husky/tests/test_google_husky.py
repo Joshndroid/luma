@@ -72,6 +72,11 @@ class HuskyProfile(unittest.TestCase):
         self.assertIn("/etc/dconf/db/gdm.d/10-luma-handheld", init)
         self.assertNotIn("power-button-action=", init)
 
+    def test_unused_vendor_module_requests_are_masked(self):
+        init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
+        self.assertIn("for name in fuse-overlayfs open-vm-tools fwupd-i2c i2c-tools", init)
+        self.assertIn('ln -sf /dev/null "/run/modules-load.d/$name.conf"', init)
+
     def test_firmware_manifest_is_exact(self):
         device = load("device.toml")
         manifest = (DEVICE / "firmware.manifest").read_bytes()
