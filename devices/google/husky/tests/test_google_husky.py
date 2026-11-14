@@ -78,6 +78,23 @@ class HuskyProfile(unittest.TestCase):
         self.assertEqual(hashlib.sha256(manifest).hexdigest(),
                          device["firmware"]["manifest_sha256"])
 
+    def test_modem_data_stays_read_only_and_root_only(self):
+        init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
+        self.assertIn(
+            "for name in persist efs efs_backup modem_userdata modem_a modem_b; do",
+            init,
+        )
+        self.assertIn('blockdev --setro "$dev"', init)
+        self.assertIn(
+            'mount -t ramfs -o mode=0700,nodev,nosuid,noexec ramfs "$modem_fw"',
+            init,
+        )
+        self.assertIn('mount -t f2fs -o ro,norecovery,nodev,nosuid,noexec', init)
+        self.assertIn('mount -t ext4 -o ro,noload,nodev,nosuid,noexec', init)
+        self.assertIn('chmod 0400 "$modem_fw/$name"', init)
+        self.assertIn("PrivateMounts=yes", init)
+        self.assertIn('MODE:="0600"', init)
+
 
 if __name__ == "__main__":
     unittest.main()
