@@ -135,12 +135,13 @@ case $release in
 	"$base_release"*) localversion=${release#"$base_release"} ;;
 	*) echo "kernel release $release is not based on $base_release" >&2; exit 1 ;;
 esac
-k() { make -C "$kernel" O="$obj" ARCH=arm64 LLVM=1 LOCALVERSION="$localversion" "$@"; }
+k() { make -C "$kernel" O="$obj" ARCH=arm64 LLVM=1 LOCALVERSION= "$@"; }
 k defconfig
 "$kernel/scripts/kconfig/merge_config.sh" -m -O "$obj" \
 	"$obj/.config" "$common_config" "$config"
 "$kernel/scripts/config" --file "$obj/.config" --set-str CMDLINE "$cmdline"
 "$kernel/scripts/config" --file "$obj/.config" --enable CMDLINE_FORCE
+"$kernel/scripts/config" --file "$obj/.config" --set-str LOCALVERSION "$localversion"
 "$kernel/scripts/config" --file "$obj/.config" --set-str INITRAMFS_SOURCE \
 	"$work/root $work/devnodes.list"
 k olddefconfig
