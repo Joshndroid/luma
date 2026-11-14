@@ -339,9 +339,136 @@ if mount -t ramfs -o mode=0700,nodev,nosuid,noexec ramfs "$modem_fw"; then
 		stage_modem efs nv_normal.bin:524288:efs/nv_normal.bin \
 			nv_protected.bin:524288:efs/nv_protected.bin
 	)
+	# The CP's own image (about 100 MB) is not copied: the booted slot's
+	# modem partition is mounted read-only where the driver's firmware-name
+	# points (modem/images/default/modem.bin). The two slots can carry
+	# different builds, and the NV files belong to the one that last ran.
+	slot=$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^androidboot.slot_suffix=//p' | tail -n 1)
+	mpart=modem${slot:-_a} mdev=$(partdev "$mpart") mloop=""
+	if [ -b "$mdev" ] && mloop=$(losetup -f) && losetup -r "$mloop" "$mdev" &&
+		mkdir -p "$modem_fw/modem" &&
+		mount -t ext4 -o ro,noload,nodev,nosuid,noexec "$mloop" "$modem_fw/modem"; then
+		say "$mpart mounted read-only for the modem"
+	else
+		[ -n "$mloop" ] && losetup -d "$mloop" 2>/dev/null
+		say "WARNING: $mpart not mounted; no modem image"
+	fi
 else
 	say "WARNING: no private modem directory; modem calibration not staged"
 fi
+
+# The replay archive is packed from modem_userdata on every boot (the CP
+# rejects a stale one) by a root unit, since it needs Python: into the same
+# root-only ramfs, with its source mount private to the unit.
+mkdir -p /run/luma-husky-modem
+chmod 0700 /run/luma-husky-modem
+cat > /run/luma-husky-modem/replay.py <<'EOF'
+#!/usr/bin/python3
+"""Pack this boot's modem replay archive, root only and in RAM.
+
+The s5300 CP takes modem_userdata:/replay/dds.bin as a 512 KiB ustar region
+(format from Luma's Pixel 9 Fold helper) and rejects a stale one, so it is
+packed on every boot, stamped with the current time. modem_userdata is read
+through a read-only loop device and never written; the content is never
+printed.
+"""
+import glob
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+OUT = "/run/luma-husky-firmware/google/s5300/replay_region.bin"
+SIZE = 512 * 1024
+
+
+def partition(name):
+    for u in glob.glob("/sys/class/block/sd*/uevent"):
+        lines = open(u).read().split()
+        if "PARTNAME=" + name in lines:
+            return "/dev/" + [l[8:] for l in lines if l.startswith("DEVNAME=")][0]
+    raise SystemExit(name + ": no such partition")
+
+
+def header(name, size):
+    h = bytearray(512)
+    h[0:len(name)] = name.encode()
+    h[100:108] = b"0000666\0"
+    h[108:116] = b"%07o\0" % 1001
+    h[116:124] = b"%07o\0" % 1000
+    h[124:136] = b"%011o\0" % size
+    h[136:148] = b"%011o\0" % int(time.time())
+    h[148:156] = b"        "
+    h[156] = ord("0")
+    h[257:263] = b"ustar "
+    h[263:265] = b" \0"
+    h[265:270] = b"radio"
+    h[297:303] = b"system"
+    h[148:156] = b"%06o\0 " % sum(h)
+    return bytes(h)
+
+
+def main():
+    dev = partition("modem_userdata")
+    loop = subprocess.run(["/usr/sbin/losetup", "-r", "-f", "--show", dev],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        with tempfile.TemporaryDirectory(dir="/run/luma-husky-modem") as mnt:
+            subprocess.run(["mount", "-t", "f2fs", "-o",
+                            "ro,norecovery,nodev,nosuid,noexec", loop, mnt], check=True)
+            try:
+                if os.path.islink(os.path.join(mnt, "replay")):
+                    raise SystemExit("replay is a symlink")
+                fd = os.open(os.path.join(mnt, "replay/dds.bin"), os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise SystemExit("dds.bin is not a regular file")
+                    data = os.read(fd, SIZE)
+                finally:
+                    os.close(fd)
+            finally:
+                subprocess.run(["umount", mnt], check=True)
+    finally:
+        subprocess.run(["/usr/sbin/losetup", "-d", loop], check=True)
+    if not 0 < len(data) <= SIZE - 1536:
+        raise SystemExit("dds.bin is %d bytes" % len(data))
+    blob = header("replay/dds.bin", len(data)) + data
+    blob += bytes(SIZE - len(blob))
+    tmp = OUT + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    try:
+        os.write(fd, blob)
+    finally:
+        os.close(fd)
+    os.replace(tmp, OUT)
+    print("replay region packed from %d bytes" % len(data))
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    try:
+        os.unlink(OUT + ".new")
+    except FileNotFoundError:
+        pass
+    sys.exit(main())
+EOF
+cat > /run/systemd/system/luma-husky-modem-replay.service <<'EOF'
+[Unit]
+Description=Pack the modem replay archive (root only, RAM only)
+After=local-fs.target
+ConditionPathIsMountPoint=/run/luma-husky-firmware/google/s5300
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+PrivateMounts=yes
+ExecStart=/usr/bin/python3 /run/luma-husky-modem/replay.py
+[Install]
+WantedBy=multi-user.target
+EOF
+ln -sf ../luma-husky-modem-replay.service /run/systemd/system/multi-user.target.wants/
 
 # --- 7. AoC: sensors, audio and Bluetooth ----------------------------------------
 # Audio: the calibration step and speaker-ready check, and the card's UCM
