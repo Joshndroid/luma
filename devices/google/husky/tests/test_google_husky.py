@@ -31,6 +31,15 @@ class HuskyProfile(unittest.TestCase):
         self.assertNotIn("device_repo", device)
         self.assertEqual(device["updates"]["ostree_ref"], "luma/1/aarch64/nightly")
 
+    def test_kernel_uses_the_luma_zuma_branch_layout(self):
+        kernel = load("device.toml")["kernel"]
+        self.assertEqual(kernel["tag"], "luma-kernel-7.2.15-zuma")
+        self.assertEqual(kernel["release"], "7.2.15-zuma")
+        self.assertEqual(kernel["config"], "luma/config/zuma.fragment")
+        build = (ROOT / "scripts/mobile/husky/build-boot.sh").read_text()
+        self.assertIn("luma/config/luma.fragment", build)
+        self.assertIn("scripts/kconfig/merge_config.sh", build)
+
     def test_identity_partitions_are_preserved(self):
         preserve = set(load("device.toml")["install"]["preserve"])
         self.assertTrue(IDENTITY <= preserve)

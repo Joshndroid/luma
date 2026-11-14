@@ -26,9 +26,9 @@ fastboot_product = "husky"
 # luma/husky/tools/ect-decode.py and fvmap-decode.py in the kernel tree
 # regenerate them. Thermal budgets are downstream zuma's (LITTLE 200, BIG
 # 2000 mW) or measured on the phone (MID 2500, GPU 1300 mW).
-tag = "luma-husky-alpha1-7.3.0-rc5-zuma-luma-husky"
-release = "7.3.0-rc5-zuma-luma-husky"
-config = "luma/husky/alpha1/config-7.3.0-rc5-zuma-luma-husky"
+tag = "luma-kernel-7.2.15-zuma"
+release = "7.2.15-zuma"
+config = "luma/config/zuma.fragment"
 # Relative to the SoC's dts_directory (arch/arm64/boot/dts/exynos): the
 # schema allows one directory level and Exynos boards sit at exynos/google/.
 dtb = "google/zuma-husky.dtb"

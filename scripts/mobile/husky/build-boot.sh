@@ -67,11 +67,13 @@ print(v)' "$@"
 }
 release=$(toml "$device/device.toml" kernel release)
 config=$kernel/$(toml "$device/device.toml" kernel config)
+common_config=$kernel/luma/config/luma.fragment
 os_version=$(toml "$device/boot.toml" os_version)
 patch_level=$(toml "$device/boot.toml" os_patch_level | cut -c1-7)
 partition_size=$(toml "$device/boot.toml" partition_size)
 rollback_index=$(toml "$device/boot.toml" avb rollback_index)
-[ -f "$config" ] || { echo "no kernel config at $config (is --kernel the zuma branch?)" >&2; exit 1; }
+[ -f "$config" ] || { echo "no Zuma config fragment at $config" >&2; exit 1; }
+[ -f "$common_config" ] || { echo "no shared Luma config fragment at $common_config" >&2; exit 1; }
 # The kernel forces its built-in command line: boot.toml's fixed arguments,
 # then the generic phone userdata image's filesystems (the UUIDs the device
 # kit builder checks for) and ostree=aboot. The config must carry exactly that.
@@ -85,13 +87,6 @@ values = {"pmos_root_uuid": kit.ROOT_UUID, "pmos_boot_uuid": kit.BOOT_UUID, "ost
 print(" ".join(boot["args"] + [f"{k}={values[k]}" for k in boot["generated"]]))
 EOF
 )
-[ "$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "$config")" = "$cmdline" ] || {
-	echo "CONFIG_CMDLINE in $config is not boot.toml's command line:" >&2
-	echo "  $cmdline" >&2
-	exit 1
-}
-grep -qx 'CONFIG_CMDLINE_FORCE=y' "$config" || { echo "$config does not force its command line" >&2; exit 1; }
-
 echo "$busybox_rpm_sha256  $busybox_rpm" | sha256sum -c --quiet
 echo "$mali_fw_sha256  $mali_fw" | sha256sum -c --quiet
 python3 "$here/firmware.py" check "$firmware" "$device/firmware.manifest"
@@ -133,13 +128,30 @@ nod /dev/null 0666 0 0 c 1 3
 EOF
 
 # --- kernel -------------------------------------------------------------------
-# LOCALVERSION= (empty) keeps scripts/setlocalversion from appending "+", so
-# the release is exactly the one device.toml names.
-k() { make -C "$kernel" O="$obj" ARCH=arm64 LLVM=1 LOCALVERSION= "$@"; }
-cp "$config" "$obj/.config"
+# Luma kernels start with arm64 defconfig, then merge the shared and family
+# fragments carried by SimplyLuma/linux. Derive LOCALVERSION from device.toml.
+base_release=$(make -s -C "$kernel" ARCH=arm64 kernelversion)
+case $release in
+	"$base_release"*) localversion=${release#"$base_release"} ;;
+	*) echo "kernel release $release is not based on $base_release" >&2; exit 1 ;;
+esac
+k() { make -C "$kernel" O="$obj" ARCH=arm64 LLVM=1 LOCALVERSION="$localversion" "$@"; }
+k defconfig
+"$kernel/scripts/kconfig/merge_config.sh" -m -O "$obj" \
+	"$obj/.config" "$common_config" "$config"
+"$kernel/scripts/config" --file "$obj/.config" --set-str CMDLINE "$cmdline"
+"$kernel/scripts/config" --file "$obj/.config" --enable CMDLINE_FORCE
 "$kernel/scripts/config" --file "$obj/.config" --set-str INITRAMFS_SOURCE \
 	"$work/root $work/devnodes.list"
 k olddefconfig
+[ "$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "$obj/.config")" = "$cmdline" ] || {
+	echo "configured kernel command line differs from boot.toml" >&2
+	exit 1
+}
+grep -qx 'CONFIG_CMDLINE_FORCE=y' "$obj/.config" || {
+	echo "configured kernel does not force its command line" >&2
+	exit 1
+}
 [ "$(k -s kernelrelease)" = "$release" ] || { echo "kernel release is not $release" >&2; exit 1; }
 # The embedded DTB first (vmlinux links it in, and no rule builds it), then
 # vmlinux, which modpost needs; the Image link below repacks the initramfs once
