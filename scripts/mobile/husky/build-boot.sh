@@ -145,6 +145,7 @@ k defconfig
 "$kernel/scripts/config" --file "$obj/.config" --set-str INITRAMFS_SOURCE \
 	"$work/root $work/devnodes.list"
 k olddefconfig
+k include/config/auto.conf
 [ "$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "$obj/.config")" = "$cmdline" ] || {
 	echo "configured kernel command line differs from boot.toml" >&2
 	exit 1
