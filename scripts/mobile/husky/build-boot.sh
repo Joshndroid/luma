@@ -144,6 +144,10 @@ k defconfig
 "$kernel/scripts/config" --file "$obj/.config" --set-str LOCALVERSION "$localversion"
 "$kernel/scripts/config" --file "$obj/.config" --set-str INITRAMFS_SOURCE \
 	"$work/root $work/devnodes.list"
+# The shared arm64 kernel is larger than the old Husky-only one; xz keeps the
+# built-in initramfs (mostly firmware) inside the 64 MiB boot partition.
+"$kernel/scripts/config" --file "$obj/.config" \
+	--disable INITRAMFS_COMPRESSION_GZIP --enable INITRAMFS_COMPRESSION_XZ
 k olddefconfig
 k include/config/auto.conf
 [ "$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "$obj/.config")" = "$cmdline" ] || {
