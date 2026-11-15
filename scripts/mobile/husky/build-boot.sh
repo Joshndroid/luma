@@ -168,6 +168,8 @@ k -j"$(nproc)" modules
 for m in $modules; do
 	install -m 0644 "$obj/$m.ko" "$work/root/luma/modules/"
 done
+# Debug info is most of each module's size (as INSTALL_MOD_STRIP=1 does).
+llvm-strip --strip-debug "$work"/root/luma/modules/*.ko
 k -j"$(nproc)" Image
 
 # --- boot image (devices/google/husky/boot.toml) ------------------------------
