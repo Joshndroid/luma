@@ -44,15 +44,15 @@ config = "boot.toml"
 # 03e02c8b011c39546f058af2f9195a7ed0494b74e9dd253c37c576adc8b1a277), and
 # scripts/mobile/husky/build-boot.sh refuses any tree that differs from this
 # manifest. It covers the CS40L26 haptics, the BCM4398 Wi-Fi (firmware, NVRAM,
-# CLM and TX-cap blobs for every chip revision and SKU), the Bluetooth patch
+# CLM and TX-cap blobs for every SKU of the retail d0 chip), the Bluetooth patch
 # file, the AoC image and sensor registry, and the CS35L41 speaker-protection
 # firmware. The boot image carries it in its initramfs, as on the Pixel 9.
 # The speakers' factory calibration is per phone and is read on the phone,
 # read-only, from persist. The GPU's CSF firmware
 # (arm/mali/arch11.8/mali_csffw.bin.xz) comes from Luma's linux-firmware.
 manifest = "firmware.manifest"
-manifest_sha256 = "b3daeae84de9971eda5e015f1e65e5c3cb925fbbc333588ec1d4e3643fbb270a"
-files = 41
+manifest_sha256 = "22f0add6b8612742994aac35f93bab69b818f3af2197cd2353650c0a06968f14"
+files = 34
 # Where a device package would install it; until husky has one, the files
 # travel in the boot image and the initramfs points the loader at a copy.
 store = "/usr/lib/firmware"
