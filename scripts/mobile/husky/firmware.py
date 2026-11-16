@@ -51,10 +51,14 @@ FILES = [
     ("firmware/cs35l41-dsp1-spk-prot.bin", "cirrus/cs35l41-dsp1-spk-prot-husky.bin", True),
     ("firmware/R-cs35l41-dsp1-spk-prot.bin", "cirrus/cs35l41-dsp1-spk-prot-husky-r.bin", True),
 ]
-# BCM4398 Wi-Fi: firmware, NVRAM, CLM and TX-cap blobs for every chip revision
-# and SKU on the image; bcmdhd appends the revision or SKU itself. The symbol
-# maps (fw_bcmdhd.map_*) are for crash dumps only and are left out.
+# BCM4398 Wi-Fi: firmware, NVRAM, CLM and TX-cap blobs for every SKU on the
+# image; bcmdhd appends the chip revision or SKU itself. Retail Pixel 8 Pros
+# carry chip revision d0 (bcmdhd: "chiprev string(d0) found"); the image also
+# holds the pre-production b0 and c0 sets, about 1.9 MB of the 64 MiB boot
+# image once compressed, which are left out. The symbol maps (fw_bcmdhd.map_*)
+# are for crash dumps only and are left out too.
 WIFI_PREFIXES = ("fw_bcmdhd.bin_", "bcmdhd.cal_", "bcmdhd_clm.blob_", "bcmdhd_txcap.blob_")
+WIFI_SKIP = ("_4398_b0", "_4398_c0")
 WIFI_REQUIRED = ("fw_bcmdhd.bin_4398_d0", "bcmdhd_clm.blob_4398_d0", "bcmdhd_txcap.blob_4398_d0")
 
 
@@ -169,7 +173,8 @@ def extract(args):
                 dump_tree(vendor, src, out / dest)
             else:
                 dump(vendor, src, out / dest)
-        wifi = [n for n, d in listing(vendor, "firmware") if not d and n.startswith(WIFI_PREFIXES)]
+        wifi = [n for n, d in listing(vendor, "firmware")
+                if not d and n.startswith(WIFI_PREFIXES) and not n.endswith(WIFI_SKIP)]
         for name in WIFI_REQUIRED:
             if name not in wifi:
                 raise SystemExit(f"error: firmware/{name} not in vendor")
