@@ -99,6 +99,21 @@ luma_ostree_resolve /sysroot || fallback "no usable OSTree deployment"
 luma_ostree_apply /sysroot "$cmdline" || fallback "cannot point root.a at $LUMA_OSTREE_DEPLOY"
 deploy=/sysroot/ostree/$LUMA_OSTREE_DEPLOY
 say "deployment $LUMA_OSTREE_DEPLOY ($LUMA_OSTREE_REASON)"
+# greenboot keeps its boot counter in /boot/grub2/grubenv, which the resolver
+# above reads (as the shared hooks-extra/50-luma-ostree-default.sh prepares
+# it on the Fairphone). There is no GRUB, so nothing else creates it, and
+# grub2-editenv refuses a missing directory. Create both while LumaRoot is
+# writable here (/boot is read-only later) with the label policy gives them.
+grubenv=/sysroot/boot/grub2/grubenv
+if [ ! -f "$grubenv" ]; then
+	if mkdir -p -m 0700 "${grubenv%/*}" && luma_grubenv_set "$grubenv" &&
+		setfattr -n security.selinux -v system_u:object_r:boot_t:s0 \
+			"${grubenv%/*}" "$grubenv"; then
+		say "created $grubenv"
+	else
+		say "WARNING: cannot create $grubenv"
+	fi
+fi
 
 # --- 4. ostree-prepare-root, from the deployment ---------------------------------
 # Its configuration is read from the initramfs, so take the deployment's.
@@ -266,6 +281,10 @@ EOF
 # block device. luma-device-layer would wait 30 s for it on every boot,
 # holding back the display manager. Skip it until husky has a kit.
 ln -sf /dev/null /run/systemd/system/luma-device-layer.service
+# A phone has no EFI system partition for bootupd to update. Images from
+# build-phone-userdata.sh mask it in /etc (since 2026-11-10); this covers
+# installs made before that.
+ln -sf /dev/null /run/systemd/system/bootloader-update.service
 # FUSE is built in, and husky has no userspace I2C device consumer. Mask only
 # the Fedora package defaults that would ask kmod for absent modules.
 mkdir -p /run/modules-load.d
