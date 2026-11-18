@@ -121,6 +121,7 @@ install -D -m 0755 "$here/initramfs/audio/speaker-calibrate" "$work/root/luma/au
 install -D -m 0755 "$here/initramfs/audio/speaker-ready" "$work/root/luma/audio/speaker-ready"
 install -D -m 0644 "$here/initramfs/audio/aoc-audio.conf" "$work/root/luma/audio/aoc-audio.conf"
 install -D -m 0644 "$here/initramfs/audio/HiFi.conf" "$work/root/luma/audio/HiFi.conf"
+install -D -m 0644 "$here/initramfs/audio/wireplumber-aoc.conf" "$work/root/luma/audio/wireplumber-aoc.conf"
 cat > "$work/devnodes.list" <<'EOF'
 dir /dev 0755 0 0
 nod /dev/console 0600 0 0 c 5 1

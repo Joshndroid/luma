@@ -10,6 +10,10 @@ temperature before it starts. Those come from persist/audio/speaker.cal,
 written at the factory; persist is only ever read here, through a read-only
 loop device. The UCM speaker route refuses to unmute (speaker-ready) unless
 this script wrote its report.
+
+The same records carry each amplifier's factory analog and digital volume,
+the levels the stock build plays at. They are written to speaker-gains for
+speaker-ready to apply when the route opens.
 """
 from pathlib import Path
 import ctypes as C
@@ -23,6 +27,7 @@ import time
 CARD = 'aocaudio'
 REPORT_DIR = Path('/run/luma-husky-audio')
 REPORT = REPORT_DIR / 'speaker-calibration.json'
+GAINS = REPORT_DIR / 'speaker-gains'
 PREFIXES = ('', 'R ')
 
 
@@ -145,8 +150,9 @@ def main():
     REPORT_DIR.mkdir(mode=0o755, exist_ok=True)
     st = REPORT_DIR.lstat()
     assert stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
-    assert not REPORT.is_symlink()
-    REPORT.unlink(missing_ok=True)
+    for path in (REPORT, GAINS):
+        assert not path.is_symlink()
+        path.unlink(missing_ok=True)
     assert Path('/sys/class/sound/card0/id').read_text().strip() == CARD
 
     # Route both amps through their DSP and preload (not start) the firmware,
@@ -193,11 +199,15 @@ def main():
             assert controls.word(base + 'cd CSPL_ERRORNO') == 0
         _, err = player.communicate(timeout=5)
         assert player.returncode == 0 and not err
+        # Left then right: analog and digital PCM volume, range-checked above.
+        GAINS.write_text(' '.join('%d %d' % (rec[4], rec[5]) for rec in records) + '\n')
+        GAINS.chmod(0o644)
         REPORT.write_text(json.dumps({
             'source': 'read-only persist/audio/speaker.cal',
             'both_unit_calibrations_selected': True,
             'protection_errors': False,
             'startup_output_muted': True,
+            'factory_gains': [{'analog': rec[4], 'digital': rec[5]} for rec in records],
             'phone_partition_writes': []}) + '\n')
         REPORT.chmod(0o644)
     finally:
