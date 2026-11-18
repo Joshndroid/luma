@@ -92,6 +92,47 @@ class HuskyProfile(unittest.TestCase):
         self.assertEqual(hashlib.sha256(manifest).hexdigest(),
                          device["firmware"]["manifest_sha256"])
 
+    def test_speakers_play_at_the_phones_factory_volume(self):
+        audio = ROOT / "scripts/mobile/husky/initramfs/audio"
+        hifi = (audio / "HiFi.conf").read_text()
+        speaker = hifi.split('SectionDevice."Speaker"')[1]
+        enable = speaker.split("EnableSequence [")[1].split("]")[0]
+        # The route only runs the gate, which applies the calibrated gains;
+        # no fixed cap below the factory level is left in the profile.
+        self.assertEqual(enable.split(), ["exec", '"/run/luma-husky-audio/speaker-ready"'])
+        self.assertNotIn("673", hifi)
+        calibrate = (audio / "speaker-calibrate").read_text()
+        self.assertIn("ambient <= 85 and analog <= 31 and digital <= 913", calibrate)
+        self.assertIn("GAINS.write_text(' '.join('%d %d' % (rec[4], rec[5]) for rec in records)",
+                      calibrate)
+        self.assertLess(calibrate.index("GAINS.write_text"), calibrate.index("REPORT.write_text"))
+        ready = (audio / "speaker-ready").read_text()
+        self.assertIn('[ "$(stat -c %u "$f")" = 0 ]', ready)
+        self.assertIn('[ "$la" -le 31 ] && [ "$ra" -le 31 ] && [ "$ld" -le 913 ] && [ "$rd" -le 913 ]',
+                      ready)
+        self.assertIn("set_amp '' \"$la\" \"$ld\" && set_amp 'R ' \"$ra\" \"$rd\"", ready)
+
+    def test_microphones_record_with_gain(self):
+        hifi = (ROOT / "scripts/mobile/husky/initramfs/audio/HiFi.conf").read_text()
+        mic = hifi.split('SectionDevice."Mic"')[1].split("SectionDevice")[0]
+        enable = mic.split("EnableSequence [")[1].split("]")[0]
+        self.assertIn("cset \"name='Mic HW Gain (cB)' 130\"", enable)
+        self.assertIn("cset \"name='Mic Record Soft Gain (dB)' 12\"", enable)
+
+    def test_wireplumber_keeps_playback_ahead_of_the_aoc(self):
+        audio = ROOT / "scripts/mobile/husky/initramfs/audio"
+        rule = (audio / "wireplumber-aoc.conf").read_text()
+        self.assertIn('node.name = "~alsa_output.platform-aoc-sound.*"', rule)
+        self.assertIn("api.alsa.headroom = 2048", rule)
+        build = (ROOT / "scripts/mobile/husky/build-boot.sh").read_text()
+        self.assertIn('"$here/initramfs/audio/wireplumber-aoc.conf" "$work/root/luma/audio/wireplumber-aoc.conf"',
+                      build)
+        init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
+        self.assertIn("/run/luma-husky-xdg/wireplumber/wireplumber.conf.d/51-luma-husky-aoc.conf", init)
+        # Only WirePlumber searches the /run directory, and still finds /etc/xdg.
+        self.assertIn("Environment=XDG_CONFIG_DIRS=/run/luma-husky-xdg:/etc/xdg", init)
+        self.assertIn("/run/systemd/user/wireplumber.service.d/51-luma-husky-audio.conf", init)
+
     def test_modem_data_stays_read_only_and_root_only(self):
         init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
         self.assertIn(

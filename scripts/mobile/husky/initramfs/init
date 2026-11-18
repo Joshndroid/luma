@@ -508,6 +508,13 @@ cp -r /sysroot/usr/share/alsa/ucm2/lib /run/luma-husky-ucm2/ 2>/dev/null  # ucm.
 printf '#!/bin/sh\necho ALSA_CONFIG_UCM2=/run/luma-husky-ucm2\n' \
 	> /run/systemd/user-environment-generators/91-luma-husky-audio
 chmod 0755 /run/systemd/user-environment-generators/91-luma-husky-audio
+# WirePlumber's rule for the card (playback headroom), from a /run
+# configuration directory searched before /etc/xdg by WirePlumber alone.
+mkdir -p /run/luma-husky-xdg/wireplumber/wireplumber.conf.d /run/systemd/user/wireplumber.service.d
+cp /luma/audio/wireplumber-aoc.conf \
+	/run/luma-husky-xdg/wireplumber/wireplumber.conf.d/51-luma-husky-aoc.conf
+printf '[Service]\nEnvironment=XDG_CONFIG_DIRS=/run/luma-husky-xdg:/etc/xdg\n' \
+	> /run/systemd/user/wireplumber.service.d/51-luma-husky-audio.conf
 # No ALSA state save/restore: alsactl restore runs when the card appears and
 # would put back whatever the amps had at the last shutdown, volumes included,
 # before speaker-calibrate has armed protection, and it races the calibration
