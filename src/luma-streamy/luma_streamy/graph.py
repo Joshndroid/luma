@@ -162,10 +162,18 @@ def hardware_decode() -> bool:
 _HW: bool | None = None
 
 
+#: A decodebin added to the running program completes its own state change: it needs data to finish
+#: (MJPEG is parsed first), and a child's async start makes the whole pipeline lose its state, so the
+#: rest of the branch would join PAUSED, its live source would send nothing, and the program would
+#: wait forever.
+DECODE_ASYNC = {"async-handling": True}
+
+
 def _capture_head(widget: Widget, prefix: str, fake: bool, fd: int | None, node: str | None,
                   hw_decode: bool = False) -> list[Element]:
     kind = widget.kind
-    if fake:
+    fake_caps = widget.source.get("fake-caps") if fake else None
+    if fake and not fake_caps:
         if widget.source.get("fake-silent"):
             # A check run's stream that opens and never sends a picture (a window that never redraws).
             return [Element("appsrc", f"{prefix}-src", {"is-live": True, "format": "time", "caps":
@@ -198,6 +206,17 @@ def _capture_head(widget: Widget, prefix: str, fake: bool, fd: int | None, node:
         # WirePlumber links a camera-portal client's stream only when it says it is a camera.
         props["stream-properties"] = "props,media.role=Camera"
     head = [Element("pipewiresrc", f"{prefix}-src", props)]
+    if fake_caps:
+        # A check run's capture in exactly the caps a real one sends (format, size, MJPEG), followed
+        # by the same chain as that capture.
+        if str(fake_caps).startswith("image/jpeg"):
+            raw = str(fake_caps).replace("image/jpeg", "video/x-raw,format=I420", 1)
+            head = [Element("videotestsrc", f"{prefix}-src", {"is-live": True, "pattern": "smpte100"}),
+                    Element("capsfilter", f"{prefix}-fake", {"caps": raw}),
+                    Element("jpegenc", f"{prefix}-jpeg", {"quality": 60})]
+        else:
+            head = [Element("videotestsrc", f"{prefix}-src", {"is-live": True, "pattern": "smpte100"}),
+                    Element("capsfilter", f"{prefix}-fake", {"caps": str(fake_caps)})]
     if kind == "window":
         # Its caps are set to what downstream takes, alpha formats first (Engine._alpha_first): a
         # window's rounded corners stay transparent.
@@ -216,12 +235,12 @@ def _capture_head(widget: Widget, prefix: str, fake: bool, fd: int | None, node:
         if hw_decode:
             # The GPU decodes (vajpegdec) and vapostproc hands GL a DMABuf: no picture crosses the CPU.
             # A raw camera's frames are uploaded by vapostproc the same way.
-            head += [Element("decodebin", f"{prefix}-decode"),
+            head += [Element("decodebin", f"{prefix}-decode", DECODE_ASYNC),
                      Element("vapostproc", f"{prefix}-vapp"),
                      Element("capsfilter", f"{prefix}-dmabuf", {"caps": "video/x-raw(memory:DMABuf)"})]
         else:
             # Software: a VA decoder's VA memory is something videoconvert can't take.
-            head += [Element("decodebin", f"{prefix}-decode", {"force-sw-decoders": True}),
+            head += [Element("decodebin", f"{prefix}-decode", {"force-sw-decoders": True, **DECODE_ASYNC}),
                      Element("videoconvert", f"{prefix}-convert")]
     return head
 

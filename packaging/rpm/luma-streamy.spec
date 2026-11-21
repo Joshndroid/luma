@@ -128,6 +128,13 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 120 python3 -B tests/engine_fa
 # A microphone meters at once, also beside a source that failed; a frameless widget draws its Look.
 PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 120 python3 -B tests/engine_levels.py
 PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 120 python3 -B tests/engine_placeholder.py
+# Every capture kind and format reaches a picture, also reopened and beside an MJPEG camera.
+# Half-size displays: llvmpipe builders composite a 3440x1440 cast at a few frames a second.
+PYTHONPATH=%{buildroot}%{python3_sitelib} STREAMY_FORMATS_FAST=1 timeout 240 python3 -B tests/engine_formats.py
+PYTHONPATH=%{buildroot}%{python3_sitelib} STREAMY_FORMATS_BESIDE=1 STREAMY_FORMATS_ONLY=display \
+  timeout 120 python3 -B tests/engine_formats.py
+# A resize is composited on the next canvas frame, never behind an older picture.
+PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 120 python3 -B tests/engine_resize_frame.py
 # The installed app opens on drawn stand-in sources and renders its window
 # at phone and desktop widths. The first try waits 15 s: on a loaded builder
 # the window can take that long to map while llvmpipe composites the scene.

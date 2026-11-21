@@ -981,6 +981,12 @@ class StreamyWindow(AppWindow):
         states.update({wid: "choose" for wid, reason in self.widget_errors.items() if reason in ("unshared", "nocamera")})
         states.update({wid: "Paused while locked" for wid, reason in self.widget_errors.items() if reason == "paused"})
         states.update({wid: "Needs sharing again" for wid, reason in self.widget_errors.items() if reason == "reshare"})
+        for wid, reason in self.widget_errors.items():
+            if reason == "unplugged":
+                try:
+                    states[wid] = self.cause_line(self.project.find_widget(wid)[1], reason)
+                except ModelError:
+                    pass
         self.engine.show_scene(self.project.active_scene, skip=set(self.widget_errors), states=states)
         self._close_offscene_sound()
 
@@ -1013,6 +1019,8 @@ class StreamyWindow(AppWindow):
                 # The node vanished under the stream: the camera (or its driver) stopped answering.
                 return "The camera stopped responding. Try again once it's working; Streamy won't retry on its own."
             return f"{thing} is gone: it was closed, unplugged or removed. Choose it again."
+        if reason == "unplugged":
+            return f"{thing} is unplugged. It reconnects by itself when it's plugged in again."
         if reason == "format":
             return f"{thing} sends pictures in a format Streamy can't read."
         if reason == "timeout":
@@ -1042,8 +1050,8 @@ class StreamyWindow(AppWindow):
     @staticmethod
     def fix_words(w: Widget, reason: str) -> str | None:
         """The key that fixes a widget's problem, or None when nothing here can."""
-        if reason == "unavailable":
-            return None
+        if reason in ("unavailable", "unplugged"):
+            return None  # unplugged: "Use …" (stand_in), and it reconnects by itself
         if w.kind == "app-audio":
             return "Choose apps"
         if w.kind in ("display", "window"):
@@ -1088,6 +1096,79 @@ class StreamyWindow(AppWindow):
                 "microphone": "The microphone", "desktop-audio": "Desktop audio",
                 "app-audio": "The apps' sound"}.get(w.kind, w.name)
 
+    def device_missing(self, w: Widget) -> bool:
+        """A camera or microphone chosen by name that isn't connected: it was unplugged."""
+        if w.kind == "camera":
+            cameras = self.portals.cameras if self.portals is not None else None
+            name = w.source.get("camera")
+            return bool(name) and cameras is not None and cameras.ready and cameras.find(name) is None
+        if w.kind == "microphone":
+            name = w.source.get("device")
+            return bool(name) and self.devices.ready and self.devices.find("source", name) is None
+        return False
+
+    def stand_in(self, w: Widget):
+        """What an unplugged camera or microphone can switch to at once: the system's default one."""
+        if w.kind == "camera":
+            cameras = self.portals.cameras if self.portals is not None else None
+            return next(iter(cameras.cameras), None) if cameras is not None and cameras.ready else None
+        if w.kind == "microphone":
+            return self.devices.default("source")
+        return None
+
+    def use_stand_in(self, w: Widget) -> None:
+        """"Use …": the unplugged device's widget takes the default camera or microphone from now on."""
+        device = self.stand_in(w)
+        if device is None:
+            return
+        self._checkpoint(f"Use {device.label}")
+        if w.kind == "camera":
+            w.source["camera"] = device.name
+            w.source["device-name"] = device.label
+            w.source.pop("mode", None)  # the unplugged camera's mode may not exist on this one
+        else:
+            w.source.pop("device", None)
+            w.source.pop("device-name", None)
+        self.widget_errors.pop(w.id, None)
+        self._reconnect(w)
+        self._changed(structure=True)
+        self.refresh_all()
+
+    def _sync_unplugged(self) -> None:
+        """Cameras and microphones follow their device: one unplugged says so and stops trying; the same
+        device plugged in again reconnects by itself, with nothing to press."""
+        from .engine import log
+
+        shown = {w.id for w in self.project.active_scene.widgets} if self.project.active_scene else set()
+        changed = False
+        for w in [w for scene in self.project.scenes for w in scene.widgets if w.kind in ("camera", "microphone")]:
+            reason = self.widget_errors.get(w.id)
+            if self.device_missing(w):
+                # A camera is known gone once its stream failed; a microphone's stream never fails (it
+                # would hear nothing), so its absence from the device list is enough.
+                if reason in ("missing", "stopped") or (reason is None and w.kind == "microphone"):
+                    self.widget_errors[w.id] = "unplugged"
+                    self.widget_waiting.discard(w.id)
+                    log(f"{w.kind} widget {w.name!r}: {self.cause_line(w, 'unplugged')}")
+                    changed = True
+                continue
+            if w.kind == "microphone" and w.source.get("device"):
+                device = self.devices.find("source", w.source["device"])
+                if device is not None and w.source.get("device-name") != device.label:
+                    w.source["device-name"] = device.label  # its name, for when it is unplugged
+            if reason == "unplugged":
+                log(f"{w.kind} widget {w.name!r}: {self.source_name(w)} is back")
+                self.widget_errors.pop(w.id, None)
+                changed = True
+                if w.id in shown:
+                    if w.kind == "camera" and self.portals is not None and not self.fake:
+                        self._choose_source(w, restore=True)
+                    else:
+                        self.engine._remove_branch(w.id)
+        if changed:
+            self._show_scene()
+            self.refresh_all()
+
     def cause_line(self, w: Widget, reason: str | None) -> str | None:
         """The one short line beside Try again: what went wrong, by name."""
         name = self.source_name(w)
@@ -1104,6 +1185,7 @@ class StreamyWindow(AppWindow):
             "paused": "Paused while locked",
             "reshare": "Needs sharing again",
             "missing": f"{name} stopped responding" if w.kind == "camera" else f"{name} is gone",
+            "unplugged": f"{name} unplugged",
             "format": f"{name} sends a picture Streamy can't read" if w.has_picture else
                       f"{name} sends sound Streamy can't read",
             "stopped": f"{name} stopped with an error",
@@ -1117,7 +1199,9 @@ class StreamyWindow(AppWindow):
             return
         from .engine import log
 
-        if getattr(self, "locked", False) and reason in ("ended", "stopped", "missing", "timeout", "unshared"):
+        if reason in ("missing", "stopped", "nocamera") and self.device_missing(w):
+            reason = "unplugged"  # it reconnects by itself (_sync_unplugged)
+        elif getattr(self, "locked", False) and reason in ("ended", "stopped", "missing", "timeout", "unshared"):
             reason = "paused"  # it comes back after unlock
         log(f"{w.kind} widget {w.name!r}: {self.cause_line(w, reason)} ({reason})")
         self.widget_waiting.discard(widget_id)
@@ -1585,6 +1669,8 @@ class StreamyWindow(AppWindow):
 
     def source_summary(self, w: Widget) -> str:
         """What the Source key says at rest: "Built-in Front Camera · 1080p 30", "System default (…)"."""
+        if self.device_missing(w):
+            return f"{w.source.get('device-name') or 'Device'} unplugged"
         if w.kind == "camera":
             camera = self._camera_of(w)
             name = camera.label if camera else w.source.get("device-name") or "Camera"
@@ -1622,6 +1708,11 @@ class StreamyWindow(AppWindow):
             parts.append(TypeLabel(self.problem_words(w, problem) if problem else
                                    f"{self.source_name(w)} is connected but hasn't sent a picture yet.",
                                    role="body", wrap=True))
+        stand_in = self.stand_in(w) if problem == "unplugged" else None
+        if stand_in is not None:
+            parts.append(PanelRow(f"Use {stand_in.label}", icon="replace",
+                                  subtitle="The system default" if w.kind == "microphone" else "Another camera",
+                                  on_activate=lambda: self.use_stand_in(w)))
         if w.kind == "camera":
             parts += self._camera_rows(w)
         elif w.kind in ("display", "window"):
@@ -2203,6 +2294,7 @@ class StreamyWindow(AppWindow):
 
     def _devices_changed(self) -> None:
         """A microphone or output came or went, or the default changed: strips and an open chooser follow."""
+        self._sync_unplugged()
         if self.project.active_scene and any(w.has_sound for w in self.project.active_scene.widgets):
             self._refresh_audio()
             self._refresh_bar()
@@ -2210,6 +2302,7 @@ class StreamyWindow(AppWindow):
 
     def _cameras_changed(self) -> None:
         self._camera_error = None
+        self._sync_unplugged()
         self._refresh_bar()
         self._regrow("source")
 
@@ -2286,6 +2379,9 @@ class StreamyWindow(AppWindow):
                 items.append(BarAction("crop", tooltip="Crop on the canvas",
                                        on_activate=lambda: self.arrange.set_cropping(w.id)))
             fix = self.fix_words(w, self.widget_errors[w.id]) if w.id in self.widget_errors else None
+            stand_in = self.stand_in(w) if self.widget_errors.get(w.id) == "unplugged" else None
+            if stand_in is not None:
+                items.append(BarAction("replace", f"Use {stand_in.label}", on_activate=lambda: self.use_stand_in(w)))
             if fix:
                 items.append(BarAction("monitor-up" if w.kind in ("display", "window") else "rotate-ccw", fix,
                                        on_activate=lambda: self.retry_widget(w)))
@@ -2411,10 +2507,11 @@ class StreamyWindow(AppWindow):
         scene = self.project.active_scene
         if paintable is None or scene is None or not self.sidebar.get_mapped() or not self._on_screen():
             return
-        if not any(w.has_picture and w.visible and w.id not in self.widget_errors for w in scene.widgets):
+        if not any(w.has_picture and w.visible for w in scene.widgets):
             if self._thumbs.pop(scene.id, None) is not None:
                 self._refresh_scenes()
-            return  # nothing to show: the row keeps its glyph, not a black square
+            return  # no picture at all: the row keeps its glyph, not a black square
+        # Otherwise the canvas as composed, placeholder cards (No picture, unplugged…) included.
         image = self._small(paintable.get_current_image())
         if image is None:
             return

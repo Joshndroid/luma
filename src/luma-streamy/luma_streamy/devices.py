@@ -99,6 +99,7 @@ class AudioDevices:
     def __init__(self, on_changed: Callable[[], None] | None = None) -> None:
         self.on_changed = on_changed
         self.devices: list[Device] = []
+        self.ready = False  # listed once: a device not in the list is unplugged
         self._monitor = None
         self._lock = threading.Lock()
         threading.Thread(target=self._start, name="streamy-devices", daemon=True).start()
@@ -135,6 +136,7 @@ class AudioDevices:
                 found.append(device)
         with self._lock:
             self.devices = found
+            self.ready = True
         if self.on_changed is not None:
             GLib.idle_add(lambda: self.on_changed() and False)
 

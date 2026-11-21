@@ -174,6 +174,7 @@ def check(app) -> None:
     outputs(win)
     inspector(win)
     several(win)
+    unplugged(win)
     win.close()  # the engine stops with the window, before the interpreter goes
     pump(1.0)
     app.quit()
@@ -337,6 +338,57 @@ def outputs(win) -> None:
         win.center.fold()
         print("go live with no destination: Add a destination opens the + menu")
     win.center.show_bar = show_bar
+
+
+def unplugged(win) -> None:
+    """A microphone whose device is unplugged says so by name, offers "Use <default>" in the bar, and
+    reconnects by itself when the same device comes back; "Use …" switches it to the default."""
+    from luma_streamy.devices import Device
+
+    devices = win.devices
+    saved = (list(devices.devices), devices.ready)
+    gone = Device("alsa_input.test-pocket", "Pocket Mic", "source")
+    default = Device("alsa_input.test-builtin", "Built-in Microphone", "source", default=True)
+    scene = win.project.active_scene
+    mic = win.project.add_widget(scene.id, "microphone", source={"device": gone.name, "device-name": gone.label})
+    shown = []
+    show_bar = win.center.show_bar
+    win.center.show_bar = lambda items, **kw: (shown.append(list(items)), show_bar(items, **kw))[1]
+    try:
+        with devices._lock:
+            devices.devices, devices.ready = [default], True
+        win._devices_changed()
+        pump()
+        assert win.widget_errors.get(mic.id) == "unplugged", f"not unplugged: {win.widget_errors.get(mic.id)}"
+        assert win.source_summary(mic) == "Pocket Mic unplugged", win.source_summary(mic)
+        win.select(mic.id)
+        win._refresh_bar()
+        use = [i for i in shown[-1] if getattr(i, "label", None) == "Use Built-in Microphone"]
+        assert use, f"no Use key: {[getattr(i, 'label', i) for i in shown[-1]]}"
+        # Plugged in again: it reconnects with nothing pressed.
+        with devices._lock:
+            devices.devices = [default, gone]
+        win._devices_changed()
+        pump()
+        assert mic.id not in win.widget_errors, f"still {win.widget_errors.get(mic.id)}"
+        assert mic.id in win.engine.branches, "it did not reconnect"
+        # Unplugged again, then "Use …": the default from now on.
+        with devices._lock:
+            devices.devices = [default]
+        win._devices_changed()
+        pump()
+        win.use_stand_in(mic)
+        pump()
+        assert "device" not in mic.source and mic.id not in win.widget_errors, mic.source
+    finally:
+        win.center.show_bar = show_bar
+        with devices._lock:
+            devices.devices, devices.ready = saved
+        win.deselect()
+        win.project.remove_widget(mic.id)
+        win._changed(structure=True)
+        win._show_scene()
+        pump()
 
 
 def main() -> int:

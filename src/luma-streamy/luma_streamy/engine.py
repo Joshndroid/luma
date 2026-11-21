@@ -488,6 +488,9 @@ class Engine(GObject.Object):
         self._pad_widget: dict[Gst.Pad, str] = {}
         #: Window casts that offered no alpha format: taken opaque (alpha first, not alpha only).
         self._no_alpha: set[str] = set()
+        #: mixer pad -> the revision whose first picture drops the older ones waiting there (_supersede)
+        self._superseding: dict = {}
+        self._supersede_probes: set = set()
         #: Cameras the GPU couldn't decode (VA failed to negotiate): decoded in software from then on.
         self._sw_decode: set[str] = set()
         #: Enum properties last set by nick, per (element name, property): a move never re-sets them.
@@ -1013,7 +1016,8 @@ class Engine(GObject.Object):
                 return  # not chosen yet: the window asks the portal first
         self._generation += 1
         if widget.has_picture:
-            hw = widget.kind == "camera" and not self.fake and widget.id not in self._sw_decode and graph.hardware_decode()
+            hw = widget.kind == "camera" and (not self.fake or bool(widget.source.get("fake-caps"))) and \
+                widget.id not in self._sw_decode and graph.hardware_decode()
             chain = graph.picture_chain(widget, zorder, fake=self.fake, fd=fd, node=node, generation=self._generation,
                                         hw_decode=hw)
         else:
@@ -1087,8 +1091,37 @@ class Engine(GObject.Object):
         picture = branch.last.copy()  # the same GPU memory, its own timestamps
         picture.pts = clock.get_time() - self.pipeline.get_base_time()
         picture.dts = Gst.CLOCK_TIME_NONE
+        self._supersede(frame)
         # Pushed on this thread: the pad's stream lock keeps it in turn with the source's own pictures.
         queue.get_static_pad("sink").chain(picture)
+
+    def _supersede(self, frame: Gst.Element) -> None:
+        """The first picture drawn at ``frame``'s new revision replaces the older ones still waiting at
+        its mixer pad: the mixer takes it on its next frame instead of one source frame later."""
+        src = frame.get_static_pad("src")
+        pad = src.get_peer() if src is not None else None
+        if pad is None or not hasattr(pad, "drop_buffer") or os.environ.get("STREAMY_NO_SUPERSEDE"):
+            return
+        with self._geom_lock:
+            self._superseding[pad] = frame.get_property("revision")
+            if pad in self._supersede_probes:
+                return
+            self._supersede_probes.add(pad)
+        pad.add_probe(Gst.PadProbeType.BUFFER, self._superseded, None)
+
+    def _superseded(self, pad: Gst.Pad, info: Gst.PadProbeInfo, _data) -> Gst.PadProbeReturn:
+        buffer = info.get_buffer()
+        with self._geom_lock:
+            revision = self._superseding.get(pad)
+            if buffer is None or revision is None or buffer.offset < revision:
+                return Gst.PadProbeReturn.OK
+            del self._superseding[pad]
+            self._supersede_probes.discard(pad)
+        while True:
+            waiting = pad.peek_buffer()
+            if waiting is None or waiting.offset >= revision or not pad.drop_buffer():
+                break
+        return Gst.PadProbeReturn.REMOVE
 
     def _source_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo, state: dict) -> Gst.PadProbeReturn:
         """What a capture actually sends: its caps and, for a window cast, the crop region the window
@@ -1315,6 +1348,7 @@ class Engine(GObject.Object):
             self._applied.pop(pad, None)
             self._applied_rev.pop(pad, None)
             self._pad_widget.pop(pad, None)
+            self._superseding.pop(pad, None)
 
     def _samples_selected(self, mixer, _segment, pts, _dts, _duration, _info, program: Program) -> None:
         """The mixer's thread, before it composites a frame: each layer's pad takes the geometry of
