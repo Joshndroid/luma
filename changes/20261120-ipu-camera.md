@@ -1,7 +1,7 @@
 ---
 type: fix
 component: Camera
-packages: [libcamera, libcamera-ipa]
+packages: [libcamera, libcamera-ipa, libcamera-gstreamer]
 highlight: false
 ---
 Summary: Built-in cameras no longer stop the media service
