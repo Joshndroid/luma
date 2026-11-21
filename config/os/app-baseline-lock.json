@@ -2,10 +2,10 @@
   "schema": "org.projectluma.os-app-baseline-lock/v1",
   "baselines": {
     "aarch64": {
-      "manifest_sha256": "16736a9f359958a1348529fc44f8ec2bb641dff1cdd6264306197dd9b755304c"
+      "manifest_sha256": "5e6f33226a4686138b20012a5bcc0d20ff8a420f321cb1b23116ed32105e5606"
     },
     "x86_64": {
-      "manifest_sha256": "559e6290e23a295a77f94abef1b9d1abc994f30a116391852dac56093aebb608"
+      "manifest_sha256": "7d4d9308af9f58850dda2cd33a91b148d44c5a0bbfdd109c3266b7d71d82832b"
     }
   },
   "applications": {
@@ -91,15 +91,11 @@
     },
     "org.projectluma.Depot": {
       "commits": {
-        "aarch64": "ba22a809f46ed131eb19b43b425d9c749a7f6ace15d9dd963f203348cc53d561",
-        "x86_64": "0914252d92f275c6464ef4dc88512d708b97d5b7e100a56a88f4e826739df2ad"
+        "aarch64": "1cd72f20b14324743c1d768391c86ffc2ce27d01ea8d4622849f41f54f512209",
+        "x86_64": "f377886e3b98d347d5e84b2a35c957c1601961d1320904dd7e60ef780b5ecc23"
       },
-      "source_sha256": "49422bda503b9dd99a3746a6b5158e457728ad8c3e09e97da36403a50185a90e",
-      "version": "0.1.5",
-      "pending": {
-        "reason": "only host-side luma_installer.system_app_updates changed (luma-application-installer 1.luma.96); the app does not run it, the next Depot rebuild carries it; 1.luma.97 changes only Valet (installer, workflow.added_appimage); 1.luma.98 changes only the capsule launcher (launcher); 1.luma.99 changes Valet and the capsule launcher (appimage_run, backends, capsule_runtime, desktop, installer, launcher); 1.luma.100 changes only the capsule launcher (backends, capsule_identity, launcher); 1.luma.101 changes the capsule launcher and removal (backends, capsule_display, capsule_identity, capsule_runtime, capsule_scope, capsule_secrets, launcher, manager); 1.luma.102 adds capsule updates on the host side (capsule_refresh, depot_inventory, launcher, manager)",
-        "expires": "2026-11-23"
-      }
+      "source_sha256": "f1a11d654a1d28273fe0c5494fee680cd56febacdb93be90fcc506b037742fd0",
+      "version": "0.1.5"
     },
     "org.projectluma.Imager": {
       "commits": {
