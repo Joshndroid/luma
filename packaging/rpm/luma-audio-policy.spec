@@ -2,7 +2,7 @@
 
 Name:           luma-audio-policy
 Version:        0.1.0
-Release:        1.luma.4%{?dist}
+Release:        1.luma.5%{?dist}
 Summary:        Luma sound policy: outputs, per-app mixer, app audio capture, opt-in AirPlay
 License:        MPL-2.0 AND CC-BY-SA-4.0
 URL:            https://projectluma.org/sound
@@ -105,6 +105,11 @@ cd tests && PYTHONPATH=$PWD/.. %{python3} -m unittest discover -p "test_*.py" -v
 %{_datadir}/icons/hicolor/scalable/status/luma-network-speaker-symbolic.svg
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.5
+- luma/app-audio.lua: the node-removed and client-removed hooks read
+  object.id from the event, not from the removed proxy, whose properties are
+  gone. Fixes a wp_properties_get critical per removed client or stream, and
+  captures now end when their owner leaves PipeWire
 * Thu Nov 19 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.4
 - Per-app mixer in org.projectluma.AudioDevices1 version 2: GetApplications,
   ApplicationsChanged, SetApplicationVolume/Mute/Output and GetOutputs

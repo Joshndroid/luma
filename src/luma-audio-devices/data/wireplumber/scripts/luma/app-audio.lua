@@ -363,8 +363,9 @@ restoring_cleanup = SimpleEventHook {
     },
   },
   execute = function (event)
-    -- A removed node is no longer bound; its global id is in its properties.
-    local id = tonumber (event:get_subject ().properties ["object.id"])
+    -- A removed node is no longer bound and its proxy has no properties left;
+    -- the event keeps its global properties, object.id among them.
+    local id = tonumber (event:get_properties () ["object.id"])
     if id then
       restoring [id] = nil
     end
@@ -642,7 +643,8 @@ SimpleEventHook {
     },
   },
   execute = function (event)
-    local client_id = tonumber (event:get_subject ().properties ["object.id"])
+    -- As above: the removed client's proxy has no properties left.
+    local client_id = tonumber (event:get_properties () ["object.id"])
     if not client_id then
       return
     end

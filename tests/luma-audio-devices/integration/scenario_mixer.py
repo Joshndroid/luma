@@ -298,6 +298,22 @@ import time; time.sleep(30)
         check(wait_for(lambda: not any(((o.get("info") or {}).get("props") or {}).get("luma.audio-capture.id")
                                        for o in dump()), 5), "a capture ends when its owner leaves the bus")
 
+        # WirePlumber ends a capture whose owner leaves PipeWire, without the
+        # service: the client-removed hook reads the client's global id.
+        monitor = subprocess.Popen(["pw-mon", "-N"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        owner_id = wait_for(lambda: next((o["id"] for o in dump() if o.get("type", "").endswith(":Client") and
+                                          ((o.get("info") or {}).get("props") or {})
+                                          .get("application.process.id") == monitor.pid), None), 5)
+        has_owner_check = lambda: any(((o.get("info") or {}).get("props") or {}).get("luma.audio-capture.id")
+                                      == "owner-check" for o in dump())
+        run("pw-metadata", "-n", "luma-app-audio", "0", "capture:owner-check",
+            json.dumps({"mode": "system", "owner": owner_id, "name": "owner-check"}), "Spa:String:JSON")
+        check(owner_id is not None and wait_for(has_owner_check, 3), "a capture owned by a PipeWire client exists")
+        monitor.kill()
+        monitor.wait()
+        check(wait_for(lambda: not has_owner_check(), 5), "a capture ends when its owner leaves PipeWire")
+        run("pw-metadata", "-n", "luma-app-audio", "-d", "0", "capture:owner-check", check_rc=False)
+
         # Volumes survive a service and WirePlumber restart.
         service.stop()
         service.start()

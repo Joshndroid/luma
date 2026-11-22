@@ -101,6 +101,15 @@ if [ "$what" = airplay ] || [ "$what" = all ]; then
   python3 "$here/scenario_airplay.py" || status=1
 fi
 
+# A GLib critical (a hook reading a removed object's properties, say) is a bug
+# even when audio keeps working.
+if grep -qE "assertion '.*' failed" "$run_dir/wireplumber.log"; then
+  echo "FAIL WirePlumber logged GLib criticals:"; status=1
+  grep -oE "[a-z_]+: assertion '.*' failed" "$run_dir/wireplumber.log" | sort | uniq -c | head -n 5
+else
+  echo "PASS WirePlumber logged no GLib criticals"
+fi
+
 echo "logs: $run_dir"
 grep -h "s-luma-output-policy" "$run_dir/wireplumber.log" | tail -n 40 >"$run_dir/policy-decisions.txt" || true
 exit $status
