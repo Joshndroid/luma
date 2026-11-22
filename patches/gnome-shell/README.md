@@ -874,3 +874,14 @@ Mutter 0042, ADR-053) is marked on its window tile with an eye-off chip,
 tile's accessible name; sharing that window still shows it. Screen tiles
 leave such windows out of their clones, so a screen preview shows what the
 screen share will. Tests: `tests/mutter/window-capture`. Shell .197.
+
+`0385-notification-lip-ink-on-the-phone.patch`: the phone presentation
+paints the notification lip in the Dock's dark palette in every appearance
+mode (`src/luma-shell-presentation/presentation.css`) and turns the lip's
+material off, but the binding kept the appearance mode's classes on it: in
+Light the lip carried `luma-surface-light` and its text, source line, time
+and buttons took dark ink on the dark surface.
+`SurfaceMaterialBinding.setClassTreatment()` lets a host that paints a
+surface's fill itself name the treatment of that fill (null follows the
+mode again); the lip names `dark` while the presentation is `mobile`.
+Desktop and TV are unchanged. Shell .198.
