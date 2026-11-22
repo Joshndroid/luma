@@ -23,6 +23,10 @@ Results are `passed` (to Review), `needs_changes` (back to the developer, with t
 
 The review VM boots only with headroom: it takes the review lane `vm_lock` (`/var/lock/luma-heavy-review.lock`, one review VM beside one luma-heavy job, like the conform lane), then waits up to `vm_slot_wait_seconds` until `vm_memory_mib + vm_reserve_mib` is available, the 1-minute load is under 0.75 per CPU and `luma-heavy.slice` isn't frozen by the thermal guard. The boot timeout starts when qemu does. The review desktop's dconf policy (in the base, and re-applied each run) turns off idle, dim, lock and blanking, and each run holds an idle inhibitor and wakes the display before it watches the screen.
 
+Android stays off in the review VM: the kickstart and `prepare-base` mask `luma-android-initialize.service`, `waydroid-container.service` and the user prewarm/session units, and every run stops them for that boot. `prepare-base` works on an overlay and commits it into the base only after the verify boot. It refuses a base that is already prepared (`/etc/luma-depot-review/prepared`; its boots run first-boot jobs inside the base, so build a new base instead, or pass `--force`) and a base other processes have open (disks backed by it would break).
+
+When a launch fails, the run saves the session state (`session.log`) and launches the control app (`control_bundle`, Depot Hello) on the same VM; if that fails too, the launch is `couldnt_run`. The launch watch ends after 180 s of wall time; an app unit still in Flatpak's first-run ldconfig then is `couldnt_run` (`flatpak_ldconfig_timeout`).
+
 `depot-review recheck JOB/submission.json ...` re-runs the checks of submissions that were already reported and prints each verdict. It reports nothing to the Hub.
 
 AppImages are opened and scanned, then answered "coming soon". `.rpm`/`.deb` are fully checked but don't publish yet.

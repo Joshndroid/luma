@@ -95,7 +95,9 @@ install -d -o {USER} -g {USER} /home/{USER}/.config /home/{USER}/.local /home/{U
 printf 'yes\\n' > /home/{USER}/.config/gnome-initial-setup-done
 : > /home/{USER}/.local/state/luma-setup/welcome-done
 chown {USER}:{USER} /home/{USER}/.config/gnome-initial-setup-done /home/{USER}/.local/state/luma-setup/welcome-done
-{write_review_dconf()}systemctl set-default graphical.target
+{write_review_dconf()}systemctl mask {" ".join(ANDROID_SYSTEM_UNITS)}
+systemctl --global mask {" ".join(REVIEW_USER_MASKS)}
+systemctl set-default graphical.target
 restorecon -RF /etc/gdm /var/lib/AccountsService/users /home/{USER} /etc/dconf || true
 %end
 %post --nochroot
@@ -168,7 +170,22 @@ def build_base(iso: Path, out: Path, arch: str = "x86_64", disk_gib: int = 40) -
 REVIEW_MASKS = ("luma-update-check.service", "luma-update-check.timer",
                 "fedora-atomic-desktop-appstream-cache-refresh.service",
                 "fedora-atomic-desktop-mandb-update.service", "snapd.seeded.service", "snapd.service",
-                "snapd.socket", "NetworkManager-wait-online.service")
+                "snapd.socket", "NetworkManager-wait-online.service",
+                "luma-android-initialize.service", "waydroid-container.service")
+# Android never runs in the review VM: Flatpak checks don't need it, and once
+# luma-android-initialize has set it up (any boot without /var/lib/waydroid/
+# waydroid.cfg, prepare-base's own boots included) the session's prewarm starts
+# it in every run, taking a quarter of the VM's memory and a core of dex2oat.
+REVIEW_USER_MASKS = ("luma-android-prewarm.timer", "luma-android-prewarm.service", "luma-android-session.service")
+ANDROID_SYSTEM_UNITS = ("luma-android-initialize.service", "waydroid-container.service")
+
+
+def android_off(runtime: bool = True) -> str:
+    """Shell that stops Android and keeps it from starting (for this boot only
+    with runtime=True, which also covers bases prepared before the masks)."""
+    scope = "--runtime " if runtime else ""
+    return (f"systemctl mask {scope}--now {' '.join(ANDROID_SYSTEM_UNITS)} >/dev/null 2>&1; "
+            f"systemctl --global mask {scope}{' '.join(REVIEW_USER_MASKS)} >/dev/null 2>&1; true")
 
 
 def qmp_path(work: Path) -> Path:
@@ -233,14 +250,42 @@ def wait_session(guest: "Guest", timeout: int) -> str:
     return ""
 
 
-def prepare_base(disk: Path, arch: str = "x86_64") -> None:
-    """Make an installed base boot straight to a stable logged-in desktop."""
+PREPARED_STAMP = "/etc/luma-depot-review/prepared"
+
+
+def prepare_refusal(stamped: bool, holders: str, force: bool) -> str:
+    """Why prepare-base must not touch this base, or "". Its boots run first-boot
+    jobs inside the base (Android's setup was one), so a prepared base is never
+    prepared again: build a new one. A base other disks back onto can't change."""
+    if holders:
+        return f"the base is open by other processes ({holders}); disks backed by it would break"
+    if stamped and not force:
+        return "the base is already prepared; re-preparing runs first-boot jobs inside it. Build a new base"
+    return ""
+
+
+def disk_holders(disk: Path) -> str:
+    result = subprocess.run(["fuser", str(disk)], capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def prepare_base(disk: Path, arch: str = "x86_64", force: bool = False) -> None:
+    """Make an installed base boot straight to a stable logged-in desktop.
+
+    Works on an overlay and commits it into the base only after the verify boot
+    passed, so a refusal or a failure leaves the base as it was."""
     key = disk.parent / "review-key"
+    why = prepare_refusal(False, disk_holders(disk), force)
+    if why:
+        raise RuntimeError(f"prepare-base: {why}")
     work = Path(tempfile.mkdtemp(prefix="prepare-", dir=disk.parent))
+    overlay = work / "prepare.qcow2"
+    subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", "-b", str(disk.resolve()), "-F", "qcow2",
+                    str(overlay)], check=True)
     try:
         for attempt in ("configure", "verify"):
             port = free_port()
-            process = boot(disk, arch, work, port, memory="6144", cpus="4")
+            process = boot(overlay, arch, work, port, memory="6144", cpus="4")
             guest = Guest(port, key)
             started = time.time()
             try:
@@ -248,12 +293,19 @@ def prepare_base(disk: Path, arch: str = "x86_64") -> None:
                     raise RuntimeError(f"{attempt}: no SSH after {int(time.time() - started)} s")
                 log(f"{attempt}: SSH after {int(time.time() - started)} s")
                 if attempt == "configure":
+                    stamped = guest.run(f"test -e {PREPARED_STAMP}", timeout=30).returncode == 0
+                    why = prepare_refusal(stamped, "", force)
+                    if why:
+                        raise RuntimeError(f"prepare-base: {why}")
                     guest.run("systemctl mask " + " ".join(REVIEW_MASKS), timeout=60, check=True)
+                    guest.run("systemctl --global mask " + " ".join(REVIEW_USER_MASKS), timeout=60, check=True)
                     guest.run(write_review_dconf(), timeout=60, check=True)
                     guest.run("rpm-ostree kargs --append-if-missing=plymouth.enable=0 "
                               "--append-if-missing=consoleblank=0 "
                               "--append-if-missing=systemd.default_device_timeout_sec=600 "
                               "--delete-if-present=rhgb --delete-if-present=quiet", timeout=600, check=True)
+                    guest.run(f"mkdir -p {Path(PREPARED_STAMP).parent} && date -u +%FT%TZ > {PREPARED_STAMP}",
+                              timeout=30, check=True)
                     jobs = guest.run("systemctl list-jobs --no-legend | head -20", timeout=30).stdout
                     log("pending jobs at configure:\n" + jobs)
                 else:
@@ -279,6 +331,11 @@ def prepare_base(disk: Path, arch: str = "x86_64") -> None:
                     process.wait()
                 shutil.copy(work / "serial.log", disk.parent / f"prepare-{attempt}-serial.log")
                 qmp_path(work).unlink(missing_ok=True)
+        why = prepare_refusal(False, disk_holders(disk), force)
+        if why:
+            raise RuntimeError(f"prepare-base: {why}")
+        subprocess.run(["qemu-img", "commit", "-q", str(overlay)], check=True)
+        log(f"prepare-base: committed into {disk}")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -434,6 +491,7 @@ def wake(guest: "Guest", uid: str) -> None:
 
 
 SCREEN_TRIES = 4
+LAUNCH_SECONDS = 180
 UNIT_STATES = ("active", "activating", "deactivating", "inactive", "failed")
 
 
@@ -445,6 +503,13 @@ def parse_unit_state(returncode: int, stdout: str) -> str:
     if returncode in (124, 255) or state not in UNIT_STATES:
         return "unknown"
     return state
+
+
+def stuck_in_ldconfig(comms: str) -> bool:
+    """The app's unit is still only Flatpak building its library cache: flatpak,
+    bwrap and ldconfig, and nothing of the app itself."""
+    names = set(comms.split())
+    return "ldconfig" in names and names <= {"flatpak", "bwrap", "ldconfig"}
 
 
 def judge_launch(control: bool | None) -> str:
@@ -505,8 +570,9 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
                 couldnt_run("boot", "boot_timeout", "The test VM didn't start in time.",
                             detail=f"no SSH after {int(time.time() - started)} s")
             return result
-        # The policy is in the base; this also covers bases built before it was.
-        guest.run(write_review_dconf(), timeout=60)
+        # The policy and the Android masks are in the base; this also covers
+        # bases prepared before they were.
+        guest.run(write_review_dconf() + android_off(), timeout=90)
         uid = wait_session(guest, max(60, boot_timeout - int(time.time() - started)))
         if not uid:
             couldnt_run("boot", "desktop_timeout", "The test VM's desktop didn't start.",
@@ -567,7 +633,7 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
             over a minute)."""
             alive, seen, unknown, probes = False, 0, 0, 0
             launched = time.time()
-            for _ in range(36):
+            while time.time() - launched < LAUNCH_SECONDS:
                 time.sleep(5)
                 probe = guest.run(f"runuser -u {USER} -- env {env} systemctl --user is-active {unit}", timeout=20)
                 state = parse_unit_state(probe.returncode, probe.stdout)
@@ -621,6 +687,13 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
                        f"on the same VM ({seen['seconds']} s, alive={seen['alive']})"
 
         def failed_launch(message: str, detail: str) -> dict:
+            # What the session was doing: a session that ended under the run is
+            # Depot's problem, and this is the evidence Nick reads.
+            session = guest.run("loginctl list-sessions --no-legend; loginctl show-user " + USER + " -p State; "
+                                "ls -la /run/user/; journalctl -b --no-pager -o short-monotonic "
+                                "-u gdm -u systemd-logind _COMM=gnome-shell _COMM=gnome-session-service | tail -n 80",
+                                timeout=60)
+            (out / "session.log").write_text(session.stdout + session.stderr)
             verdict, note = control()
             if judge_launch(verdict) == "infrastructure":
                 couldnt_run("launch", "control_failed", "The test VM couldn't run apps, so your app's launch "
@@ -650,6 +723,14 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
             return failed_launch("Your app closed right after it started. Its log is attached for you.",
                                  (journal.stdout[-1000:] + "\n" + status.stdout[-500:]))
         if seen < 2:
+            procs = guest.run(f"cat /sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/"
+                              "depot-review-app.service/cgroup.procs 2>/dev/null | xargs -r ps -o comm= -p",
+                              timeout=30).stdout
+            if stuck_in_ldconfig(procs):
+                couldnt_run("launch", "flatpak_ldconfig_timeout", "Flatpak didn't finish preparing the runtime "
+                            "in time, so your app's launch couldn't be watched.",
+                            detail=f"still in Flatpak's first-run ldconfig after {LAUNCH_SECONDS} s: {procs.split()}")
+                return result
             return failed_launch("Your app started but no window appeared within three minutes.",
                                  journal.stdout[-1500:])
         # Stop the app and look again: the change must leave with it.
@@ -711,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     pb = sub.add_parser("prepare-base")
     pb.add_argument("--disk", type=Path, required=True)
     pb.add_argument("--arch", default="x86_64")
+    pb.add_argument("--force", action="store_true", help="prepare a base that is already prepared")
     r = sub.add_parser("run")
     r.add_argument("--base", type=Path, required=True)
     r.add_argument("--key", type=Path, required=True)
@@ -722,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.command == "prepare-base":
-        prepare_base(args.disk, args.arch)
+        prepare_base(args.disk, args.arch, force=args.force)
         return 0
     if args.command == "build-base":
         build_base(args.iso, args.out, args.arch)
