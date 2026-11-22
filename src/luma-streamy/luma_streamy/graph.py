@@ -162,6 +162,26 @@ def hardware_decode() -> bool:
 _HW: bool | None = None
 
 
+def gpu_decoders_first(_decodebin, _pad, caps):
+    """decodebin's ``autoplug-factories`` on a camera decoded on the GPU: its usual choice for ``caps``,
+    with VA's JPEG decoder first for MJPEG. vajpegdec has rank none, so decodebin alone decodes MJPEG on
+    the CPU, and vapostproc hands GL that picture as a linear DMABuf that never reaches the canvas. A
+    JPEG not parsed yet goes to the parser first (vajpegdec takes parsed frames only)."""
+    from gi.repository import Gst
+
+    factories = Gst.ElementFactory.list_filter(
+        Gst.ElementFactory.list_get_elements(Gst.ELEMENT_FACTORY_TYPE_DECODABLE, Gst.Rank.MARGINAL),
+        caps, Gst.PadDirection.SINK, False)
+    factories.sort(key=lambda f: f.get_rank(), reverse=True)
+    structure = caps.get_structure(0) if caps is not None and caps.get_size() else None
+    va = Gst.ElementFactory.find("vajpegdec")
+    if va is None or structure is None or structure.get_name() != "image/jpeg":
+        return factories
+    if structure.has_field("parsed"):
+        return [va] + [f for f in factories if f.get_name() != "vajpegdec"]
+    return sorted(factories, key=lambda f: "Parser" not in (f.get_metadata("klass") or ""))
+
+
 #: A decodebin added to the running program completes its own state change: it needs data to finish
 #: (MJPEG is parsed first), and a child's async start makes the whole pipeline lose its state, so the
 #: rest of the branch would join PAUSED, its live source would send nothing, and the program would

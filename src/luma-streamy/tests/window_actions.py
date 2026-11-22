@@ -8,6 +8,7 @@ panel. Runs the real window on drawn stand-in sources (needs a display: Xvfb).
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ["STREAMY_FAKE_SOURCES"] = "1"
@@ -35,6 +36,14 @@ def pump(seconds: float = 0.3) -> None:
     loop = GLib.MainLoop()
     GLib.timeout_add(int(seconds * 1000), loop.quit)
     loop.run()
+
+
+def pump_until(until, seconds: float) -> bool:
+    """Run the main loop until ``until()`` or ``seconds`` passed; whether it came true."""
+    end = time.monotonic() + seconds
+    while not until() and time.monotonic() < end:
+        pump(0.05)
+    return until()
 
 
 def check(app) -> None:
@@ -340,25 +349,51 @@ def outputs(win) -> None:
     win.center.show_bar = show_bar
 
 
+class _Monitor:
+    """A sound device monitor that lists ``listed`` (as it is when asked) and hears nothing more."""
+
+    def __init__(self, listed: list) -> None:
+        self.listed = listed
+
+    def get_bus(self):
+        class Bus:
+            @staticmethod
+            def timed_pop(timeout):
+                time.sleep(timeout / Gst.SECOND)
+
+        return Bus()
+
+    def get_devices(self):
+        return list(self.listed)
+
+    def stop(self) -> None:
+        pass
+
+
 def unplugged(win) -> None:
-    """A microphone whose device is unplugged says so by name, offers "Use <default>" in the bar, and
-    reconnects by itself when the same device comes back; "Use …" switches it to the default."""
+    """A microphone whose device is unplugged says so by name (once a fresh device monitor agrees),
+    offers "Use <default>" in the bar, and reconnects by itself when the same device comes back;
+    "Use …" switches it to the default."""
+    from luma_streamy import devices as devices_module
     from luma_streamy.devices import Device
 
     devices = win.devices
-    saved = (list(devices.devices), devices.ready)
+    saved = devices._new_monitor
     gone = Device("alsa_input.test-pocket", "Pocket Mic", "source")
     default = Device("alsa_input.test-builtin", "Built-in Microphone", "source", default=True)
+    listed = [default]
+    confirm = devices_module.CONFIRM_S + 3.0  # a fresh monitor is asked, and lists
     scene = win.project.active_scene
     mic = win.project.add_widget(scene.id, "microphone", source={"device": gone.name, "device-name": gone.label})
     shown = []
     show_bar = win.center.show_bar
     win.center.show_bar = lambda items, **kw: (shown.append(list(items)), show_bar(items, **kw))[1]
     try:
-        with devices._lock:
-            devices.devices, devices.ready = [default], True
-        win._devices_changed()
-        pump()
+        devices._new_monitor = lambda: _Monitor(listed)
+        devices.restart()
+        pump(0.3)
+        assert mic.id not in win.widget_errors, f"unplugged before a fresh list said so: {win.widget_errors}"
+        pump_until(lambda: win.widget_errors.get(mic.id) == "unplugged", confirm)
         assert win.widget_errors.get(mic.id) == "unplugged", f"not unplugged: {win.widget_errors.get(mic.id)}"
         assert win.source_summary(mic) == "Pocket Mic unplugged", win.source_summary(mic)
         win.select(mic.id)
@@ -366,24 +401,23 @@ def unplugged(win) -> None:
         use = [i for i in shown[-1] if getattr(i, "label", None) == "Use Built-in Microphone"]
         assert use, f"no Use key: {[getattr(i, 'label', i) for i in shown[-1]]}"
         # Plugged in again: it reconnects with nothing pressed.
-        with devices._lock:
-            devices.devices = [default, gone]
-        win._devices_changed()
-        pump()
+        listed.append(gone)
+        devices.restart()
+        pump_until(lambda: mic.id not in win.widget_errors and mic.id in win.engine.branches, 2)
         assert mic.id not in win.widget_errors, f"still {win.widget_errors.get(mic.id)}"
         assert mic.id in win.engine.branches, "it did not reconnect"
         # Unplugged again, then "Use …": the default from now on.
-        with devices._lock:
-            devices.devices = [default]
-        win._devices_changed()
-        pump()
+        listed.remove(gone)
+        devices.restart()
+        pump_until(lambda: win.widget_errors.get(mic.id) == "unplugged", confirm)
+        assert win.widget_errors.get(mic.id) == "unplugged", f"not unplugged again: {win.widget_errors.get(mic.id)}"
         win.use_stand_in(mic)
         pump()
         assert "device" not in mic.source and mic.id not in win.widget_errors, mic.source
     finally:
         win.center.show_bar = show_bar
-        with devices._lock:
-            devices.devices, devices.ready = saved
+        devices._new_monitor = saved
+        devices.restart()
         win.deselect()
         win.project.remove_widget(mic.id)
         win._changed(structure=True)

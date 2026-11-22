@@ -91,6 +91,7 @@ def make(answers, props=None):
     p.captures = {}
     p.on_ready = None
     p.on_ended = None
+    p.last_node = {}
     return p
 
 

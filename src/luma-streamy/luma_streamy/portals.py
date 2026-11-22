@@ -90,19 +90,30 @@ class PortalError(RuntimeError):
     pass
 
 
-def _devices(fd: int, wanted: str):
-    """The PipeWire devices a remote shows, through GStreamer's provider (which owns and closes ``fd``)."""
+def pipewire_provider():
+    """A PipeWire device provider of our own, or None. The factory's own (``factory.get()``) is one per
+    process, shared with every GstDeviceMonitor: its start and stop are counted, so a second start with
+    another fd connects nothing (the list comes from whichever remote started it first), and anyone's
+    stop can end the connection a camera list depends on."""
     import gi
 
     gi.require_version("Gst", "1.0")
-    from gi.repository import Gst
+    from gi.repository import GObject, Gst
 
     Gst.init(None)
     factory = Gst.DeviceProviderFactory.find("pipewiredeviceprovider")
-    if factory is None:
-        os.close(fd)
+    factory = factory.load() if factory is not None else None
+    if factory is None or not factory.get_device_provider_type():
+        return None
+    return GObject.new(factory.get_device_provider_type())
+
+
+def _devices(fd: int, wanted: str):
+    """The PipeWire devices a remote shows, through a provider of our own. The provider copies ``fd``
+    and never closes it: the caller closes it once the provider has stopped."""
+    provider = pipewire_provider()
+    if provider is None:
         return None, []
-    provider = factory.get()
     provider.set_property("fd", fd)
     if not provider.start():
         return None, []
@@ -120,18 +131,13 @@ def camera_nodes(fd: int) -> list[tuple[str, str, tuple[int, int] | None]]:
     The target is the node's object.serial (or its node.name), which is what
     pipewiresrc's target-object wants on that remote; a global node id is not.
     """
-    import gi
-
-    gi.require_version("Gst", "1.0")
-    from gi.repository import Gst
-
-    Gst.init(None)
-    factory = Gst.DeviceProviderFactory.find("pipewiredeviceprovider")
-    if factory is None:
+    provider = pipewire_provider()
+    if provider is None:
+        os.close(fd)
         return []
-    provider = factory.get()
-    provider.set_property("fd", fd)  # the provider owns and closes it
+    provider.set_property("fd", fd)  # copied, never closed by the provider: closed after stop()
     if not provider.start():
+        os.close(fd)
         return []
     try:
         nodes = []
@@ -158,15 +164,17 @@ def camera_nodes(fd: int) -> list[tuple[str, str, tuple[int, int] | None]]:
         return nodes
     finally:
         provider.stop()
+        os.close(fd)
 
 
 def node_serial(fd: int, node_id: int) -> str | None:
-    """The object.serial of node ``node_id`` on a portal's PipeWire remote (which owns ``fd``), or None.
+    """The object.serial of node ``node_id`` on a portal's PipeWire remote (``fd``, closed here), or None.
 
     A portal older than ScreenCast v6 gives only the node id; pipewiresrc's target-object
     wants the serial, which the remote's own registry knows."""
     provider, devices = _devices(fd, "Video/Source")
     if provider is None:
+        os.close(fd)
         return None
     try:
         for device in devices:
@@ -181,6 +189,7 @@ def node_serial(fd: int, node_id: int) -> str | None:
         return None
     finally:
         provider.stop()
+        os.close(fd)
 
 
 @dataclass(frozen=True)
@@ -304,66 +313,248 @@ def unique_cameras(cameras: list) -> list:
     return [c for c in cameras if by_label.get(c.label) is c]
 
 
-class CameraWatch:
-    """The cameras Streamy may use, kept current on a thread of its own (one PipeWire connection on the
-    camera portal's remote); ``on_changed`` runs on the window's thread when one comes or goes."""
+#: A camera missing from the list is gone only once a connection opened this long after it went missing
+#: says so too. The camera service recreates every camera node when it restarts (a second or so), and a
+#: connection that died with it, or that was opened while it was down, keeps a list that never changes.
+CONFIRM_S = 1.5
+#: A connection whose list hasn't come in this long (the service never let it in) is given up for a new one.
+READY_S = 4.0
+#: While a chosen camera stays missing, a fresh connection looks again: first after this long, then less often.
+RECHECK_S = 20.0
+RECHECK_MAX_S = 120.0
 
-    def __init__(self, fd: int, on_changed: Callable[[], None]) -> None:
+
+def _fd_add(fd: int, condition: GLib.IOCondition, callback: Callable) -> int:
+    """A main-loop watch on ``fd`` (GLibUnix where GLib has it)."""
+    import gi
+
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+
+        return GLibUnix.fd_add_full(GLib.PRIORITY_DEFAULT, fd, condition, callback)
+    except (ImportError, ValueError):
+        return GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, fd, condition, callback)
+
+
+class CameraWatch:
+    """The cameras Streamy may use, kept current on a PipeWire connection of its own on the camera portal's
+    remote (``open_remote(done)`` opens one: ``done(fd)`` or ``done(None)``, on the window's thread).
+    ``on_changed`` runs on the window's thread whenever the list changes.
+
+    The connection is replaced by a fresh one (the portal asks nothing again) when it can't be trusted:
+    the service closed it, its list never came, the camera service restarted (``reopen``), a camera
+    stream ended, or a chosen camera is missing (``missing``). A fresh list replaces the old one only
+    once it is in: until then the old one stays, so nothing is declared gone from a connection that
+    died."""
+
+    def __init__(self, open_remote: Callable[[Callable[[int | None], None]], None], on_changed: Callable[[], None],
+                 provider: Callable = None) -> None:
         self.cameras: list[Camera] = []
+        #: A list is known (from a live connection, or empty with ``error`` when none could be opened).
         self.ready = False
         #: Why there is no list (the device provider failed), in words; None when it is fine.
         self.error: str | None = None
         self.on_changed = on_changed
+        self._open_remote = open_remote
+        self._provider = provider or (lambda fd: _devices(fd, "Video/Source")[0])  # the caller closes fd
         self._lock = threading.Lock()
-        threading.Thread(target=self._run, args=(fd,), name="streamy-cameras", daemon=True).start()
+        self._generation = 0  # the newest connection asked for
+        self._live = 0  # the connection the list comes from
+        self._opened_at = float("-inf")  # when the live connection was asked for (monotonic)
+        self._reopening = False
+        self._retry_s = 1.0
+        self._hangup: tuple[int, int] | None = None  # (GLib source, our copy of the live connection's fd)
+        self._missing_since: dict[str, float] = {}
+        self._recheck_s = RECHECK_S
+        self._timers: dict[str, int] = {}
+        self.reopen("start")
 
-    def _run(self, fd: int) -> None:
+    # ── Connections ──
+
+    def reopen(self, reason: str) -> None:
+        """Open a fresh connection; its list replaces this one once it is in. One at a time."""
+        if self._reopening:
+            return
+        self._reopening = True
+        self._generation += 1
+        generation, asked = self._generation, time.monotonic()
+        if reason != "start":
+            log(f"cameras: {reason}; listing them on a fresh connection")
+
+        def opened(fd: int | None) -> None:
+            if generation != self._generation:
+                if fd is not None:
+                    os.close(fd)
+                return
+            if fd is None:
+                self._failed(generation, "The camera service did not answer")
+                return
+            # Our own copy of the connection hears the service close it (the provider tells no one).
+            watch_fd = os.dup(fd)
+            threading.Thread(target=self._run, args=(fd, watch_fd, generation, asked), name="streamy-cameras",
+                             daemon=True).start()
+
+        self._open_remote(opened)
+        self._after("late", READY_S, lambda: self._failed(generation, "The camera list did not come"))
+
+    def _run(self, fd: int, watch_fd: int, generation: int, asked: float) -> None:
+        """One connection's thread: its first list, then its changes, until it is no longer wanted."""
         import gi
 
         gi.require_version("Gst", "1.0")
         from gi.repository import Gst
 
         try:
-            provider, _devices_now = _devices(fd, "Video/Source")
-        except Exception as error:  # noqa: BLE001 - the list must come back, empty, whatever failed
-            print(f"streamy: cameras: {error}", flush=True)
+            provider = self._provider(fd)
+        except Exception as error:  # noqa: BLE001 - the list must come back, whatever failed
+            log(f"cameras: {error}")
             provider = None
         if provider is None:
-            self.error = "The camera list could not be read"
-            self._publish([])
+            os.close(watch_fd)
+            os.close(fd)
+            GLib.idle_add(lambda: self._failed(generation, "The camera list could not be read") and False,
+                          priority=GLib.PRIORITY_DEFAULT)
             return
-        self._provider = provider
         bus = provider.get_bus()
-        self._publish(provider)
-        while True:
-            message = bus.timed_pop(Gst.CLOCK_TIME_NONE)
-            if message is None:
-                break
-            if message.type in (Gst.MessageType.DEVICE_ADDED, Gst.MessageType.DEVICE_REMOVED,
-                                Gst.MessageType.DEVICE_CHANGED):
-                self._publish(provider)
+        try:
+            # A fresh client hears of the nodes as it starts (a list taken at once can be empty): the
+            # first list waits until the provider has been quiet for a moment, a second at most.
+            settled = time.monotonic() + 1.0
+            while time.monotonic() < settled and bus.timed_pop(100 * Gst.MSECOND) is not None:
+                pass
+            # At the main loop's own priority: a busy window (redraws) never holds the list back.
+            GLib.idle_add(lambda cameras=self._list(provider): self._listed(generation, asked, watch_fd, cameras)
+                          and False, priority=GLib.PRIORITY_DEFAULT)
+            while generation in (self._generation, self._live):
+                message = bus.timed_pop(250 * Gst.MSECOND)
+                if message is not None and message.type in (Gst.MessageType.DEVICE_ADDED,
+                                                             Gst.MessageType.DEVICE_REMOVED,
+                                                             Gst.MessageType.DEVICE_CHANGED):
+                    GLib.idle_add(lambda cameras=self._list(provider): self._changed(generation, cameras) and False,
+                                  priority=GLib.PRIORITY_DEFAULT)
+        finally:
+            provider.stop()
+            os.close(fd)  # the provider copied it: closed, the service sees this client go
 
-    def _publish(self, provider) -> None:
+    @staticmethod
+    def _list(provider) -> list[Camera]:
         cameras = []
-        if provider:
-            for device in provider.get_devices():
-                if device.get_device_class().startswith("Video/Source"):
-                    try:
-                        camera = _camera(device)
-                    except Exception as error:  # noqa: BLE001 - one odd device never hides the others
-                        print(f"streamy: camera {device.get_display_name()}: {error}", flush=True)
-                        camera = None
-                    if camera is not None:
-                        cameras.append(camera)
+        for device in provider.get_devices():
+            if device.get_device_class().startswith("Video/Source"):
+                try:
+                    camera = _camera(device)
+                except Exception as error:  # noqa: BLE001 - one odd device never hides the others
+                    log(f"camera {device.get_display_name()}: {error}")
+                    camera = None
+                if camera is not None:
+                    cameras.append(camera)
+        return unique_cameras(cameras)
+
+    def _listed(self, generation: int, asked: float, watch_fd: int, cameras: list[Camera]) -> None:
+        """A fresh connection's first list: it is the live one from now on (the old one's thread ends)."""
+        if generation != self._generation:
+            os.close(watch_fd)
+            return
+        self._cancel("late")
+        self._reopening, self._retry_s = False, 1.0
+        self._drop_hangup()
+        self._live, self._opened_at, self.error = generation, asked, None
+
+        def hung_up(*_args) -> bool:
+            if self._hangup is not None and self._hangup[1] == watch_fd:
+                self._hangup = None
+                os.close(watch_fd)
+                self.reopen("the camera service closed the connection")
+            return False
+
+        source = _fd_add(watch_fd, GLib.IOCondition.HUP | GLib.IOCondition.ERR, hung_up)
+        self._hangup = (source, watch_fd)
+        self._set(cameras)
+
+    def _changed(self, generation: int, cameras: list[Camera]) -> None:
         with self._lock:
-            self.cameras, self.ready = unique_cameras(cameras), True
-        GLib.idle_add(lambda: self.on_changed() and False)
+            same = cameras == self.cameras
+        if generation == self._live and not same:  # the provider reports every node it hears of
+            self._set(cameras)
+
+    def _failed(self, generation: int, error: str) -> None:
+        """A fresh connection failed or never listed: the old list stays (or none, said in words) and it
+        is tried again, less often each time."""
+        if generation != self._generation or not self._reopening:
+            return
+        self._cancel("late")
+        self._reopening = False
+        self._generation += 1  # a list that comes in late is not wanted any more
+        log(f"cameras: {error}; trying again in {self._retry_s:.0f} s")
+        self._after("retry", self._retry_s, lambda: self.reopen("trying again"))
+        self._retry_s = min(self._retry_s * 2, 30.0)
+        if not self.ready:
+            self.error = error
+            self._set([])
+
+    def _set(self, cameras: list[Camera]) -> None:
+        with self._lock:
+            self.cameras, self.ready = cameras, True
+        self.on_changed()
+
+    def _drop_hangup(self) -> None:
+        if self._hangup is not None:
+            source, fd = self._hangup
+            self._hangup = None
+            GLib.source_remove(source)
+            os.close(fd)
+
+    def _after(self, key: str, seconds: float, then: Callable[[], None]) -> None:
+        self._cancel(key)
+
+        def fire() -> bool:
+            self._timers.pop(key, None)
+            then()
+            return False
+
+        self._timers[key] = GLib.timeout_add(int(seconds * 1000), fire)
+
+    def _cancel(self, key: str) -> None:
+        timer = self._timers.pop(key, None)
+        if timer:
+            GLib.source_remove(timer)
+
+    def close(self) -> None:
+        for key in list(self._timers):
+            self._cancel(key)
+        self._drop_hangup()
+        self._generation += 1
+        self._live = -1
+
+    # ── Questions ──
 
     def find(self, name: str | None) -> Camera | None:
         with self._lock:
             if name:
                 return next((c for c in self.cameras if c.name == name), None)
             return self.cameras[0] if self.cameras else None
+
+    def missing(self, name: str) -> bool:
+        """Camera ``name`` is gone: absent from a list whose connection was opened at least CONFIRM_S after
+        it went missing. Until one is, the answer is no, and such a connection is on its way."""
+        if not name or not self.ready or self.find(name) is not None:
+            if self._missing_since.pop(name, None) is not None and not self._missing_since:
+                self._recheck_s = RECHECK_S
+                self._cancel("recheck")
+            return False
+        now = time.monotonic()
+        since = self._missing_since.setdefault(name, now)
+        if self._opened_at >= since + CONFIRM_S:
+            if "recheck" not in self._timers:
+                # Gone, as far as a live connection knows; a fresh one looks again now and then.
+                self._after("recheck", self._recheck_s, lambda: self.reopen("a chosen camera is still missing"))
+                self._recheck_s = min(self._recheck_s * 2, RECHECK_MAX_S)
+            return True
+        if "confirm" not in self._timers:
+            self._after("confirm", max(0.0, since + CONFIRM_S - now),
+                        lambda: self.reopen(f"camera {name} is missing"))
+        return False
 
 
 class Portals:
@@ -376,6 +567,9 @@ class Portals:
         self.on_ended: Callable[[str], None] | None = None
         #: The cameras, once the camera portal said yes (CameraWatch); ``on_cameras()`` follows them.
         self.cameras: CameraWatch | None = None
+        #: The node each closed camera capture was on (widget id -> target): a camera that comes back on
+        #: another node (its service restarted, or it was plugged in again) is worth opening again.
+        self.last_node: dict[str, str | None] = {}
         self.on_cameras: Callable[[], None] | None = None
         self._camera_waiters: list[Callable[[], None]] = []
 
@@ -638,16 +832,10 @@ class Portals:
             return
 
         def allowed(_results: dict) -> None:
-            def opened(fd: int | None) -> None:
-                if fd is None:
-                    failed("failed")
-                    return
-                self._camera_waiters.append(then)
-                # The remote shows only the cameras Streamy may use; one connection is kept for
-                # watching them, each stream opens its own.
-                self.cameras = CameraWatch(fd, self._cameras_changed)
-
-            self._open_remote_async(CAMERA, [], opened)
+            self._camera_waiters.append(then)
+            # The remote shows only the cameras Streamy may use; one connection is kept for watching
+            # them (opened again whenever it can't be trusted), each stream opens its own.
+            self.cameras = CameraWatch(lambda done: self._open_remote_async(CAMERA, [], done), self._cameras_changed)
 
         def refused(reason: str) -> None:
             failed("denied" if reason == "cancelled" else reason)
@@ -683,6 +871,8 @@ class Portals:
         capture = self.captures.pop(widget_id, None)
         if capture is None:
             return
+        if capture.camera is not None:
+            self.last_node[widget_id] = capture.node
         for fd in capture.pool:
             os.close(fd)
         capture.pool.clear()

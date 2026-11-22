@@ -180,6 +180,9 @@ class FakeCameras:
             return next((c for c in self.cameras if c.name == name), None)
         return self.cameras[0] if self.cameras else None
 
+    def missing(self, name) -> bool:
+        return bool(name) and self.find(name) is None
+
 
 class FakePortals:
     """What the window asks of Portals, for check runs with STREAMY_FAKE_SOURCES=1: no D-Bus."""

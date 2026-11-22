@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.13%{?dist}
+Release:        1.luma.14%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -114,7 +114,8 @@ found=$(find licenses/vendor -type f | wc -l)
 python3 -m py_compile %{buildroot}%{python3_sitelib}/luma_streamy/*.py
 desktop-file-validate %{buildroot}%{_datadir}/applications/org.projectluma.Streamy.desktop
 appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/org.projectluma.Streamy.metainfo.xml
-# Scene model, layouts and the pipeline graph.
+# Scene model, layouts, the pipeline graph, and the camera and sound device lists across a
+# service that goes away and comes back.
 PYTHONPATH=. python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 # Headless GL: Mesa's EGL surfaceless platform on llvmpipe.
 export GST_GL_PLATFORM=egl GST_GL_WINDOW=surfaceless LIBGL_ALWAYS_SOFTWARE=1
@@ -182,6 +183,17 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.14
+- Cameras and microphones follow PipeWire and WirePlumber restarts: the camera
+  list is read again on a fresh portal connection when its connection closes,
+  never lists, the service restarts, a camera stream ends or a chosen camera
+  is missing; a device is unplugged only once a fresh list agrees; a camera
+  on a new node reopens by itself, a microphone that came back is listened to
+  again
+- MJPEG cameras decode on the GPU with vajpegdec (rank none, so decodebin
+  never chose it); a GPU-decoded camera that sends but shows nothing in 8 s
+  decodes in software
+
 * Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.13
 - A preview leaving the program (a canvas hidden, the program closing) lets
   GTK's paintable sink go on the main thread; dropped on the close thread it

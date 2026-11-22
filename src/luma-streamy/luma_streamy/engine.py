@@ -148,6 +148,27 @@ def _set_prop(element: Gst.Element, name: str, value) -> None:
 CONSTRUCT_ONLY = {"force-live"}
 
 
+def source_fds(elements) -> list[int]:
+    """The PipeWire connections given to ``elements``' pipewiresrc (pipewiresrc copies the fd it is given
+    and never closes it: open, the connection and its portal client stay)."""
+    fds = []
+    for element in elements:
+        factory = element.get_factory()
+        if factory is not None and factory.get_name() == "pipewiresrc" and element.get_property("fd") >= 0 and \
+                not element.is_locked_state():  # a branch on its way out closes its own (Engine._remove_branch)
+            fds.append(element.get_property("fd"))
+    return fds
+
+
+def close_fds(fds: list[int]) -> None:
+    """Once their sources are NULL."""
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def make(spec: Element) -> Gst.Element:
     early = {k: v for k, v in spec.props.items() if k in CONSTRUCT_ONLY}
     if early:
@@ -307,6 +328,8 @@ class Branch:
     last: Gst.Buffer | None = None
     #: Out of the program: a late probe keeps no picture (its GPU memory would hold a GL context).
     closed: bool = False
+    #: Its source has sent a buffer (what it sends reaches the branch; a picture may not, yet).
+    sourced: bool = False
 
     def frame(self, fmt: str = "landscape") -> Gst.Element | None:
         layer = self.layers.get(fmt)
@@ -815,6 +838,10 @@ class Engine(GObject.Object):
         # The close thread lets the pipeline go before it counts as done; the last reference is the main
         # thread's (_drop_on_main), so the pipeline is never disposed on a thread a quit no longer waits for.
         held = [pipeline]
+        inside: list = []
+        pipeline.iterate_recurse().foreach(inside.append)
+        fds = source_fds(inside)
+        del inside
         _drop_on_main([pipeline])
         del pipeline
 
@@ -822,6 +849,7 @@ class Engine(GObject.Object):
             try:
                 old = holder.pop()
                 old.set_state(Gst.State.NULL)
+                close_fds(fds)
                 for device in devices:
                     GLib.idle_add(self._released, device)
             finally:
@@ -1291,6 +1319,7 @@ class Engine(GObject.Object):
         branch = state["branch"]()
         if branch is None:
             return Gst.PadProbeReturn.OK
+        branch.sourced = True
         buffer = info.get_buffer()
         caps = pad.get_current_caps()
         if buffer is None or caps is None:
@@ -1606,6 +1635,15 @@ class Engine(GObject.Object):
                 branch.widget_id not in self._no_alpha and any(e.get_name().endswith("-alpha") for e in branch.elements):
             self._fail(branch.widget_id, "format", "no picture with an alpha format")  # opaque, at once
             return False
+        if self.branches.get(branch.widget_id) is branch and not branch.shown and branch.sourced and \
+                branch.widget_id not in self._sw_decode and any(e.get_name().endswith("-vapp") for e in branch.elements):
+            # The camera sends, yet nothing decoded on the GPU reached the canvas: the CPU decodes it instead.
+            log(f"widget {branch.widget_id}: the camera sends but GPU decoding showed no picture in "
+                f"{FIRST_PICTURE_S} s; decoding in software")
+            self._sw_decode.add(branch.widget_id)
+            self._remove_branch(branch.widget_id)
+            GLib.idle_add(lambda: self.show_scene(self._scene, skip=self._skip, states=self._states) and False)
+            return False
         if self.branches.get(branch.widget_id) is branch and not branch.shown:
             log(f"widget {branch.widget_id}: no picture after {FIRST_PICTURE_S} s; the stream stays open")
             self.emit("widget-waiting", branch.widget_id)
@@ -1640,6 +1678,8 @@ class Engine(GObject.Object):
     def _link_chain(elements: list[Gst.Element]) -> None:
         for a, b in zip(elements, elements[1:]):
             if a.get_factory().get_name() == "decodebin":
+                if b.get_factory().get_name() == "vapostproc":
+                    a.connect("autoplug-factories", graph.gpu_decoders_first)
                 def pad_added(_bin, pad, following=b):
                     sink = following.get_static_pad("sink")
                     if not sink.is_linked() and pad.query_caps(None).to_string().startswith(("video/", "audio/")):
@@ -1792,6 +1832,9 @@ class Engine(GObject.Object):
             for element in branch.elements:
                 if element.get_parent() is pipeline:
                     pipeline.remove(element)
+            for element in branch.elements:
+                element.set_locked_state(False)
+            close_fds(source_fds(branch.elements))
             if device:
                 self._released(device)
             if not branch.picture and self.pipeline is pipeline:

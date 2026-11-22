@@ -29,7 +29,7 @@ from luma_appkit.creative_parts import add_arrange_item  # noqa: E402
 
 from . import graph  # noqa: E402
 from .engine import Engine, EngineError  # noqa: E402
-from .devices import AudioDevices  # noqa: E402
+from .devices import AudioDevices, ServiceRestarts  # noqa: E402
 from .layouts import PRESETS, LayoutStore  # noqa: E402
 from .undo import History  # noqa: E402
 from .model import FORMATS, KINDS, ModelError, Project, ProjectStore, Widget  # noqa: E402
@@ -96,6 +96,8 @@ class StreamyWindow(AppWindow):
         self.history = History()
         self._monitor_last: dict[str, str] = {}
         self.devices = AudioDevices(on_changed=self._devices_changed)
+        #: PipeWire or its session manager restarting: device lists and camera nodes are all new.
+        self._services = None if self.fake else ServiceRestarts(self._service_restarted)
         self._app_audio: bool | None = None
 
         commands = self._commands()
@@ -1121,10 +1123,10 @@ class StreamyWindow(AppWindow):
         if w.kind == "camera":
             cameras = self.portals.cameras if self.portals is not None else None
             name = w.source.get("camera")
-            return bool(name) and cameras is not None and cameras.ready and cameras.find(name) is None
+            # Only a list from a connection opened after it went says so (CameraWatch.missing).
+            return bool(name) and cameras is not None and cameras.missing(name)
         if w.kind == "microphone":
-            name = w.source.get("device")
-            return bool(name) and self.devices.ready and self.devices.find("source", name) is None
+            return self.devices.missing("source", w.source.get("device"))
         return False
 
     def stand_in(self, w: Widget):
@@ -1164,9 +1166,15 @@ class StreamyWindow(AppWindow):
         for w in [w for scene in self.project.scenes for w in scene.widgets if w.kind in ("camera", "microphone")]:
             reason = self.widget_errors.get(w.id)
             if self.device_missing(w):
-                # A camera is known gone once its stream failed; a microphone's stream never fails (it
-                # would hear nothing), so its absence from the device list is enough.
-                if reason in ("missing", "stopped") or (reason is None and w.kind == "microphone"):
+                # A camera is known gone once its stream failed, or its node is gone from a trusted list
+                # while its stream is open; a microphone's stream never fails (it would hear nothing),
+                # so its absence from the device list is enough.
+                live = w.kind == "camera" and reason is None and self.portals is not None and \
+                    w.id in self.portals.captures
+                if reason in ("missing", "stopped") or live or (reason is None and w.kind == "microphone"):
+                    if live:
+                        self.portals.close(w.id)
+                        self.engine._remove_branch(w.id)
                     self.widget_errors[w.id] = "unplugged"
                     self.widget_waiting.discard(w.id)
                     log(f"{w.kind} widget {w.name!r}: {self.cause_line(w, 'unplugged')}")
@@ -1176,6 +1184,12 @@ class StreamyWindow(AppWindow):
                 device = self.devices.find("source", w.source["device"])
                 if device is not None and w.source.get("device-name") != device.label:
                     w.source["device-name"] = device.label  # its name, for when it is unplugged
+                if reason is None and w.source["device"] in self.devices.returned and w.id in self.engine.branches:
+                    # Its device went and came back (a restart recreates it): the stream opens on it
+                    # again rather than staying on whatever the sound server moved it to meanwhile.
+                    log(f"microphone widget {w.name!r}: {self.source_name(w)} came back; listening to it again")
+                    self.engine._remove_branch(w.id)
+                    changed = True
             if reason == "unplugged":
                 log(f"{w.kind} widget {w.name!r}: {self.source_name(w)} is back")
                 self.widget_errors.pop(w.id, None)
@@ -1226,12 +1240,26 @@ class StreamyWindow(AppWindow):
         log(f"{w.kind} widget {w.name!r}: {self.cause_line(w, reason)} ({reason})")
         self.widget_waiting.discard(widget_id)
         self.widget_errors[widget_id] = reason
+        rechecking = False
         if self.portals is not None:
             self.portals.close(widget_id)
+            cameras = self.portals.cameras
+            if w.kind == "camera" and reason in ("missing", "stopped") and hasattr(cameras, "reopen"):
+                # Its node may be gone with the camera service: a fresh list says whether it is back on
+                # a new one (_follow_cameras), or unplugged. Only a camera still failing after that is told.
+                cameras.reopen("a camera stream ended")
+                rechecking = True
         self._show_scene()  # its card says so in its place
         self._shared_one(widget_id)
         if reason == "paused":
             pass
+        elif rechecking:
+            def still_failing() -> bool:
+                if self.widget_errors.get(widget_id) in ("missing", "stopped"):
+                    Toast.show(self.host, f"{w.name} couldn't start", kind="warning")
+                return False
+
+            GLib.timeout_add_seconds(5, still_failing)
         elif reason == "timeout":
             Toast.show(self.host, "The picker stopped waiting. Share again when you're ready.", kind="warning")
         elif reason != "unshared":  # a person who pressed Cancel knows
@@ -2322,9 +2350,51 @@ class StreamyWindow(AppWindow):
 
     def _cameras_changed(self) -> None:
         self._camera_error = None
+        self._follow_cameras()
         self._sync_unplugged()
         self._refresh_bar()
         self._regrow("source")
+
+    def _follow_cameras(self) -> None:
+        """A camera on another node now (its service restarted, or it was plugged in again) opens again on
+        it by itself: a stream on the old node shows nothing more, and one that ended is worth another try
+        only on a new node (the same node failing again would only fail again)."""
+        if self.portals is None or self.fake or self.portals.cameras is None:
+            return
+        from .engine import log
+
+        shown = {w.id for w in self.project.active_scene.widgets} if self.project.active_scene else set()
+        changed = False
+        for w in [w for scene in self.project.scenes for w in scene.widgets if w.kind == "camera"]:
+            camera = self.portals.cameras.find(w.source.get("camera"))
+            if camera is None:
+                continue
+            capture = self.portals.captures.get(w.id)
+            if capture is not None:
+                if capture.node == camera.target:
+                    continue
+            elif self.widget_errors.get(w.id) not in ("missing", "stopped", "nocamera") or \
+                    self.portals.last_node.get(w.id) == camera.target:
+                continue
+            log(f"camera widget {w.name!r}: {camera.label} is on a new node; opening it again")
+            self.widget_errors.pop(w.id, None)
+            self.widget_waiting.discard(w.id)
+            self.portals.close(w.id)
+            self.engine._remove_branch(w.id)
+            if w.id in shown and not getattr(self, "locked", False):
+                self._choose_source(w, restore=True)
+            changed = True
+        if changed:
+            self._show_scene()
+            self.refresh_all()
+
+    def _service_restarted(self, unit: str) -> None:
+        """PipeWire or its session manager started again: the sound devices and cameras are listed afresh
+        (connections may have died with it), and what was open follows them back."""
+        self.devices.restart()
+        cameras = self.portals.cameras if self.portals is not None else None
+        if hasattr(cameras, "reopen"):
+            cameras.reopen(f"{unit} started again")
 
     #: Why the camera list is empty, in words.
     CAMERA_ERRORS = {"denied": "Camera access is turned off for Streamy", "failed": "The camera service did not answer",
