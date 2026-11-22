@@ -31,6 +31,7 @@ CASES = [
     ("camera", "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1"),
 ]
 RUN_S = 3.5  # past the Dell's 2.5 s failure after the first picture
+FIRST_S = 15.0  # the first picture of a big cast on software GL on a loaded builder
 
 
 def run(seconds: float) -> None:
@@ -85,7 +86,12 @@ def check(kind: str, caps: str) -> list[str]:
     errors = []
     engine.start(project)
     for attempt in ("first", "reopened"):
-        run(RUN_S)
+        for _ in range(int(FIRST_S * 10)):  # its first picture, however slow the GL
+            branch = engine.branches.get(widget.id)
+            if failed or (branch is not None and branch.shown):
+                break
+            run(0.1)
+        run(RUN_S)  # then on past the point a negotiation failure would stop it
         branch = engine.branches.get(widget.id)
         if failed:
             errors.append(f"{attempt}: failed ({failed})")
@@ -105,8 +111,7 @@ def check(kind: str, caps: str) -> list[str]:
             engine.show_scene(scene, skip={widget.id})
             run(0.5)
             engine.show_scene(scene)
-    engine.stop()
-    run(0.3)
+    assert engine.stop(wait=10), "the program did not stop"
     return errors
 
 

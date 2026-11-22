@@ -86,8 +86,7 @@ def main() -> int:
     print("sending: border", pixel(shot, 205, 380))
     assert max(pixel(shot, 205, 380)) < 20, "the placeholder leaks into what is sent"
     engine.outputs.clear()
-    engine.stop()
-    run(0.5)  # the program's own threads finish before the interpreter goes
+    assert engine.stop(wait=10), "the program did not stop"
     return 0
 
 

@@ -61,53 +61,67 @@ def main() -> int:
     # 1 s: shared two-core builders pause a process for half a second on their own; a source
     # waited on by the main loop (the fault this catches) holds it for seconds.
     assert max(gaps) < 1.0, f"the main loop stalled for {max(gaps):.2f} s"
-    # Let the stuck source go, then stop everything without waiting on it.
-    fd = os.open(stuck, os.O_RDWR | os.O_NONBLOCK)
+    # Stop everything without waiting on the stuck source, then let it go: each time a reader has the pipe
+    # open (or is blocked opening it), a writer opens and closes at once, so its open returns and its read
+    # ends. The whole program is stopped before the next one starts.
     t = time.monotonic()
     engine.stop()
     assert time.monotonic() - t < 1.0
-    os.close(fd)
+    while not engine.wait_stopped(0.1):
+        try:
+            os.close(os.open(stuck, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:  # ENXIO: no reader yet
+            pass
+        assert time.monotonic() - t < 10, "the program did not stop"
 
     # Nothing to show and nothing sent: no pipeline at all. A widget added later starts a fresh
-    # program, and its pictures reach the mixer (the timing of a program opened late is right).
+    # program, and its pictures keep reaching the mixer (the timing of a program opened late is right:
+    # wrong running times make the mixer drop every picture as late, or hold them, after the first).
     empty = Project.starter()
     idle = Engine(fake=True, preview=False)
     idle.start(empty)
     assert idle.pipeline is None, "an empty scene has no pipeline"
     late = empty.add_widget(empty.active_scene.id, "display")
-    frames = [0]
+    pictures: list[float] = []  # when each picture left the layer for the mixer (any thread)
 
     def add() -> bool:
         idle.show_scene(empty.active_scene)
         frame = idle.branches[late.id].frame("landscape")
         frame.get_static_pad("src").add_probe(
-            Gst.PadProbeType.BUFFER, lambda *_a: (frames.__setitem__(0, frames[0] + 1), Gst.PadProbeReturn.OK)[1])
+            Gst.PadProbeType.BUFFER, lambda *_a: (pictures.append(time.monotonic()), Gst.PadProbeReturn.OK)[1])
         return False
 
-    loop = GLib.MainLoop()
+    # The source sends 30 a second. Proven here: the first picture comes (software GL on a loaded
+    # builder: within FIRST_S), then pictures keep coming for WINDOW_S at a rate no late-timed
+    # program reaches (MIN_RATE, a tenth of the source's) and still come at its end (no gap over 1 s).
+    FIRST_S, WINDOW_S, MIN_RATE = 10.0, 3.0, 3.0
     GLib.timeout_add(1000, add)
-    GLib.timeout_add(3500, loop.quit)
-    loop.run()
-    print("late widget frames", frames[0])
-    assert frames[0] > 15, f"only {frames[0]} pictures reached the mixer"  # 2.5 s; builders run llvmpipe
+    started = time.monotonic()
+    while not pictures and time.monotonic() - started < 1.0 + FIRST_S:
+        run(0.1)
+    assert pictures, f"no picture reached the mixer within {FIRST_S:g} s"
+    run(WINDOW_S)
+    first = pictures[0]
+    window = [t for t in pictures if t - first <= WINDOW_S]
+    rate = (len(window) - 1) / WINDOW_S
+    gap = time.monotonic() - pictures[-1]
+    print(f"late widget: first picture after {first - started - 1.0:.2f} s, then {rate:.1f}/s, last {gap:.2f} s ago")
+    assert rate >= MIN_RATE, f"only {len(window)} pictures reached the mixer in {WINDOW_S:g} s"
+    assert gap < 1.0, f"pictures stopped reaching the mixer {gap:.2f} s ago"
     empty.remove_widget(late.id)
     idle.show_scene(empty.active_scene)
-    loop = GLib.MainLoop()
-    GLib.timeout_add(500, loop.quit)
-    loop.run()
+    run(0.5)
     assert idle.pipeline is None, "the last widget gone, the pipeline goes"
-    idle.stop()
-    loop = GLib.MainLoop()
-    GLib.timeout_add(500, loop.quit)
-    loop.run()  # the programs' own threads finish before the interpreter goes
+    assert idle.stop(wait=10), "the program did not stop"
     return 0
+
+
+def run(seconds: float) -> None:
+    loop = GLib.MainLoop()
+    GLib.timeout_add(int(seconds * 1000), loop.quit)
+    loop.run()
 
 
 if __name__ == "__main__":
     Gst.init(None)
-    status = main()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    # Straight out: interpreter teardown with GStreamer's pool threads still parked crashed builders
-    # after every check had passed.
-    os._exit(status)
+    sys.exit(main())

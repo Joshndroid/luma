@@ -91,8 +91,7 @@ def main() -> int:
         with lock:
             state["step"], state["armed"] = step, True
         run(0.2)
-    engine.stop()
-    run(0.3)
+    assert engine.stop(wait=10), "the program did not stop"
     late = state["late"]
     print(f"{len(late)} of {STEPS} resizes composited; frames late after arriving: "
           f"p50 {statistics.median(late) if late else '-'}, max {max(late) if late else '-'}, "

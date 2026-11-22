@@ -82,7 +82,7 @@ def main() -> int:
     for i in range(10):
         target = other if i % 2 == 0 else scene
         first_picture(f"scene {i}", lambda t=target: (project.activate(t.id), engine.show_scene(t)))
-    engine.stop()
+    assert engine.stop(wait=10), "the program did not stop"
     assert not overlaps, f"a stream opened while another held the device: {overlaps[:3]}"
     times.sort()
     print(f"camera first picture: {len(times)} starts, p50 {times[len(times) // 2] * 1000:.0f} ms, "

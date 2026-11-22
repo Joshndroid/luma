@@ -45,7 +45,7 @@ def main() -> int:
     try:
         return checks(engine, project, scene, second, out_dir, url)
     finally:
-        engine.stop()
+        engine.stop(wait=10)  # every stop finished before the interpreter goes
 
 
 def checks(engine, project, scene, second, out_dir, url) -> int:

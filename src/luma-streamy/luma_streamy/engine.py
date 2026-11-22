@@ -14,9 +14,11 @@ Python only builds and edits the graph; every frame stays in GStreamer.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -31,6 +33,54 @@ from .graph import ALPHA_FORMATS, ALPHA_FOURCCS, Chain, Element, EncoderChoice, 
 from .model import FORMATS, Project, Scene, Widget  # noqa: E402
 
 FADE_MS = 300
+
+#: The GL display every program pipeline in this process shares (a gst.gl.GLDisplay context). Each pipeline
+#: making its own would open the same EGLDisplay underneath, and an old program's eglTerminate as its display
+#: goes breaks the GL of the program running after it (a restart, a second engine). The first display a
+#: program used (its own, or the preview sink's from GDK) is kept for the life of the process.
+_gl_display: Gst.Context | None = None
+
+
+#: Every engine alive in this process, so the interpreter never goes while one of them still runs.
+_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
+
+
+@atexit.register
+def _stop_engines() -> None:
+    """At exit (also on an uncaught exception): every program NULL and every stop finished before the
+    interpreter finalizes; a GL thread still at work when Mesa unloads crashes the process."""
+    for engine in list(_engines):
+        engine.stop(wait=5.0)
+
+
+class Teardown:
+    """Counts the stops still running off the main loop (GStreamer's pool, a close thread), so a quit can
+    wait for them: a process that exits while a program is still going to NULL tears Mesa down under
+    its GL thread."""
+
+    def __init__(self) -> None:
+        self._done = threading.Condition()
+        self._running: dict[str, int] = {}
+
+    def begin(self, what: str) -> None:
+        with self._done:
+            self._running[what] = self._running.get(what, 0) + 1
+
+    def end(self, what: str) -> None:
+        with self._done:
+            self._running[what] -= 1
+            if not self._running[what]:
+                del self._running[what]
+            self._done.notify_all()
+
+    def wait(self, timeout: float) -> bool:
+        """Whether every stop finished within ``timeout`` seconds (the GIL is free meanwhile)."""
+        with self._done:
+            return self._done.wait_for(lambda: not self._running, timeout)
+
+    def running(self) -> str:
+        with self._done:
+            return ", ".join(f"{what} ×{n}" for what, n in self._running.items())
 
 
 def _set_prop(element: Gst.Element, name: str, value) -> None:
@@ -495,6 +545,8 @@ class Engine(GObject.Object):
         self._sw_decode: set[str] = set()
         #: Enum properties last set by nick, per (element name, property): a move never re-sets them.
         self._strings: dict[tuple[str, str], str] = {}
+        self._teardown = Teardown()
+        _engines.add(self)
 
     # ── Canvases ──
 
@@ -624,11 +676,24 @@ class Engine(GObject.Object):
                 element.set_state(Gst.State.NULL)
             GLib.idle_add(lambda: [pipeline.remove(e) for e in elements if e.get_parent() is pipeline] and False)
 
-        pipeline.call_async(stop, items)
+        self._call_async(pipeline, stop, items)
         program.paintable = None
         self.emit("preview-changed", fmt)
 
     # ── The program pipeline ──
+
+    def _call_async(self, pipeline: Gst.Pipeline, func, data) -> None:
+        """``func(pipeline, data)`` on GStreamer's pool, counted by the teardown a quit waits for."""
+        what = func.__qualname__.replace("Engine.", "").replace(".<locals>", "")
+
+        def run(p, d) -> None:
+            try:
+                func(p, d)
+            finally:
+                self._teardown.end(what)
+
+        self._teardown.begin(what)
+        pipeline.call_async(run, data)
 
     def start(self, project: Project) -> None:
         """Show ``project``'s active scene. The pipeline itself exists only while something
@@ -642,6 +707,8 @@ class Engine(GObject.Object):
         if self.pipeline is not None:
             return
         self.pipeline = Gst.Pipeline.new("streamy-program")
+        if _gl_display is not None:
+            self.pipeline.set_context(_gl_display)
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._message)
@@ -667,6 +734,9 @@ class Engine(GObject.Object):
             self._releasing[device] = self._releasing.get(device, 0) + 1
         pipeline = self.pipeline
         pipeline.get_bus().remove_signal_watch()
+        global _gl_display
+        if _gl_display is None:
+            _gl_display = pipeline.get_context("gst.gl.GLDisplay")
         programs, self.programs = self.programs, {}
         if self._watch_timer:
             GLib.source_remove(self._watch_timer)
@@ -685,22 +755,41 @@ class Engine(GObject.Object):
         # Off the window's thread: a source still stuck opening holds its state lock, and the
         # pipeline's own NULL waits on it. Nothing here needs the old pipeline any more.
         def close() -> None:
-            pipeline.set_state(Gst.State.NULL)
-            for device in devices:
-                GLib.idle_add(self._released, device)
+            try:
+                pipeline.set_state(Gst.State.NULL)
+                for device in devices:
+                    GLib.idle_add(self._released, device)
+            finally:
+                self._teardown.end("close")
 
+        self._teardown.begin("close")
         threading.Thread(target=close, name="streamy-close", daemon=True).start()
         self._sound = False
         self._sound_tap = []
         for fmt in programs:
             self.emit("preview-changed", fmt)
 
-    def stop(self) -> None:
-        """Everything off: outputs finish, captures stop, the pipeline goes."""
+    def stop(self, wait: float = 0.0) -> bool:
+        """Everything off: outputs finish, captures stop, the pipeline goes. The stops run off the main
+        loop; with ``wait``, block up to that many seconds until every one of them (also those of
+        earlier removals) has finished, and say whether they did. Quitting waits: no GStreamer or GL
+        thread may still be stopping when the process exits."""
         for output in list(self.outputs.values()):
             output.stop()
         self.enabled = False
         self._close()
+        return self.wait_stopped(wait) if wait > 0 else True
+
+    def wait_stopped(self, timeout: float) -> bool:
+        """Block up to ``timeout`` seconds until every stop running off the main loop has finished."""
+        done = self._teardown.wait(timeout)
+        if not done and timeout >= 1:
+            log(f"the program did not stop within {timeout:g} s: still running {self._teardown.running()}")
+            if os.environ.get("STREAMY_STOP_TRACE"):
+                import faulthandler
+
+                faulthandler.dump_traceback(all_threads=True)
+        return done
 
     @property
     def running(self) -> bool:
@@ -838,7 +927,7 @@ class Engine(GObject.Object):
         _ok, state, _pending = self.pipeline.get_state(0)
         if state != Gst.State.PLAYING:
             # On GStreamer's pool: a source still opening (a stuck device) never holds the window.
-            self.pipeline.call_async(lambda pipeline, _data: pipeline.set_state(Gst.State.PLAYING), None)
+            self._call_async(self.pipeline, lambda pipeline, _data: pipeline.set_state(Gst.State.PLAYING), None)
 
     def _idle_check(self) -> None:
         """Nothing captures, shows or is sent: the program goes, so it costs nothing."""
@@ -881,7 +970,7 @@ class Engine(GObject.Object):
             width, height, (x, y, w, h) = branch.crop
             x, y = min(x, width - 1), min(y, height - 1)
             self._crop_layer(branch, layer, (x, y, min(w, width - x), min(h, height - y)))
-        self.pipeline.call_async(lambda _p, items: [e.sync_state_with_parent() for e in reversed(items)], elements)
+        self._call_async(self.pipeline, lambda _p, items: [e.sync_state_with_parent() for e in reversed(items)], elements)
 
     def _remove_layer(self, branch: Branch, fmt: str) -> None:
         layer = branch.layers.pop(fmt, None)
@@ -935,7 +1024,7 @@ class Engine(GObject.Object):
         self._placeholder_words[widget.id] = words
         for fmt in self.programs:
             self._add_layer(card, fmt, widget, zorder, card=True)
-        self.pipeline.call_async(lambda _p, items: [e.sync_state_with_parent() for e in reversed(items)], elements)
+        self._call_async(self.pipeline, lambda _p, items: [e.sync_state_with_parent() for e in reversed(items)], elements)
 
     def _update_placeholder(self, widget: Widget, zorder: int | None = None) -> None:
         card = self.placeholders.get(widget.id)
@@ -1055,7 +1144,7 @@ class Engine(GObject.Object):
             self._sync_monitor(branch, widget)
         # State changes run on GStreamer's thread pool: a source that takes its time
         # (a camera opening, a portal stream negotiating) never holds up the window.
-        self.pipeline.call_async(lambda _pipeline, items: [e.sync_state_with_parent() for e in reversed(items)],
+        self._call_async(self.pipeline, lambda _pipeline, items: [e.sync_state_with_parent() for e in reversed(items)],
                                  elements)
         if widget.has_picture:
             branch.watchdog = GLib.timeout_add_seconds(FIRST_PICTURE_S, self._no_picture, branch)
@@ -1531,7 +1620,7 @@ class Engine(GObject.Object):
         link_all(elements)
         tee.link(elements[0])
         branch.monitor, branch.monitor_device = elements, device
-        self.pipeline.call_async(lambda _p, items: [e.sync_state_with_parent() for e in reversed(items)], elements)
+        self._call_async(self.pipeline, lambda _p, items: [e.sync_state_with_parent() for e in reversed(items)], elements)
 
     def _drop_monitor(self, branch: Branch) -> None:
         elements, branch.monitor = branch.monitor, []
@@ -1579,7 +1668,7 @@ class Engine(GObject.Object):
                 element.set_state(Gst.State.NULL)
             GLib.idle_add(drop)
 
-        pipeline.call_async(stop, elements)
+        self._call_async(pipeline, stop, elements)
 
     def _remove_branch(self, widget_id: str) -> None:
         """Take a widget out without waiting. Its data stops at once (a probe drops it before the
@@ -1632,7 +1721,7 @@ class Engine(GObject.Object):
 
         for element in branch.elements:
             element.set_locked_state(True)  # the pipeline's own state changes leave it alone now
-        pipeline.call_async(stop, branch.elements)
+        self._call_async(pipeline, stop, branch.elements)
 
     def _released(self, device: str) -> bool:
         """A stream on ``device`` has stopped: one waiting for it opens now."""

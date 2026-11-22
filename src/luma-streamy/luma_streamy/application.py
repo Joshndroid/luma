@@ -12,6 +12,8 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Adw, Gio, GLib, Gst  # noqa: E402
 
 APP_ID = "org.projectluma.Streamy"
+#: How long a quit waits for the program to stop (a source stuck opening can hold its NULL).
+QUIT_WAIT_S = 5.0
 
 
 class StreamyApplication(Adw.Application):
@@ -38,14 +40,15 @@ class StreamyApplication(Adw.Application):
             render_after_paint(window, os.path.join(folder, os.path.basename(name) or "streamy.png"))
 
     def do_shutdown(self) -> None:
-        # Quitting without closing the window (a check run, a session ending) still stops the pipeline
-        # before the interpreter goes: no GStreamer thread calls into Python after that.
+        # Quitting, with or without closing the window (a check run, a session ending): the program is
+        # NULL before the interpreter goes, and every stop still running (the window's close, a removed
+        # widget) has finished, so no GStreamer or GL thread is mid-teardown when the process exits.
         for window in self.get_windows():
             engine, outputs = getattr(window, "engine", None), getattr(window, "outputs", None)
             if outputs is not None:
                 outputs.close_now()
             if engine is not None:
-                engine.stop()
+                engine.stop(wait=QUIT_WAIT_S)
         Adw.Application.do_shutdown(self)
 
     def do_activate(self) -> None:

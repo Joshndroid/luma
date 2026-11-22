@@ -185,7 +185,7 @@ def main(mode: str, limit_ms: float | None) -> int:
 
     GLib.timeout_add(300, tick)
     loop.run()
-    engine.stop()
+    assert engine.stop(wait=10), "the program did not stop"
 
     complete = [s for s in steps if "painted" in s]
     print(f"{mode}: {len(complete)} of {len(steps)} steps reached the screen; preview {PREVIEW_WIDTH} px wide")

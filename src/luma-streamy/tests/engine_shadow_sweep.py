@@ -73,7 +73,7 @@ def main() -> int:
     loop.run()
     seen = [e for e in edges if e is not None]
     print(f"{len(edges)} frames; content left edge at {sorted(set(seen))}")
-    engine.stop()
+    assert engine.stop(wait=10), "the program did not stop"
     assert len(seen) > 20 and max(seen) - min(seen) <= 1, f"the picture moved: {sorted(set(seen))}"
     return 0
 

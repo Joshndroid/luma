@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.11%{?dist}
+Release:        1.luma.12%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -179,6 +179,12 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.12
+- Quitting waits for the program and every pending stop to reach NULL, so
+  no GL thread is mid-teardown when the process exits (exit segfaults)
+- Every program pipeline in a process shares one GL display; an old
+  program's eglTerminate no longer breaks the next one
+
 * Sat Nov 21 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.11
 - aarch64: no gstreamer1-plugins-bad-free-extras recommendation; it conflicts
   with the Raspberry Pi 5 bad-free override

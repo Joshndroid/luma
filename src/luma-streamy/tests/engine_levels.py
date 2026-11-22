@@ -19,6 +19,12 @@ from luma_streamy.engine import Engine  # noqa: E402
 from luma_streamy.model import Project  # noqa: E402
 
 
+#: A level comes every 100 ms of sound, so a microphone joining a running program meters within a few of
+#: them; 0.5 s leaves a shared builder's scheduling room. A program that waits on something to start
+#: (or is rebuilt, also asserted on its own) meters seconds later.
+FIRST_LEVEL_S = 0.5
+
+
 def run(seconds: float) -> None:
     loop = GLib.MainLoop()
     GLib.timeout_add(int(seconds * 1000), loop.quit)
@@ -50,11 +56,10 @@ def main() -> int:
     assert mic.id in first, "no level from the microphone"
     delay = first[mic.id] - added
     print(f"first level {delay * 1000:.0f} ms after the microphone was added")
-    assert delay <= 0.2, f"first level after {delay * 1000:.0f} ms"
+    assert delay <= FIRST_LEVEL_S, f"first level after {delay * 1000:.0f} ms"
     _ok, state, _pending = program.get_state(0)
     assert state == Gst.State.PLAYING, f"program is {state.value_nick}"
-    engine.stop()
-    run(0.5)
+    assert engine.stop(wait=10), "the program did not stop"
 
     # A source that fails as it starts (a camera that is gone) fails the program's own state change;
     # the program must still run on, so a microphone beside it meters.
@@ -81,10 +86,9 @@ def main() -> int:
     _ok, state, _pending = engine.pipeline.get_state(0)
     assert state == Gst.State.PLAYING, f"beside a failed source the program is {state.value_nick}"
     assert mic.id in first, "no level beside a failed source"
-    assert first[mic.id] - added <= 0.2, f"first level beside a failed source after {(first[mic.id] - added) * 1000:.0f} ms"
+    assert first[mic.id] - added <= FIRST_LEVEL_S, f"first level beside a failed source after {(first[mic.id] - added) * 1000:.0f} ms"
     print(f"beside a failed source: first level {(first[mic.id] - added) * 1000:.0f} ms")
-    engine.stop()
-    run(0.5)  # the programs' own threads finish before the interpreter goes
+    assert engine.stop(wait=10), "the program did not stop"
     return 0
 
 

@@ -58,7 +58,7 @@ def main(out_dir: str) -> int:
         print(container, "streams", kinds, "duration", round(duration, 2), probe.stderr.strip()[:200])
         assert kinds == ["audio", "video"], f"{container}: streams {kinds}"
         assert duration > 0.5, f"{container}: duration {duration}"
-    engine.stop()
+    assert engine.stop(wait=10), "the program did not stop"
     return 0
 
 

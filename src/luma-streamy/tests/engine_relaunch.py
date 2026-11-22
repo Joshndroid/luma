@@ -154,8 +154,7 @@ def main() -> int:
     run(0.5)
     engine.start(project)  # a relaunch: everything comes back, stills included
     check(engine, project, widgets, "restart")
-    engine.stop()
-    run(0.5)
+    assert engine.stop(wait=10), "the program did not stop"
     return 0
 
 

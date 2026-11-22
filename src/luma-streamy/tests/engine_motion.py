@@ -77,7 +77,7 @@ def main(limit_ms: float | None) -> int:
     p50 = statistics.median(delays)
     p95 = delays[int(len(delays) * 0.95) - 1]
     print(f"motion to program picture: p50 {p50:.0f} ms, p95 {p95:.0f} ms over {len(delays)} moves")
-    engine.stop()
+    assert engine.stop(wait=10), "the program did not stop"
     if limit_ms is not None:
         assert p95 <= limit_ms, f"p95 {p95:.0f} ms over {limit_ms} ms"
     return 0
