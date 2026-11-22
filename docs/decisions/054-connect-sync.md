@@ -310,19 +310,18 @@ An app with network access can send anything it can read to any server, and Sync
    - Folders; phone device backups; paid cloud storage.
    - The second Hub host.
 
-## Defaults pending the owner's confirmation
+## Defaults
 
-These are decided as below unless overruled. None of them blocks Phase 1.
+Decided 2026-11-22; the owner delegated these calls. None of them blocks Phase 1.
 
 1. **Calendar and contacts** move to end-to-end encrypted zones for Luma devices. A per-account CalDAV/CardDAV bridge stays available for other clients (Thunderbird, iPhone) as an explicit opt-in. Turning it on tells the person that the Hub can then read calendars and contacts.
 2. **No escrow.** Losing every device and the recovery key loses synced data. Setup makes saving the recovery key a required step.
 
-Open questions, each with the recommended default that applies until the owner decides:
 
-3. **Free storage and a paid tier.** *Needs the owner (pricing).* Default: 10 GB of resident data per account (the Phase 1 Hub default); peer-lane transfers unlimited; transit 10 GB for 14 days; relaying 50 GB a month; no paid tier yet. A paid tier would add *Keep in Luma Cloud* storage, larger transit and relay allowances, a year of versions and phone device backups.
-4. **Documents device to device.** Default: Documents, Desktop and chosen folders sync device to device only, opt-in per folder (Folders, Phase 5), with no Hub storage except transit and paid *Keep in Luma Cloud*.
-5. **Showing the recovery key again, or only making a new one.** Default: the device that holds the words can show them again (polkit). Removing such a device offers a new key. The alternative is Apple's: no Show, only "Make a new recovery key…", which invalidates the old one.
-6. **Where photo originals live.** Default: device-held after transit, with previews kept on the Hub. The alternative is iCloud's: originals on the Hub within the free amount.
+3. **Free storage and a paid tier.** Decided: 10 GB of resident data per account (the Phase 1 Hub default); peer-lane transfers unlimited; transit 10 GB for 14 days; relaying 50 GB a month; no paid tier at launch. A later paid tier (sizes and price set when it ships) would add *Keep in Luma Cloud* storage, larger transit and relay allowances, a year of versions and phone device backups.
+4. **Documents device to device.** Decided: Documents, Desktop and chosen folders sync device to device only, opt-in per folder (Folders, Phase 5), with no Hub storage except transit and paid *Keep in Luma Cloud*.
+5. **Showing the recovery key again, or only making a new one.** Decided: the device that holds the words can show them again (polkit). Removing such a device offers a new key. The alternative is Apple's: no Show, only "Make a new recovery key…", which invalidates the old one.
+6. **Where photo originals live.** Decided: device-held after transit, with previews kept on the Hub. The alternative is iCloud's: originals on the Hub within the free amount.
 
 ## Phase 1 note
 
