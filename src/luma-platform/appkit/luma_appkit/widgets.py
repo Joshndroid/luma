@@ -2113,6 +2113,26 @@ class AppWindow(Adw.ApplicationWindow):
         """
         (self.add_css_class if enabled else self.remove_css_class)("lumaui-edge-to-edge")
 
+    def set_hidden_from_capture(self, hidden: bool = True) -> bool:
+        """Keep this window out of captures of the screen (API level 14).
+
+        Screen shares of a display or an area and screenshots of the screen show what
+        is behind the window; the window stays on the screen, with its dialogs, menus
+        and popovers left out too. Sharing the window itself still shows it, and the
+        share picker marks it "Hidden from screen sharing". For windows that would
+        capture themselves, such as a recorder's controls or a streaming preview. No
+        permission is involved: hiding only removes content from captures.
+
+        May be called before or after the window is shown. Returns True when the
+        compositor hides the window, False elsewhere (another compositor, X11) or when
+        showing it again (C: luma_window_set_hidden_from_capture)."""
+        return bool(LumaUI.window_set_hidden_from_capture(self, bool(hidden)))
+
+    @property
+    def hidden_from_capture(self) -> bool:
+        """What `set_hidden_from_capture` last asked for this window."""
+        return bool(LumaUI.window_get_hidden_from_capture(self))
+
     @property
     def tier(self) -> str:
         """v71's tier for this window: "phone" (<560), "compact" (560-900) or "regular"."""

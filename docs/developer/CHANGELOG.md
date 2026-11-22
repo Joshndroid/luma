@@ -10,6 +10,16 @@ section: Overview
 Changes to these docs that affect what you build, newest first. Platform API
 changes name the platform version they apply to.
 
+## November 21, 2026: windows hidden from screen capture
+
+**Added**
+
+- [LumaUI in C](kit/lumaui-c.md#windows-hidden-from-screen-capture):
+  `luma_window_set_hidden_from_capture()` keeps a window out of screen
+  shares and screenshots of the screen while it stays on screen; Python
+  `AppWindow.set_hidden_from_capture()` (platform 0.1.0-1.luma.152, C
+  `LUMA_UI_API_LEVEL` 11, `LUMAUI_API_LEVEL` 14).
+
 ## November 19, 2026: windows that keep their shape
 
 **Added**

@@ -141,6 +141,32 @@ one. Elsewhere (another compositor, X11, macOS, Windows) the calls do nothing
 and return `FALSE`. Python reaches the same calls through introspection as
 `LumaUI.window_set_aspect_ratio()`.
 
+## Windows hidden from screen capture
+
+A window that would capture itself, such as a recorder's controls or a
+streaming app's preview, keeps itself out of screen captures (C API level
+11):
+
+```c
+luma_window_set_hidden_from_capture (window, TRUE);
+```
+
+Screen shares of a display or an area and screenshots of the screen show
+what is behind the window; it stays on the screen as usual, and its dialogs,
+menus and popovers are left out with it. Sharing the window itself still
+shows it, and the share picker marks its tile "Hidden from screen sharing".
+No permission is needed: hiding only removes content from captures. The call
+may come before or after the window is shown; `FALSE` shows the window in
+captures again.
+
+It returns `TRUE` when the compositor hides the window;
+`luma_window_get_capture_hiding_supported()` asks without setting anything.
+Elsewhere (another compositor, X11, macOS, Windows) it does nothing and
+returns `FALSE`. Python apps call `AppWindow.set_hidden_from_capture()`
+(`LUMAUI_API_LEVEL` 14). Xwayland apps that do not use LumaUI set the
+`_LUMA_WINDOW_HIDDEN_FROM_CAPTURE` CARDINAL property on their window to 1.
+See ADR-053.
+
 ## Where C differs from Python
 
 - **Refusals come when a part is shown.** C parts are filled in after they

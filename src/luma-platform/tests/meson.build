@@ -112,6 +112,17 @@ test(
   env: ['G_DEBUG=fatal-criticals'],
 )
 
+window_capture_test = executable(
+  'test-luma-window-capture',
+  'test-window-capture.c',
+  dependencies: ui_dep,
+)
+test(
+  'window-capture',
+  window_capture_test,
+  env: ['G_DEBUG=fatal-criticals'],
+)
+
 # LumaUI parts (ADR-052): a part's C test joins once it exists, and the parity
 # test compares every C part's widget tree with its Python twin's.
 fs = import('fs')
