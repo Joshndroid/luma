@@ -6,6 +6,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -836,7 +837,38 @@ def system_restart_required(sha256: str, default: bool) -> bool:
     return default
 
 
-def install(report: PackageReport) -> str:
+def install(report: PackageReport, *, from_command_line: bool = False) -> str:
+    """Install a reviewed package. ``from_command_line``: no sheet was shown; the
+    suggested permissions apply and a review is raised afterwards."""
+    store_install.REVIEW = from_command_line
+    name = _install(report)
+    if report.kind not in {"android", "windows", "snap", "flatpakrepo"} and not store_install.RECORDED:
+        _record_permissions(report, from_command_line)
+    store_install.RECORDED = False
+    return name
+
+
+def _record_permissions(report: PackageReport, review: bool) -> None:
+    """Permissions for an install that did not go to the store (capsule, Flatpak, AppImage folder)."""
+    from . import package_access
+    from .desktop import iter_records
+    for record in iter_records():
+        if record.get("sha256") != report.sha256:
+            continue
+        application_id = str(record.get("application_id") or "")
+        flatpak = record.get("format") == "flatpak"
+        if not application_id and not flatpak:
+            continue
+        key = package_access.key_for_record(application_id, record)
+        try:
+            package_access.record_install(key, report.access or package_access.plan_for_report(report),
+                                          review=review, flatpak=flatpak)
+        except Exception as error:  # noqa: BLE001 - installed; permissions take their defaults at first start
+            print(f"luma-installer: permissions not recorded for {key}: {error}", file=sys.stderr)
+        return
+
+
+def _install(report: PackageReport) -> str:
     phase("Check the file", 0, True)
     with transaction_lock(report.sha256):
         if fingerprint(report.path)[1] != report.sha256:

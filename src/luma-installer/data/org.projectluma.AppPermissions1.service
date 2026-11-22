@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.projectluma.AppPermissions1
+Exec=/usr/libexec/luma-app-permissions
+SystemdService=luma-app-permissions.service

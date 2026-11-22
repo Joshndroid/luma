@@ -258,6 +258,12 @@ def remove(application_id: str, delete_data: bool = False) -> str:
         except Exception:  # noqa: BLE001 - never a reason to keep the application
             pass
     remove_record(application_id)
+    # Its permissions, native-messaging hosts and Flatpak override state go with it.
+    try:
+        from . import package_access
+        package_access.forget(package_access.key_for_record(str(record.get("application_id") or application_id), record))
+    except Exception:  # noqa: BLE001 - never a reason to keep the application
+        pass
     # The lock its updates were taken under is the application's too.
     (records_root() / f".refresh-{safe_id(application_id)}.lock").unlink(missing_ok=True)
     if kind in {"deb", "rpm", "appimage", "portable"}:
@@ -381,6 +387,9 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="action", required=True)
     listing = subparsers.add_parser("list")
     listing.add_argument("--json", action="store_true")
+    installing = subparsers.add_parser("install", help="install a package file without waiting on the sheet; "
+                                       "its suggested permissions apply and a review is offered afterwards")
+    installing.add_argument("package")
     updating = subparsers.add_parser("update")
     updating.add_argument("application_id")
     removing = subparsers.add_parser("remove")
@@ -428,6 +437,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if values.action == "update":
             print(update(values.application_id))
+            return 0
+        if values.action == "install":
+            from . import backends
+            from .inspectors import inspect_package
+            report = inspect_package(Path(values.package))
+            print(backends.install(report, from_command_line=True))
             return 0
         if values.action == "remove":
             print(remove(values.application_id, values.delete_data))

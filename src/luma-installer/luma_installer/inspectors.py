@@ -287,6 +287,10 @@ def inspect_package(path: Path) -> PackageReport:
         report = enrich(inspector(path, size, digest))
     if fingerprint(path)[1] != digest:
         raise InstallerError("The package changed during inspection. Open it again.")
+    if kind not in {"android", "windows", "snap", "flatpakrepo"}:
+        import dataclasses
+        from .package_access import plan_for_report
+        report = dataclasses.replace(report, access=plan_for_report(report))
     return report
 
 

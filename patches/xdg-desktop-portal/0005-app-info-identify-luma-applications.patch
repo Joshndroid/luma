@@ -1,0 +1,277 @@
+From 5d344efea99a9339dd51c78c5ee677e66f217e97 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sat, 21 Nov 2026 21:58:25 -0500
+Subject: [PATCH] app-info: Identify Luma applications
+
+Applications Luma installs from package files run in the
+luma_application.process SELinux domain under a category pair allocated
+to them, in their own app-luma-NAME-PID.scope. Name them through Luma's
+resolver (org.projectluma.AppPermissions1.Identify, the rules Mutter 0041
+uses) and treat them as sandboxed: permissions are stored under their ID
+and files they are given go through the document portal. One that cannot
+be named is refused instead of being treated as the host.
+---
+ src/meson.build                 |   1 +
+ src/xdp-app-info-luma-private.h |  25 +++++
+ src/xdp-app-info-luma.c         | 177 ++++++++++++++++++++++++++++++++
+ src/xdp-app-info.c              |  12 +++
+ 4 files changed, 215 insertions(+)
+ create mode 100644 src/xdp-app-info-luma-private.h
+ create mode 100644 src/xdp-app-info-luma.c
+
+diff --git a/src/meson.build b/src/meson.build
+index 7e06400..c769215 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -72,6 +72,7 @@ xdp_utils_sources = enums_sources + files(
+   'xdp-app-info-registry.c',
+   'xdp-app-info-snap.c',
+   'xdp-app-info-linyaps.c',
++  'xdp-app-info-luma.c',
+   'xdp-sealed-fd.c',
+   'xdp-usb-query.c',
+   'xdp-utils.c',
+diff --git a/src/xdp-app-info-luma-private.h b/src/xdp-app-info-luma-private.h
+new file mode 100644
+index 0000000..6280c01
+--- /dev/null
++++ b/src/xdp-app-info-luma-private.h
+@@ -0,0 +1,25 @@
++/*
++ * Copyright © 2026 Project Luma
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#pragma once
++
++#include "xdp-app-info-private.h"
++
++struct _XdpAppInfoLumaClass
++{
++  XdpAppInfoClass parent_class;
++};
++
++#define XDP_TYPE_APP_INFO_LUMA (xdp_app_info_luma_get_type())
++G_DECLARE_FINAL_TYPE (XdpAppInfoLuma,
++                      xdp_app_info_luma,
++                      XDP, APP_INFO_LUMA,
++                      XdpAppInfo);
++
++XdpAppInfo * xdp_app_info_luma_new (const char *sender,
++                                    int         pid,
++                                    int        *pidfd,
++                                    GError    **error);
+diff --git a/src/xdp-app-info-luma.c b/src/xdp-app-info-luma.c
+new file mode 100644
+index 0000000..6c17eb2
+--- /dev/null
++++ b/src/xdp-app-info-luma.c
+@@ -0,0 +1,177 @@
++/*
++ * Copyright © 2026 Project Luma
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * Applications Luma installs from package files (store trees, capsules,
++ * AppImages) run in their own sandbox under an SELinux category pair
++ * allocated to them, in the luma_application.process domain, and in their
++ * own app-luma-NAME-PID.scope. They are sandboxed applications: permissions
++ * are looked up and stored under their ID, and files they are given go
++ * through the document portal.
++ *
++ * The ID comes from Luma's one resolver, org.projectluma.AppPermissions1
++ * Identify(pid) (luma_installer.app_identity), which follows the same rules
++ * as the compositor (Mutter 0041): the level names the application's record,
++ * the scope names it when there is no level. It is the desktop-file ID of the
++ * launcher Luma wrote, org.projectluma.Installed.ID, so a prompt shows that
++ * application's name and icon. A process in the domain that cannot be named
++ * is refused rather than treated as the host.
++ */
++
++#include "config.h"
++
++#include "xdp-app-info-luma-private.h"
++
++#include <gio/gio.h>
++#include <string.h>
++
++#define LUMA_ENGINE_ID "org.projectluma"
++#define LUMA_DOMAIN ":luma_application.process:"
++#define LUMA_PERMISSIONS_NAME "org.projectluma.AppPermissions1"
++#define LUMA_PERMISSIONS_PATH "/org/projectluma/AppPermissions"
++
++struct _XdpAppInfoLuma
++{
++  XdpAppInfo parent;
++};
++
++G_DEFINE_FINAL_TYPE (XdpAppInfoLuma, xdp_app_info_luma, XDP_TYPE_APP_INFO);
++
++static char *
++read_proc (int         pid,
++           const char *name)
++{
++  g_autofree char *path = g_strdup_printf ("/proc/%d/%s", pid, name);
++  char *contents = NULL;
++
++  if (!g_file_get_contents (path, &contents, NULL, NULL))
++    return NULL;
++
++  return contents;
++}
++
++/* In the Luma application domain, or started in a Luma launcher's scope. */
++static gboolean
++is_luma_application (int pid)
++{
++  g_autofree char *label = read_proc (pid, "attr/current");
++  g_autofree char *cgroup = NULL;
++  g_auto(GStrv) lines = NULL;
++  size_t i;
++
++  if (label && strstr (label, LUMA_DOMAIN) != NULL)
++    return TRUE;
++
++  cgroup = read_proc (pid, "cgroup");
++  if (!cgroup)
++    return FALSE;
++
++  lines = g_strsplit (cgroup, "\n", -1);
++  for (i = 0; lines[i]; i++)
++    {
++      const char *leaf;
++
++      if (!g_str_has_prefix (lines[i], "0::"))
++        continue;
++      leaf = strrchr (lines[i], '/');
++      leaf = leaf ? leaf + 1 : lines[i] + 3;
++      if (g_str_has_prefix (leaf, "app-luma-") && g_str_has_suffix (leaf, ".scope"))
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
++static void
++xdp_app_info_luma_class_init (XdpAppInfoLumaClass *klass)
++{
++}
++
++static void
++xdp_app_info_luma_init (XdpAppInfoLuma *app_info_luma)
++{
++}
++
++XdpAppInfo *
++xdp_app_info_luma_new (const char *sender,
++                       int         pid,
++                       int        *pidfd,
++                       GError    **error)
++{
++  g_autoptr(GDBusConnection) bus = NULL;
++  g_autoptr(GVariant) reply = NULL;
++  g_autoptr(GError) local_error = NULL;
++  g_autofree char *instance = NULL;
++  const char *test_app_info_kind;
++  const char *app_id = NULL;
++  const char *kind = NULL;
++
++  test_app_info_kind = g_getenv ("XDG_DESKTOP_PORTAL_TEST_APP_INFO_KIND");
++  if (test_app_info_kind && g_strcmp0 (test_app_info_kind, "luma") != 0)
++    {
++      g_set_error (error, XDP_APP_INFO_ERROR, XDP_APP_INFO_ERROR_WRONG_APP_KIND,
++                   "Testing requested different AppInfo kind: %s",
++                   test_app_info_kind);
++      return NULL;
++    }
++
++  if (!is_luma_application (pid))
++    {
++      g_set_error (error, XDP_APP_INFO_ERROR, XDP_APP_INFO_ERROR_WRONG_APP_KIND,
++                   "Not a Luma application");
++      return NULL;
++    }
++
++  bus = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, &local_error);
++  if (bus)
++    reply = g_dbus_connection_call_sync (bus,
++                                         LUMA_PERMISSIONS_NAME,
++                                         LUMA_PERMISSIONS_PATH,
++                                         LUMA_PERMISSIONS_NAME,
++                                         "Identify",
++                                         g_variant_new ("(u)", (guint32) pid),
++                                         G_VARIANT_TYPE ("(ss)"),
++                                         G_DBUS_CALL_FLAGS_NONE,
++                                         5000,
++                                         NULL,
++                                         &local_error);
++  if (!reply)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
++                   "Luma could not name this application: %s",
++                   local_error ? local_error->message : "no reply");
++      return NULL;
++    }
++
++  g_variant_get (reply, "(&s&s)", &app_id, &kind);
++
++  /* A host process in a scope of that name (a shell started from a
++   * terminal Luma launched, say) is the host. */
++  if (g_strcmp0 (kind, "host") == 0)
++    {
++      g_set_error (error, XDP_APP_INFO_ERROR, XDP_APP_INFO_ERROR_WRONG_APP_KIND,
++                   "Not a Luma application");
++      return NULL;
++    }
++
++  if (g_strcmp0 (kind, "luma") != 0 || app_id == NULL || *app_id == '\0' ||
++      !g_application_id_is_valid (app_id))
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
++                   "Luma could not name this application");
++      return NULL;
++    }
++
++  instance = g_strdup_printf ("%d", pid);
++
++  return g_initable_new (XDP_TYPE_APP_INFO_LUMA,
++                         NULL,
++                         error,
++                         "engine", LUMA_ENGINE_ID,
++                         "flags", XDP_APP_INFO_FLAG_HAS_NETWORK,
++                         "id", app_id,
++                         "instance", instance,
++                         "sender", sender,
++                         NULL);
++}
+diff --git a/src/xdp-app-info.c b/src/xdp-app-info.c
+index a518c39..1518c3e 100644
+--- a/src/xdp-app-info.c
++++ b/src/xdp-app-info.c
+@@ -37,6 +37,7 @@
+ #include "xdp-app-info-flatpak-private.h"
+ #include "xdp-app-info-host-private.h"
+ #include "xdp-app-info-linyaps-private.h"
++#include "xdp-app-info-luma-private.h"
+ #include "xdp-app-info-snap-private.h"
+ #include "xdp-enum-types.h"
+ #include "xdp-utils.h"
+@@ -358,6 +359,17 @@ xdp_app_info_new (const char  *sender,
+     }
+   g_clear_error (&local_error);
+ 
++  if (app_info == NULL)
++    app_info = xdp_app_info_luma_new (sender, pid, &pidfd_owned, &local_error);
++
++  if (!app_info && !g_error_matches (local_error, XDP_APP_INFO_ERROR,
++                                     XDP_APP_INFO_ERROR_WRONG_APP_KIND))
++    {
++      g_propagate_error (error, g_steal_pointer (&local_error));
++      return NULL;
++    }
++  g_clear_error (&local_error);
++
+   if (app_info == NULL)
+     app_info = xdp_app_info_host_new (sender, pid, &pidfd_owned);
+ 

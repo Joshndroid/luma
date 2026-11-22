@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from . import capsule_display, capsule_identity, capsule_refresh, capsule_scope, capsule_secrets
+from . import capsule_display, capsule_identity, capsule_refresh, capsule_scope, capsule_secrets, sandbox_permissions
 from . import sandbox_seccomp, session_boundary
 from . import capsule_runtime as runtime_policy
 from . import launch_guard
@@ -350,8 +350,22 @@ def _launch_deb(record: dict[str, object], extra: list[str] | None = None) -> in
     home = Path.home().resolve()
     arguments.extend(("--volume", f"{data}:{home}:rw,Z", "--volume", f"{data}:/home/luma:rw",
                       "--env", f"HOME={home}", "--workdir", str(home)))
-    for folder in _person_folders():
-        arguments.extend(("--volume", f"{folder}:{folder}:rw"))
+    # The person's folders (sandbox_permissions): granted ones real, the rest refusal stubs, at
+    # their real paths; podman's own namespace keeps them, so a grant reaches a running capsule.
+    access = sandbox_permissions.for_start(str(record.get("application_id") or record["sha256"]), record,
+                                           backend="podman", instance=instance)
+    propagation = "rslave" if access.view is not None else "rw"
+    for source, destination in access.binds if access.binds is not None else [(str(f), str(f)) for f in _person_folders()]:
+        arguments.extend(("--volume", f"{source}:{destination}:{propagation}"))
+    if not access.network:
+        arguments[arguments.index("--network=host")] = "--network=none"
+    for node in access.devices:
+        arguments.extend(("--device", node))
+    # No document portal view for a capsule: the portal's FUSE mount refuses podman's user
+    # namespace, and crun then fails the whole start ("cannot stat /proc/self/fd/N").
+    # A capsule's bus proxy is outside the application's scope, so the portal treats it as
+    # the host and answers with real paths, which its folder view already covers.
+    arguments.extend(session_boundary.native_messaging(access.app, capsule_runtime, podman=True))
     # The desktop's identity tells toolkits which keyring, theme and portal
     # conventions apply; Chromium without it stores sign-ins in plain text and
     # forgets them, and GTK and Qt pick fallback themes.
@@ -378,6 +392,7 @@ def _launch_deb(record: dict[str, object], extra: list[str] | None = None) -> in
     try:
         status = _guarded(record, arguments, watched=True) if watched else _guarded(record, arguments)
     finally:
+        access.close()
         _stop_bus_proxy(proxy, bus_socket)
         if display is not None:
             display.stop()
@@ -591,8 +606,18 @@ def _launch_appimage(record: dict[str, object], extra: list[str] | None = None) 
         "--dir", "/run", "--dir", "/run/user", "--dir", str(capsule_runtime),
         "--dir", str(capsule_runtime / "pulse"), "--dir", str(capsule_runtime / "at-spi"),
     ]
-    for folder in _person_folders():
-        arguments.extend(("--bind", str(folder), str(folder)))
+    access = sandbox_permissions.for_start(str(record.get("application_id") or record["sha256"]), record)
+    for source, destination in access.binds if access.binds is not None else [(str(f), str(f)) for f in _person_folders()]:
+        arguments.extend(("--bind", source, destination))
+    if not access.network:
+        arguments[arguments.index("--share-net")] = "--unshare-net"
+    for node in access.devices:
+        arguments.extend(("--dev-bind", node, node))
+    arguments.extend(session_boundary.document_portal(access.app, capsule_runtime))
+    arguments.extend(session_boundary.native_messaging(access.app, capsule_runtime))
+    # The keeper's namespaces are joined before the Landlock scope, which forbids
+    # reaching a process outside it.
+    arguments[0:0] = [*access.gate, *access.nsenter]
     if Path("/dev/dri").exists():
         arguments.extend(("--dir", "/dev/dri", "--dev-bind", "/dev/dri", "/dev/dri"))
     # Wayland, sound, the filtered buses and the application's own X socket:
@@ -628,6 +653,7 @@ def _launch_appimage(record: dict[str, object], extra: list[str] | None = None) 
     try:
         return _guarded(record, arguments, environment)
     finally:
+        access.close()
         _stop_bus_proxy(proxy, bus_socket)
         if display is not None:
             display.stop()

@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 
 from . import capsule_display
@@ -197,4 +198,31 @@ def desktop_schemas(holder: Path | None = None, source: Path = SCHEMA_SOURCE) ->
         return final
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def document_portal(app: str, inside: Path, host_runtime: Path | None = None) -> list[str]:
+    """The document portal's view for one application, where portals hand it files.
+
+    A file chosen in the file picker reaches an application identified by
+    xdg-desktop-portal (ADR-052, Permissions 8) as /run/user/UID/doc/ID/NAME;
+    the portal's by-app/APP folder holds exactly the files it was given.
+    """
+    host_runtime = host_runtime or Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    view = host_runtime / "doc" / "by-app" / app
+    if not app or not (host_runtime / "doc" / "by-app").is_dir():
+        return []
+    # bubblewrap only: the portal's FUSE mount refuses podman's user namespace (launcher._launch_deb).
+    return ["--bind-try", str(view), str(inside / "doc")]
+
+
+def native_messaging(app: str, inside: Path, host_runtime: Path | None = None, *, podman: bool = False) -> list[str]:
+    """A browser registered with the native-messaging broker reaches its own broker socket."""
+    host_runtime = host_runtime or Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    folder = host_runtime / "luma-native-messaging" / app
+    if not app or not folder.is_dir():
+        return []
+    target = inside / "luma-native-messaging" / app
+    if podman:
+        return ["--volume", f"{folder}:{target}:rw"]
+    return ["--bind", str(folder), str(target)]
 

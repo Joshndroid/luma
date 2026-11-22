@@ -46,7 +46,7 @@ from pathlib import Path
 
 from . import capsule_identity, capsule_display, launch_guard, session_boundary
 from . import capsule_runtime as runtime_policy
-from . import closure, device_graphics
+from . import closure, device_graphics, permission_views, sandbox_permissions
 from . import launcher as capsule_launcher
 from .app_store import Store, selinux_enabled
 from .errors import InstallerError
@@ -263,7 +263,9 @@ def private_home(app_id: str, data: Path | None = None) -> Path:
 
 def sandbox_arguments(checkout: Path, record: dict[str, object], *, data: Path, instance: Path,
                       session: session_boundary.View, level: str = "", folders: list[Path] | None = None,
-                      environment: dict[str, str] | None = None, network: bool = True) -> tuple[list[str], dict[str, str]]:
+                      environment: dict[str, str] | None = None, network: bool = True,
+                      binds: list[tuple[str, str]] | None = None, devices: list[str] | None = None,
+                      document_app: str = "") -> tuple[list[str], dict[str, str]]:
     """The bubblewrap command (without the payload) and the environment inside."""
     host = dict(os.environ if environment is None else environment)
     uid = os.getuid()
@@ -288,8 +290,19 @@ def sandbox_arguments(checkout: Path, record: dict[str, object], *, data: Path, 
     if record.get("legacy_home") and home.name != "luma":
         # Settings written when a capsule's home was /home/luma name that path.
         arguments.extend(("--symlink", home.name, str(home.parent / "luma")))
-    for folder in (capsule_launcher._person_folders() if folders is None else folders):
-        arguments.extend(("--bind", str(folder), str(folder)))
+    if binds is not None:
+        # The person's folders as permission_views lays them out: each at its real path, the real
+        # folder where it is granted, a refusal stub where it is not. Hidden folders never.
+        for source, destination in binds:
+            arguments.extend(("--bind", source, destination))
+    else:
+        for folder in (capsule_launcher._person_folders() if folders is None else folders):
+            arguments.extend(("--bind", str(folder), str(folder)))
+    for node in devices or []:
+        # Device nodes a granted device request names (device_requests); none otherwise.
+        arguments.extend(("--dev-bind", node, node))
+    arguments.extend(session_boundary.document_portal(document_app, inside))
+    arguments.extend(session_boundary.native_messaging(document_app, inside))
     env = {"HOME": str(home), "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/games",
            "GTK_USE_PORTAL": "1", "BROWSER": "/usr/bin/xdg-open",
            # The person's dconf database stays outside, and the tree has no service to write one of
@@ -364,6 +377,40 @@ def scope_prefix(app_id: str) -> list[str]:
             f"--unit=app-luma-{name}-{os.getpid()}.scope", "--"]
 
 
+def enter_scope(app_id: str) -> bool:
+    """Move this launcher into the application's own scope, before it starts anything.
+
+    The bus proxy, the display relay and the sandbox then all belong to the
+    application: xdg-desktop-portal sees the proxy as the caller of every
+    portal request, and names the application from its scope (portal patch
+    0005, ``app_identity``). False: the scope comes from ``scope_prefix``.
+    """
+    if not shutil.which("busctl") or not os.environ.get("XDG_RUNTIME_DIR"):
+        return False
+    name = "".join(character if character.isalnum() else "_" for character in app_id)
+    unit = f"app-luma-{name}-{os.getpid()}.scope"
+    try:
+        done = subprocess.run(["busctl", "--user", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                               "org.freedesktop.systemd1.Manager", "StartTransientUnit", "ssa(sv)a(sa(sv))", unit, "fail",
+                               "3", "PIDs", "au", "1", str(os.getpid()), "Slice", "s", "app.slice",
+                               "CollectMode", "s", "inactive-or-failed", "0"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if done.returncode:
+        return False
+    # The move is a job; what this launcher starts next has to be inside.
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            if unit in Path("/proc/self/cgroup").read_text():
+                return True
+        except OSError:
+            break
+        time.sleep(0.01)
+    return False
+
+
 def guard_record(app_id: str, tree: dict[str, object], record: dict[str, object] | None = None) -> dict[str, object]:
     """One record for everything that asks about the application while it starts:
     what its tree exports, under what Valet recorded when it was installed."""
@@ -420,6 +467,8 @@ def launch(store: Store, app_id: str, extra: list[str] | None = None, *, graphic
         label_data(instance, level)
     identity = hashlib.sha256(app_id.encode()).hexdigest()
     held = running_lock(instance)
+    scoped = enter_scope(app_id)
+    access = sandbox_permissions.for_start(app_id, described)
     proxy, bus_socket = capsule_launcher._start_bus_proxy(runtime, identity, runtime_policy.own_bus_arguments(described),
                                                          described)
     display = capsule_launcher._start_display(runtime, identity)
@@ -434,16 +483,21 @@ def launch(store: Store, app_id: str, extra: list[str] | None = None, *, graphic
         session = session_boundary.view(runtime, inside, dict(os.environ),
                                         accessibility=proxy.accessibility if proxy is not None else None,
                                         bus_socket=bus_socket, display=display)
-        arguments, env = sandbox_arguments(checkout, described, data=data, instance=instance, session=session, level=level)
+        arguments, env = sandbox_arguments(checkout, described, data=data, instance=instance, session=session, level=level,
+                                           network=access.network, binds=access.binds, devices=access.devices,
+                                           document_app=access.app)
         front, filter_options = capsule_launcher._confinement(described)
         program = command if command is not None else payload(tree, session.wayland, list(extra or []))
-        full = [*scope_prefix(app_id), *front, *arguments, *filter_options, "--", *program]
+        # The keeper's namespaces are joined before the Landlock scope (``front``), which
+        # forbids reaching a process outside it.
+        full = [*([] if scoped else scope_prefix(app_id)), *access.gate, *access.nsenter, *front, *arguments, *filter_options, "--", *program]
         if command is not None:
             return subprocess.run(full, env=env, check=False).returncode
         return capsule_launcher._guarded(described, full, env, watched=watched)
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
+        access.close()
         capsule_launcher._stop_bus_proxy(proxy, bus_socket)
         if display is not None:
             display.stop()
@@ -573,7 +627,19 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: closure-launch APPLICATION_ID [ARGUMENT ...]", file=sys.stderr)
         return 2
     try:
+        if values[0] == "--command" and len(values) > 2:
+            # A program of the application other than its launcher, in its own sandbox
+            # (the native-messaging broker starts a host this way): ID -- PROGRAM ...
+            from .desktop import read_record
+            record = read_record(values[1])
+            store_id = str(dict(record.get("store") or {}).get("id") or values[1])  # type: ignore[arg-type]
+            program = values[3:] if values[2] == "--" else values[2:]
+            return launch(Store(), store_id, command=program, record=record)
         return launch(Store(), values[0], values[1:])
     except InstallerError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

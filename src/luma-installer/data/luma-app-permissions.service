@@ -1,0 +1,10 @@
+[Unit]
+Description=Application permissions
+Documentation=https://simplyluma.com/apps
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.projectluma.AppPermissions1
+ExecStart=/usr/libexec/luma-app-permissions
+Restart=on-failure

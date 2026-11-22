@@ -35,12 +35,11 @@
     (rangetransition process user_home_t dir ((s0) (s0)))
     (rangetransition process user_home_t file ((s0) (s0)))
     (rangetransition process user_home_t lnk_file ((s0) (s0)))
-    ; Music is the one standard folder with a type of its own in the policy
-    ; (audio_home_t, ~/Music); the others are user_home_t. Without these rules
-    ; a music player saw that ~/Music was there and could not list, read or
-    ; save into it ({ read } and { write } on the dir, { read } on a file).
-    ; The same rights as above, for that type only. Keys, keyrings and browser
-    ; profiles keep their own types and stay refused.
+    ; Music has a type of its own in the policy (audio_home_t, ~/Music): a
+    ; music player granted Music could see that it was there and not open it,
+    ; with no AVC (a dontaudit). The same rights as for the other folders; the
+    ; refusal stub, not the type, decides which folders an application may use.
+    ; Keys, keyrings and browser profiles keep their own types and stay refused.
     (allow process audio_home_t (dir (getattr search open read ioctl lock watch create write add_name remove_name rename reparent rmdir setattr)))
     (allow process audio_home_t (file (getattr open read write append create unlink rename link lock ioctl map setattr watch)))
     (allow process audio_home_t (lnk_file (getattr read create unlink rename setattr)))
@@ -96,6 +95,33 @@
     ; logged, so that a real denial on the tree is not lost among these.
     ; Only adding an entry to a folder of the tree is silenced.
     (dontaudit process container_ro_file_t (dir (write add_name)))
+    ; -- Folders an application may not use (ADR-052, Permissions 3) --------
+    ; Every folder of the home folder is at its real path in an application's
+    ; sandbox. One it may not use has an empty folder of this type mounted over
+    ; it (luma_installer.permission_views): the application sees that the
+    ; folder is there (getattr) and nothing else. Reading, entering or writing
+    ; it is refused with a permission error, and each refusal is an AVC that
+    ; luma-refusal-watch turns into one offer per application and folder. No
+    ; dontaudit: these denials are the signal. A grant mounts the real folder
+    ; over the stub in the same place, while the application runs.
+    (type refused)
+    (roletype object_r refused)
+    (typeattributeset file_type (refused))
+    (allow refused tmpfs_t (filesystem (associate)))
+    (allow process refused (dir (getattr)))
+    ; Container domains may search every folder; on this type a search would
+    ; turn a path into the folder into "no such file" instead of a refusal.
+    (deny process refused (dir (search)))
+    ;
+    ; -- Devices a granted device request names (ADR-052, Permissions 5) ----
+    ; The sandbox's /dev holds only the graphics nodes and the nodes of a
+    ; granted request (device_requests: HID and lighting controllers, USB
+    ; serial adapters, game controllers, USB devices by vendor), so these
+    ; rules reach nothing that was not granted. Without them a granted
+    ; controller was present and refused ({ read write } on usb_device_t).
+    (allow process usb_device_t (chr_file (getattr open read write ioctl lock)))
+    (allow process usbtty_device_t (chr_file (getattr open read write ioctl lock)))
+    (allow process event_device_t (chr_file (getattr open read write ioctl lock)))
 )
 ; The store and its checkouts, per person. Without these a relabel of the home
 ; folder (restorecon) would give every tree the type of ordinary data, and no

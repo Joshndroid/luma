@@ -1,0 +1,12 @@
+[Unit]
+Description=Folder views of running applications
+Documentation=https://simplyluma.com/apps
+# A user and mount namespace that only holds mounts: each running
+# application's folders (luma_installer.permission_views). Its mounts reach the
+# applications started inside it as slaves, so a grant applies while they run.
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/unshare --user --map-current-user --mount --propagation shared /usr/bin/sleep infinity
+Restart=on-failure

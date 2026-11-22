@@ -24,6 +24,10 @@ class PackageReport:
     version: str = ""
     publisher: str = ""
     icon: str = "application-x-executable"
+    # The permission part of the install transaction (package_access.plan_for_report):
+    # suggested file level and folders, what it asks to use, its device request.
+    # The install sheet may replace it with the person's choices before Install.
+    access: dict = field(default_factory=dict)
 
 
 SUPPORTED_SUFFIXES = {

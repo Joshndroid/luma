@@ -333,6 +333,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except (OSError, RuntimeError) as error:
             return fail(str(error))
+    if values[:1] == ["device-access"]:
+        # Granted device requests (ADR-052, Permissions 5): the signed-in person may open
+        # exactly those devices; every token is validated, nothing else is written.
+        from . import device_requests
+        try:
+            device_requests.write_access_rules(values[1:])
+            return 0
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            return fail(str(error))
     if len(values) == 3 and values[0] == "flatpak-revert":
         return flatpak_revert(values[1], values[2])
     if len(values) == 3 and values[0] == 'remove-layered':

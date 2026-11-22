@@ -29,6 +29,10 @@ def install(report):
         installation = Flatpak.Installation.new_user(None)
         cancellation = Gio.Cancellable.new()
         transaction = Flatpak.Transaction.new_for_installation(installation, cancellation)
+        # A runtime the system installation already has (the Luma Platform) satisfies a
+        # per-person install, as it does for the flatpak command; without this a bundle
+        # on that runtime failed with "requires the runtime ... which was not found".
+        transaction.add_default_dependency_sources()
         def ready(tx):
             operations = tx.get_operations()
             aggregate.expect(len(operations),

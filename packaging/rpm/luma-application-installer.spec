@@ -2,7 +2,7 @@
 
 Name:           luma-application-installer
 Version:        0.1.0
-Release:        1.luma.106%{?dist}
+Release:        1.luma.107%{?dist}
 Summary:        Project Luma universal application package broker
 License:        Apache-2.0
 URL:            https://projectluma.org/applications
@@ -211,6 +211,19 @@ install -D -m 0644 data/pipewire/70-luma-application-access.conf \
 install -D -m 0644 data/pipewire/application-capture.lua \
   %{buildroot}%{_datadir}/wireplumber/scripts/luma/application-capture.lua
 install -D -m 0755 bin/luma-app-data-broker %{buildroot}%{_libexecdir}/luma-app-data-broker
+# One permission store for every format (ADR-052 step 3): the service, the
+# keeper of running applications' folder views, the refusal watch (root, AVCs
+# on the refusal stub only), the native-messaging broker, and the stub used
+# where SELinux cannot report a refusal.
+install -D -m 0755 bin/luma-app-permissions %{buildroot}%{_libexecdir}/luma-app-permissions
+install -D -m 0755 bin/luma-refusal-watch %{buildroot}%{_libexecdir}/luma-refusal-watch
+install -D -m 0755 bin/luma-native-messaging %{buildroot}%{_bindir}/luma-native-messaging
+install -D -m 0644 data/luma-app-permissions.service %{buildroot}%{_userunitdir}/luma-app-permissions.service
+install -D -m 0644 data/luma-app-views.service %{buildroot}%{_userunitdir}/luma-app-views.service
+install -D -m 0644 data/org.projectluma.AppPermissions1.service %{buildroot}%{_datadir}/dbus-1/services/org.projectluma.AppPermissions1.service
+install -D -m 0644 data/luma-refusal-watch.service %{buildroot}%{_unitdir}/luma-refusal-watch.service
+ln -s ../luma-refusal-watch.service %{buildroot}%{_unitdir}/multi-user.target.wants/luma-refusal-watch.service
+install -d -m 0000 %{buildroot}%{_datadir}/luma-installer/refused
 install -D -m 0755 bin/luma-seed-app-baseline %{buildroot}%{_bindir}/luma-seed-app-baseline
 install -D -m 0644 data/luma-app-baseline.service %{buildroot}%{_unitdir}/luma-app-baseline.service
 install -D -m 0644 data/luma-app-baseline-display-manager.conf \
@@ -342,6 +355,15 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 %{_userunitdir}/luma-app-migrate.timer
 %{_userunitdir}/graphical-session.target.wants/luma-app-migrate.timer
 %{_libexecdir}/luma-app-data-broker
+%{_libexecdir}/luma-app-permissions
+%{_libexecdir}/luma-refusal-watch
+%{_bindir}/luma-native-messaging
+%{_userunitdir}/luma-app-permissions.service
+%{_userunitdir}/luma-app-views.service
+%{_datadir}/dbus-1/services/org.projectluma.AppPermissions1.service
+%{_unitdir}/luma-refusal-watch.service
+%{_unitdir}/multi-user.target.wants/luma-refusal-watch.service
+%dir %attr(0000,root,root) %{_datadir}/luma-installer/refused
 %{_bindir}/luma-seed-app-baseline
 %{_unitdir}/luma-app-baseline.service
 %{_unitdir}/graphical.target.wants/luma-app-baseline.service
@@ -374,6 +396,26 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 %{_unitdir}/timers.target.wants/luma-depot-appstream.timer
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.107
+- One permission store for every format (ADR-052 step 3): grants keyed by
+  application ID in the desktop's permission store, the
+  org.projectluma.AppPermissions1 service for the install sheet, Settings
+  and the folder offer (app_permissions).
+- File levels from what an application is, read from the package before it
+  is installed and shown in the install transaction (package_access).
+- Store trees, capsules and AppImages see every home folder at its real
+  path; a folder they may not use is a refusal stub (EACCES), hidden folders
+  never appear, and grants apply while the application runs
+  (permission_views, luma-app-views.service).
+- Refusals are read from SELinux AVCs without blocking the application and
+  offered once per application and folder (luma-refusal-watch.service).
+- Flatpak home and host requests become a file level; protected paths are
+  excluded, nothing is redirected (flatpak_permissions).
+- A package's udev rules become a device request; granted, its device nodes
+  are present in the sandbox (device_requests).
+- A native-messaging broker between browsers and applications in different
+  sandboxes (native_messaging).
+
 * Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.106
 - SELinux: capsules and store applications may use ~/Music (audio_home_t)
   with the same rights as the other standard folders (user_home_t). A music

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -368,7 +369,33 @@ def install(report, staged: Path, *, start: Callable[..., tuple[bool, str]] | No
         record["data_home"] = existing["data_home"]
     checkout, _tree = closure_launcher.deployment(store, application_id)
     publish(application_id, record, checkout, str(exports.get("icon") or ""))
+    _record_permissions(report, application_id, checkout)
     return str(record["name"])
+
+
+# Set by backends.install for the install in progress: a command-line install
+# gets the suggestion and a review; RECORDED tells it the store did it here.
+REVIEW = False
+RECORDED = False
+
+
+def _record_permissions(report, application_id: str, checkout: Path) -> None:
+    """The install's permissions, with the tree's own launchers and udev rules."""
+    global RECORDED
+    from . import app_identity, package_access
+    try:
+        found = package_access.plan_for_tree(checkout, name=report.title)
+        chosen = dict(report.access or {})
+        if not chosen or not dict(chosen.get("files") or {}).get("chosen"):
+            # Nothing chosen on a sheet: what the tree says it is.
+            chosen = {**found, **{key: value for key, value in chosen.items() if key == "uses"}}
+        if not chosen.get("devices") or not dict(chosen["devices"]).get("requests"):
+            chosen["devices"] = found["devices"]
+        package_access.record_install(app_identity.desktop_app_id(application_id), chosen, review=REVIEW,
+                                      tree=checkout, application_id=application_id)
+        RECORDED = True
+    except Exception as error:  # noqa: BLE001 - installed; permissions take their defaults at first start
+        print(f"luma-installer: permissions not recorded for {application_id}: {error}", file=sys.stderr)
 
 
 def _unpack_appimage(staged: Path, report) -> tuple[str, Path]:

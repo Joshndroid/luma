@@ -52,3 +52,19 @@ from the SRPM pinned in `config/desktop/inputs.env` (desktop-components group
 - `0000-luma-fedora-spec.patch`: adds the patches, the `luma.N` release and a
   `%check` running the upstream OpenURI and the AudioCapture integration
   tests.
+- `0005-app-info-identify-luma-applications.patch`: a fourth kind of
+  application beside Flatpak, snap and linyaps (`src/xdp-app-info-luma.c`). A
+  peer in the `luma_application.process` SELinux domain, or in a Luma
+  launcher's `app-luma-NAME-PID.scope`, is named by
+  `org.projectluma.AppPermissions1.Identify(pid)` (luma-application-installer,
+  `luma_installer.app_identity`: the rules Mutter 0041 uses) and is
+  sandboxed: permissions are stored under `org.projectluma.Installed.ID`,
+  chosen files go through the document portal (the launchers bind
+  `doc/by-app/ID`), prompts name the application. A peer in the domain that
+  cannot be named is refused, never treated as the host. Luma-specific.
+  **Not yet in the spec:** wiring it is `Patch1005` and Release `luma.5` in
+  `0000-luma-fedora-spec.patch` together with `XDG_DESKTOP_PORTAL_LUMA_RELEASE=1.luma.5`
+  in `config/desktop/inputs.env`, which open PRs also change. Until then the
+  installer keeps the folders applications always had
+  (`sandbox_permissions.portal_names_applications`).
+

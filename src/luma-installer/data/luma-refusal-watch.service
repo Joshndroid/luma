@@ -1,0 +1,23 @@
+[Unit]
+Description=Report folders an application was refused
+Documentation=https://simplyluma.com/apps
+# Reads the kernel's SELinux AVCs on luma_application.refused only, and passes
+# each to the person's session (luma_installer.refusal_watch).
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/luma-refusal-watch
+Restart=on-failure
+CapabilityBoundingSet=CAP_AUDIT_READ CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_AUDIT_READ
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+# The audit netlink socket exists only in the host network namespace.
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+MemoryDenyWriteExecute=yes
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

@@ -16,7 +16,8 @@ def filtered(runtime):
 
 class GraphicalBoundary(unittest.TestCase):
     def test_confined_domain_and_private_home(self):
-        with tempfile.TemporaryDirectory() as d, patch('pathlib.Path.home',return_value=Path(d)), patch.dict(os.environ,{'XDG_RUNTIME_DIR':str(Path(d)/'run')},clear=True), patch('luma_installer.launcher._start_bus_proxy',return_value=filtered(Path(d)/'run')), patch('luma_installer.launcher.launch_guard.run',return_value=(0,1.0,[])) as run, patch('luma_installer.launcher._person_folders',return_value=[Path(d).resolve()/'Documents']):
+        with tempfile.TemporaryDirectory() as d, patch('pathlib.Path.home',return_value=Path(d)), patch.dict(os.environ,{'XDG_RUNTIME_DIR':str(Path(d)/'run')},clear=True), patch('luma_installer.launcher._start_bus_proxy',return_value=filtered(Path(d)/'run')), patch('luma_installer.launcher.launch_guard.run',return_value=(0,1.0,[])) as run, patch('luma_installer.launcher._person_folders',return_value=[Path(d).resolve()/'Documents']), patch('luma_installer.sandbox_permissions.model',return_value=None):
+            # No permission store here: a capsule gets the folders it always had (sandbox_permissions).
             runtime=Path(d)/'run'
             (runtime/'at-spi').mkdir(parents=True)
             (runtime/'at-spi/bus').touch()
@@ -52,6 +53,26 @@ class GraphicalBoundary(unittest.TestCase):
             self.assertIn(f'{runtime}/luma-installer-bus/fixture.a11y:/run/user/{os.getuid()}/at-spi/bus:rw',args)
             self.assertIn(f'AT_SPI_BUS_ADDRESS=unix:path=/run/user/{os.getuid()}/at-spi/bus',args)
             self.assertFalse(any(a.startswith(f'{runtime}/at-spi/bus:') for a in args))
+
+    def test_capsule_gets_its_folder_view_and_never_the_document_portal(self):
+        # The document portal's FUSE mount refuses podman's user namespace: binding it into a
+        # capsule made crun fail every start ("cannot stat /proc/self/fd/N", status 126).
+        from luma_installer import sandbox_permissions
+        with tempfile.TemporaryDirectory() as d, patch('pathlib.Path.home',return_value=Path(d)), patch.dict(os.environ,{'XDG_RUNTIME_DIR':str(Path(d)/'run')},clear=True), patch('luma_installer.launcher._start_bus_proxy',return_value=filtered(Path(d)/'run')), patch('luma_installer.launcher.launch_guard.run',return_value=(0,1.0,[])) as run:
+            runtime=Path(d)/'run'
+            (runtime/'doc/by-app/org.projectluma.Installed.fixture').mkdir(parents=True)
+            for name in ('pipewire-0','pipewire-0-application'):
+                (runtime/name).touch()
+            home=Path(d).resolve()
+            view=runtime/'luma-permissions/views/app/1/Music'
+            access=sandbox_permissions.Access('org.projectluma.Installed.fixture',binds=[(str(view),str(home/'Music'))])
+            view_handle=access.view=MagicMock()
+            with patch('luma_installer.sandbox_permissions.for_start',return_value=access):
+                self.assertEqual(_launch_deb({'sha256':'fixture','application_id':'fixture','image':'localhost/fixture','command':'fixture'}),0)
+            args=run.call_args.args[0]
+            self.assertIn(f'{view}:{home}/Music:rslave',args)
+            self.assertFalse(any('/doc' in a for a in args))
+            view_handle.close.assert_called_once()
 
     def test_sandboxed_application_gets_the_accessibility_bus_and_desktop_settings(self):
         with tempfile.TemporaryDirectory() as d:

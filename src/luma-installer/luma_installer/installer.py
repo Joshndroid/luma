@@ -209,9 +209,26 @@ class InstallerWindow(AppWindow):
         self._declared_network = declared_network
         # The one permission vocabulary Depot uses too (luma_appkit.content_permissions).
         internet = PERMISSION_GLYPHS['internet']
-        self.card.set_permissions([
+        # Placeholder rows for ADR-052 step 3 (the design is built on top): the file level
+        # Luma suggests from what the app is, and its package's device request, from
+        # report.access (package_access). The device switch decides whether it is granted.
+        access = dict(report.access or {})
+        files = dict(access.get("files") or {})
+        devices = dict(access.get("devices") or {})
+        level_words = {"chooser": "File picker only", "folders": "These folders", "all": "All your files"}
+        placeholder = []
+        if files:
+            word = level_words.get(str(files.get("level")), "File picker only")
+            named = ", ".join(str(name) for name in files.get("folders") or [])
+            placeholder.append((f"{word}: {named}" if named else word, "folder", True, False, None))
+        if devices.get("requests"):
+            def device_changed(allowed, values=devices):
+                values["granted"] = bool(allowed)
+            placeholder.append((str(devices.get("name") or "Devices"), str(devices.get("icon") or "usb"),
+                                bool(devices.get("default", True)), True, device_changed))
+        self.card.set_permissions(([
             (internet[0], internet[1], declared_network, True, self._network_changed)
-        ] if declared_network is not None else [])
+        ] if declared_network is not None else []) + placeholder)
         self.card.set_facts([
             ('Version', report.version or 'Not declared'),
             ('Package size', human_size(report.byte_size)),
