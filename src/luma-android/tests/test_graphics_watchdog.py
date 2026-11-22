@@ -38,6 +38,20 @@ class GraphicsWatchdog(unittest.TestCase):
         self.assertEqual(watchdog.container_processes(self.proc),
                          {"surfaceflinger": (10, 500), "system_server": (12, 300)})
 
+    def test_a_restart_is_seen_without_walking_every_process(self):
+        process(self.proc, 10, "surfaceflinger", 100)
+        process(self.proc, 12, "system_server", 300)
+        found = watchdog.container_processes(self.proc)
+        self.assertTrue(watchdog.still_running(found, self.proc))
+        (self.proc / "10" / "stat").unlink()  # SurfaceFlinger died and came back
+        (self.proc / "10" / "comm").unlink()
+        (self.proc / "10" / "cgroup").unlink()
+        (self.proc / "10").rmdir()
+        process(self.proc, 40, "surfaceflinger", 500)
+        self.assertFalse(watchdog.still_running(found, self.proc))
+        self.assertEqual(watchdog.stale_framework(watchdog.container_processes(self.proc)), 12)
+        self.assertFalse(watchdog.still_running({}, self.proc))
+
     def test_surfaceflinger_newer_than_framework_is_stale(self):
         self.assertEqual(watchdog.stale_framework(
             {"surfaceflinger": (10, 500), "system_server": (12, 300)}), 12)

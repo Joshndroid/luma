@@ -76,6 +76,19 @@ def restart_android(proc: Path = Path("/proc")) -> None:
                     f"luma-android-recover@{owner}.service"], check=False, timeout=10)
 
 
+def start_ticks(proc: Path, pid: int) -> int | None:
+    try:
+        return int((proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def still_running(found: dict[str, tuple[int, int]], proc: Path = Path("/proc")) -> bool:
+    """Both processes last seen are the same processes: nothing restarted."""
+    return (len(found) == 2 and
+            all(start_ticks(proc, pid) == start for pid, start in found.values()))
+
+
 def stale_framework(found: dict[str, tuple[int, int]]) -> int | None:
     """Return system_server's pid when SurfaceFlinger started after it."""
     if "surfaceflinger" not in found or "system_server" not in found:
@@ -87,8 +100,13 @@ def stale_framework(found: dict[str, tuple[int, int]]) -> int | None:
 def monitor(proc: Path = Path("/proc"), sleep=time.sleep, clock=time.monotonic) -> int:
     restarts: list[float] = []
     stale_since: float | None = None
+    found: dict[str, tuple[int, int]] = {}
     while True:
-        pid = stale_framework(container_processes(proc))
+        # Walking every process every two seconds cost ~2% of a core on an
+        # idle phone; while both processes live on, two stat reads suffice.
+        if not still_running(found, proc):
+            found = container_processes(proc)
+        pid = stale_framework(found)
         now = clock()
         if pid is None:
             stale_since = None

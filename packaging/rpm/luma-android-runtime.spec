@@ -5,7 +5,7 @@
 
 Name:           luma-android-runtime
 Version:        0.1.0
-Release:        1.luma.117%{?dist}
+Release:        1.luma.118%{?dist}
 Summary:        Project Luma integration for Android applications
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://project-luma.local/android
@@ -222,6 +222,11 @@ update-desktop-database %{_datadir}/luma/desktop-overrides/applications >/dev/nu
 %{_unitdir}/luma-android-recover@.service
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.118
+- The graphics watchdog re-reads only the two processes it already found
+  while both live on, instead of walking every process every 2 s (~2% of a
+  core on an idle phone)
+
 * Fri Nov 20 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.117
 - Let any active local user run the package-session helper's fixed session
   requests (input-policy, boot-from-charger-mode) without authentication;
