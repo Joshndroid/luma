@@ -115,6 +115,42 @@ A device is adopted ("brought upstream") when Luma takes over its build:
 
 Experimental devices get the OS and apps only.
 
+### Device kernel updates
+
+A device kernel reaches devices only through the package named in its
+device.toml `[kernel] package`: a phone's kernel-modules package, which carries
+the boot image `luma-device-boot` writes to the inactive slot, or a board
+kernel the OS image pins.
+
+- **Pull requests.** When a device's kernel inputs change (the `[kernel]`
+  table, its patches, config fragments, config or source lock), that
+  package's Version-Release in `packaging/rpm/<package>.spec` must change in
+  the same pull request. Source checks run
+  `scripts/devices/device-kernels.py check` and fail otherwise.
+- **Nightly.** The ARM nightly runs `scripts/os/nightly-device-kernels.sh`
+  after the OS publish. A package newer in the tree than in its device
+  repository is built once per release with the device's `[kernel] build`
+  script into `device-kernels/<vendor>-<codename>/<package>-<evr>/`. An
+  image-pinned kernel ships with the image as usual.
+- **Gate.** The build waits there until the phone gate passed for that exact
+  build. The gate has two parts:
+  - `fastboot boot` the image (RAM only, `luma.device_boot=0`) and run
+    `scripts/devices/device-kernels.py gate`. Its automated checks
+    (`scripts/devices/kernel-gate-checks.py`) are: the kernel notes match the
+    package's declaration; the battery's `power_now` is nonzero and within 2×
+    of voltage × current while at least 100 mA flows; UPower shows a rate.
+    Then a person checks one suspend and resume, with touch working.
+  - Install the package through an OS update, and see luma-device-boot write
+    the spare slot, restart once and confirm it, with the old slot kept as
+    the fallback.
+
+  The pass is recorded as `device-gates/<vendor>-<codename>/<package>-<evr>.pass`.
+  The next ARM nightly then writes the signed candidate repository
+  (`scripts/devices/publish-device-repo.sh`), which is uploaded to dl with
+  the nightly. A device kernel that waits never holds up the OS nightly; the
+  nightly log's `GATE  device kernel` lines and `status/device-kernels.json`
+  say what waits.
+
 ## Alpha listing gate
 
 A device is listed on the website as Alpha when all of these hold, proven on

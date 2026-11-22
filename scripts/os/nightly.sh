@@ -284,6 +284,15 @@ if [ "$publish" -eq 1 ]; then
     --set "repo_bytes=$(du -sb "$(luma_os_channel_repo nightly)" | awk '{ print $1 }')"
 fi
 
+# 4. Device kernels (aarch64): a device kernel package newer in this tree than
+#    in its device repository is built and, after its phone gate, staged for
+#    that repository (scripts/os/nightly-device-kernels.sh). It never fails the
+#    OS nightly; status/device-kernels.json and the GATE lines say what waits.
+if [ "$LUMA_OS_ARCH" = aarch64 ]; then
+  /usr/bin/bash "$os/nightly-device-kernels.sh" --source "${checkout:-$luma_os_repo_root}" >>"$run_log" 2>&1
+  grep '^GATE  device kernel' "$run_log" | tail -n 5 >&2 || true
+fi
+
 set_status --set 'state="succeeded"' --set "run_completed_utc=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
 cp "$status" "$build_dir/status.json"
 luma_os_log "nightly $build_id ($LUMA_OS_VERSION) $candidate: gate $gate, published=$publish"

@@ -71,6 +71,11 @@ jobs:
       # fragment; hold the change here instead.
       - name: Check system-app update notes
         run: python3 -B scripts/os/lib/system_apps_current.py pr --repo . --base HEAD^1 --head HEAD
+      # A device kernel reaches devices only through its [kernel] package
+      # (docs/kernel.md, "Device kernel updates"): a kernel change must move
+      # that package's release.
+      - name: Check device kernel packages
+        run: python3 -B scripts/devices/device-kernels.py check --base HEAD^1 --head HEAD
       # Images ship the offline app baseline pinned in config/os/app-baseline-lock.json;
       # an app whose source changed needs a rebuilt bundle in a resealed baseline.
       - name: Check first-party apps against their baseline bundles

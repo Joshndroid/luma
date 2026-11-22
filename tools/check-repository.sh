@@ -21,5 +21,5 @@ python3 -B -m unittest tests.unit.test_luma_notes_store tests.unit.test_luma_app
   tests.unit.test_media_aggregate tests.unit.test_system_apps_notes tests.unit.test_app_baseline_login_order \
   tests.unit.test_selinux_journal_senders
 python3 -B tools/check-devices.py
-python3 -B -m unittest tests.unit.test_device_tree tests.unit.test_device_kit
+python3 -B -m unittest tests.unit.test_device_tree tests.unit.test_device_kit tests.unit.test_device_kernels
 python3 -B -m unittest discover -s tests/os -p test_media_vm_iso.py

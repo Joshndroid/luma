@@ -30,6 +30,10 @@ patches = [
 dtb = "qcom/milos-fairphone-fp6.dtb"
 # The boot DTB is the built dtb with these overlays (scripts/kernel/compose-fp6-dtb.sh).
 dtb_overlays = "luma/fp6/alpha1/dtb"
+# The package that brings this kernel to phones (its boot image and modules;
+# [boot_update]) and how the ARM nightly builds it when its release changes.
+package = "kernel-modules-luma-fp6"
+build = "scripts/devices/build-fp6-kernel-package.sh"
 
 [kernel.android_gpu]
 # Android GPU admission (scripts/kernel/fp6-android-gpu-admission.py). The

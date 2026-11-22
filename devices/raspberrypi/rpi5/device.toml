@@ -19,6 +19,8 @@ rpm_version_release = "7.2.15-1.luma.rpi.fc44"
 config = "config/kernel/rpi.config"
 # C1 boards. D0 boards (2 GB, 16 GB, later 4/8 GB) load broadcom/bcm2712d0-rpi-5-b.dtb.
 dtb = "broadcom/bcm2712-rpi-5-b.dtb"
+# Pinned in the OS image (config/desktop/packages.txt), which ships it.
+package = "kernel-luma-rpi"
 
 [boot]
 config = "boot.toml"

@@ -17,6 +17,7 @@ release = "7.3.0-1.luma.surface12.fc44.aarch64"
 rpm_version_release = "7.3.0-2.luma.surface12.fc44"
 config = "config/kernel/surface-pro12.config"
 dtb = "qcom/x1p42100-microsoft-sp12in.dtb"
+package = "kernel-surface-pro12"
 
 [boot]
 config = "boot.toml"
