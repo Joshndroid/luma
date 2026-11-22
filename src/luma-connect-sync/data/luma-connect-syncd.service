@@ -1,0 +1,17 @@
+[Unit]
+Description=Luma Connect Sync
+Documentation=file:///usr/share/doc/luma-connect-sync/README.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.projectluma.ConnectSync1
+ExecStart=/usr/bin/luma-connect-syncd
+Nice=10
+IOSchedulingClass=idle
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=graphical-session.target

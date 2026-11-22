@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.projectluma.ConnectSync1
+Exec=/usr/bin/luma-connect-syncd
+SystemdService=luma-connect-syncd.service

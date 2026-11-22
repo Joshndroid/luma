@@ -1,0 +1,79 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- Luma Connect Sync (ADR-054), served by luma-connect-syncd on the session bus at
+     /org/projectluma/ConnectSync1. Values typed "s" named *json are JSON documents
+     (see README.md). The recovery key is only ever in a method reply. -->
+<node>
+  <!-- Callers in a sandbox (Flatpak, ADR-052 store apps and capsules, snaps) are refused on every method.
+       ApproveJoin, RemoveDevice, DeleteAppData and SetEnabled(false) need polkit org.projectluma.connect-sync.manage
+       (auth_self_keep); RevealRecoveryKey needs org.projectluma.connect-sync.reveal-recovery-key (auth_self). -->
+  <interface name="org.projectluma.ConnectSync1">
+    <!-- State: {state: off|joining|syncing|paused|up_to_date|attention, detail,
+         attention: null | {reason: conflict|quota|revoked, detail, ...}, last_sync,
+         enabled, categories: {apps, app_data, settings, appearance, wallpaper, keyboard,
+         wifi, passwords, browser}, phase_one: [...], storage: {used, quota}, devices,
+         this_device} -->
+    <method name="GetState"><arg name="json" type="s" direction="out"/></method>
+    <method name="SetEnabled"><arg name="on" type="b" direction="in"/></method>
+    <method name="SetCategory"><arg name="category" type="s" direction="in"/><arg name="on" type="b" direction="in"/></method>
+    <method name="SyncNow"/>
+    <signal name="StateChanged"/>
+
+    <!-- Turning Sync on: the 24 words and the three positions to check (1-based). -->
+    <method name="BeginSetup">
+      <arg name="words" type="as" direction="out"/>
+      <arg name="check" type="ai" direction="out"/>
+    </method>
+    <method name="FinishSetup"><arg name="answers" type="a{is}" direction="in"/></method>
+    <method name="CancelSetup"/>
+    <!-- polkit org.projectluma.connect-sync.reveal-recovery-key -->
+    <method name="RevealRecoveryKey"><arg name="words" type="as" direction="out"/></method>
+
+    <!-- This device joining: {state: none|waiting|code|approved|denied|expired, code,
+         join, approvers: [{device, name, class}]} -->
+    <method name="RequestJoin"><arg name="json" type="s" direction="out"/></method>
+    <method name="GetJoin"><arg name="json" type="s" direction="out"/></method>
+    <method name="CancelJoin"/>
+    <method name="JoinWithRecoveryKey"><arg name="words" type="s" direction="in"/></method>
+    <signal name="JoinChanged"><arg name="json" type="s"/></signal>
+
+    <!-- Other devices asking to join: [{id, device, name, class, code, created_at, tampered}] -->
+    <method name="ListJoinRequests"><arg name="json" type="s" direction="out"/></method>
+    <method name="ApproveJoin"><arg name="join" type="s" direction="in"/><arg name="code" type="s" direction="in"/></method>
+    <method name="DenyJoin"><arg name="join" type="s" direction="in"/></method>
+    <signal name="JoinRequested">
+      <arg name="join" type="s"/><arg name="device" type="s"/><arg name="name" type="s"/>
+      <arg name="class" type="s"/><arg name="code" type="s"/>
+    </signal>
+    <!-- outcome: approved | denied | answered (on another device) | expired -->
+    <signal name="JoinCleared"><arg name="join" type="s"/><arg name="outcome" type="s"/></signal>
+
+    <!-- App data: [{app, name, kind, size, enabled, denied, uses_api, state, last_synced, syncs_when_closed}] -->
+    <method name="ListApps"><arg name="json" type="s" direction="out"/></method>
+    <method name="SetAppEnabled"><arg name="app" type="s" direction="in"/><arg name="on" type="b" direction="in"/></method>
+    <method name="DeleteAppData"><arg name="app" type="s" direction="in"/></method>
+    <method name="ApplyPending"><arg name="app" type="s" direction="in"/><arg name="applied" type="b" direction="out"/></method>
+    <method name="Quiesce"><arg name="app" type="s" direction="in"/></method>
+    <!-- {recent: [{app, name, from, at, files}], versions: {app: [{path, label, device, at}]}}: the losing copy of a
+         file changed on two devices is kept as a labelled sibling in the app's zone, never overwritten. -->
+    <method name="ListConflicts"><arg name="json" type="s" direction="out"/></method>
+    <signal name="AppsChanged"/>
+
+    <!-- Devices: [{device, name, class: computer|handheld|tv, state, this_device, last_sync}] -->
+    <method name="ListDevices"><arg name="json" type="s" direction="out"/></method>
+    <!-- polkit org.projectluma.connect-sync.manage. new_recovery_key replaces the recovery key too (offered when the
+         removed device held the words); the new words come back, else an empty list. -->
+    <method name="RemoveDevice">
+      <arg name="device" type="s" direction="in"/><arg name="new_recovery_key" type="b" direction="in"/>
+      <arg name="words" type="as" direction="out"/>
+    </method>
+    <!-- A device joined with the recovery key (no approval): every member raises the card, with Remove. -->
+    <signal name="RecoveryJoined"><arg name="device" type="s"/><arg name="name" type="s"/><arg name="class" type="s"/></signal>
+
+    <!-- Restore, for Valet and the launcher: [{app, name, kind,
+         state: installing|restoring|waiting|ready|unavailable|failed|offered, progress, reason}] -->
+    <method name="GetRestore"><arg name="json" type="s" direction="out"/></method>
+    <method name="GetAppState"><arg name="app" type="s" direction="in"/><arg name="json" type="s" direction="out"/></method>
+    <signal name="RestoreChanged"><arg name="app" type="s"/></signal>
+  </interface>
+</node>

@@ -1,0 +1,17 @@
+# Luma's own apps whose data already syncs through a Luma Connect service
+# (Notes, Calendar and Contacts, Photos, collections, Messages), or that sync
+# through the Connect Sync API later (Viola, ADR-054 §3). Their folders are not
+# copied, so nothing syncs twice.
+org.projectluma.Notes
+org.projectluma.Tasks
+org.projectluma.Calendar
+org.projectluma.Contacts
+org.projectluma.Photos
+org.projectluma.Clock
+org.projectluma.Weather
+org.projectluma.Leaf
+org.projectluma.Tide
+org.projectluma.Messages
+org.projectluma.Phone
+org.projectluma.Connect
+com.rhyme.viola

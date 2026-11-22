@@ -1,0 +1,17 @@
+# Apps that sync themselves keep doing so; their folders are not copied (ADR-054 §4.2).
+# Mail clients
+org.mozilla.Thunderbird
+org.gnome.Evolution
+org.gnome.Geary
+# Browsers (Viola syncs through the Connect Sync API from Phase 3)
+org.mozilla.firefox
+com.google.Chrome
+org.chromium.Chromium
+com.brave.Browser
+com.microsoft.Edge
+com.vivaldi.Vivaldi
+io.gitlab.librewolf-community
+# Games and cloud drives
+com.valvesoftware.Steam
+com.dropbox.Client
+com.nextcloud.desktopclient.nextcloud
