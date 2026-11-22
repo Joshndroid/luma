@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sun, 22 Nov 2026 10:00:00 -0600
+Subject: [PATCH] Notification lip: measure the card at the width it gets
+
+The lip measured its card at the lip's width, but the card sits inside the
+surface's border (a 1 px rim at each side on the phone), so it is 2 px
+narrower than it was measured. A body that fits on one line at the
+measured width wraps in the card; the lip keeps the one-line height and
+its clipped surface cuts off the actions ("Allow Diskord to draw the
+desktop background?" on a 400 px phone). The card is now measured at the
+surface's content box.
+---
+ js/ui/lumaNotificationBeacon.js | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/js/ui/lumaNotificationBeacon.js b/js/ui/lumaNotificationBeacon.js
+index ae79211..4356b14 100644
+--- a/js/ui/lumaNotificationBeacon.js
++++ b/js/ui/lumaNotificationBeacon.js
+@@ -497,7 +497,13 @@ export const NotificationLip = GObject.registerClass(class NotificationLip exten
+                 const style = `padding: ${safe.top / scale}px ${safe.right / scale}px 14px ${safe.left / scale}px;`;
+                 if (this._surface.child.get_style() !== style) this._surface.child.set_style(style);
+             }
+-            [, height] = this._surface.child.get_preferred_height(width);
++            // The card gets the surface's content box, not the lip's width:
++            // the phone's surface has a 1 px rim at each side, and a body
++            // measured 2 px too wide stays on one line, then wraps in the
++            // card and pushes its actions out of the clipped surface.
++            const inner = this._surface.get_theme_node().get_content_box(
++                new Clutter.ActorBox({x1: 0, y1: 0, x2: width, y2: monitor.height}));
++            [, height] = this._surface.child.get_preferred_height(inner.get_width());
+             height = Math.min(height, monitor.height - (top - monitor.y) - 24 * scale);
+         }
+         const wasFullPage = this._fullPage;

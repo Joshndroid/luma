@@ -885,3 +885,10 @@ and buttons took dark ink on the dark surface.
 surface's fill itself name the treatment of that fill (null follows the
 mode again); the lip names `dark` while the presentation is `mobile`.
 Desktop and TV are unchanged. Shell .198.
+
+`0386-notification-lip-card-measured-at-its-width.patch`: the lip
+measured its card at the lip's width, but the card sits inside the
+surface's border (a 1 px rim at each side on the phone), 2 px narrower. A
+body that fit one line at the measured width wrapped in the card, the lip
+kept the one-line height, and its clipped surface cut off the actions. The
+card is measured at the surface's content box. Shell .199.
