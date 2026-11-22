@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,6 +37,8 @@ gi.require_version("Secret", "1")
 from gi.repository import Secret
 items = Secret.password_search_sync(None, {}, Secret.SearchFlags.ALL | Secret.SearchFlags.UNLOCK | Secret.SearchFlags.LOAD_SECRETS, None)
 out = []
+if len(items) > %d:
+    print("dropped", len(items) - %d, file=sys.stderr)
 for item in items[:%d]:
     value = item.retrieve_secret_sync(None)   # a SecretRetrievable in the file backend
     if value is None:
@@ -43,7 +46,7 @@ for item in items[:%d]:
     out.append({"label": item.get_label(), "attributes": dict(item.get_attributes()), "content_type": value.get_content_type() or "text/plain",
                 "secret": base64.b64encode(bytes(value.get())).decode()})
 print(json.dumps(sorted(out, key=lambda e: sorted(e["attributes"].items()))))
-""" % MAX_ITEMS
+""" % (MAX_ITEMS, MAX_ITEMS, MAX_ITEMS)
 
 IMPORT = r"""
 import base64, json, sys, gi
@@ -77,14 +80,23 @@ def uses_portal(app: str) -> bool:
     return "org.freedesktop.secrets" not in permissions
 
 
+MAX_OUTPUT = 1024 * 1024        # the helper's answer; more is refused (review L6)
+
+
 def _helper(app: str, code: str, stdin: str = "") -> str:
     HELPER_RUNS[app] = time.monotonic()
-    result = subprocess.run(["flatpak", "run", "--command=python3", "--die-with-parent", app, "-c", code], input=stdin, text=True,
-                            capture_output=True, timeout=120, env={**os.environ, "LC_ALL": "C.UTF-8"})
-    HELPER_RUNS[app] = time.monotonic()
-    if result.returncode:
-        raise RuntimeError(f"the sign-in helper for {app} failed")
-    return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+    with tempfile.TemporaryFile() as out:
+        result = subprocess.run(["flatpak", "run", "--command=python3", "--die-with-parent", app, "-c", code], input=stdin.encode(),
+                                stdout=out, stderr=subprocess.DEVNULL, timeout=120, env={**os.environ, "LC_ALL": "C.UTF-8"})
+        HELPER_RUNS[app] = time.monotonic()
+        if result.returncode:
+            raise RuntimeError(f"the sign-in helper for {app} failed")
+        out.seek(0)
+        text = out.read(MAX_OUTPUT + 1)
+    if len(text) > MAX_OUTPUT:
+        raise RuntimeError(f"the sign-in helper for {app} said too much")
+    lines = text.decode("utf-8", "replace").strip().splitlines()
+    return lines[-1] if lines else ""
 
 
 def read(app: str) -> list[dict[str, object]]:
@@ -111,33 +123,33 @@ def _stamp(app: str) -> list[int]:
         return []
 
 
-def changed(engine, local, app: str) -> bool:
+def changed(engine, local, target) -> bool:
     """Cheap: the app's keyring file moved since we last read it."""
-    seen = local.get(f"portal:{app}", {})
-    return bool(_stamp(app)) and seen.get("stamp") != _stamp(app)
+    seen = local.get(f"portal:{target.zone}", {})
+    return bool(_stamp(target.app)) and seen.get("stamp") != _stamp(target.app)
 
 
-def publish(engine, local, app: str) -> None:
-    if not changed(engine, local, app) or not uses_portal(app):
+def publish(engine, local, target) -> None:
+    if not changed(engine, local, target) or not uses_portal(target.app):
         return
-    entries = read(app)
-    state = local.get(f"portal:{app}", {})
-    _version, record = engine.get(ZONE, f"portal:{app}")
+    entries = read(target.app)
+    state = local.get(f"portal:{target.zone}", {})
+    _version, record = engine.get(ZONE, target.keychain_name)
     merged = {fingerprint([e]): e for e in ((record or {}).get("items") or []) + entries}
     items = sorted(merged.values(), key=lambda e: sorted(dict(e["attributes"]).items()))[:MAX_ITEMS]
     if items and (record or {}).get("items") != items:
-        engine.save(ZONE, f"portal:{app}", {"items": items})
-    local.put(f"portal:{app}", {**state, "stamp": _stamp(app), "applied": fingerprint(items)})
+        engine.save(ZONE, target.keychain_name, {"items": items, "owner": target.owner})
+    local.put(f"portal:{target.zone}", {**state, "stamp": _stamp(target.app), "applied": fingerprint(items)})
 
 
-def restore(engine, local, app: str) -> None:
+def restore(engine, local, target) -> None:
     """Store the synced sign-ins in this device's copy of the app's keyring, as the app."""
     if engine.zone(ZONE, create=False) is not None:
         engine.fetch(ZONE)
-    _version, record = engine.get(ZONE, f"portal:{app}")
+    _version, record = engine.get(ZONE, target.keychain_name)
     items = (record or {}).get("items") or []
-    state = local.get(f"portal:{app}", {})
-    if not items or state.get("applied") == fingerprint(items):
+    state = local.get(f"portal:{target.zone}", {})
+    if not items or (record or {}).get("owner") != target.owner or state.get("applied") == fingerprint(items):
         return
-    write(app, items)
-    local.put(f"portal:{app}", {**state, "stamp": _stamp(app), "applied": fingerprint(items)})
+    write(target.app, items)
+    local.put(f"portal:{target.zone}", {**state, "stamp": _stamp(target.app), "applied": fingerprint(items)})

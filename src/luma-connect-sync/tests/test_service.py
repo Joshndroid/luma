@@ -32,8 +32,10 @@ from harness import enrol_fake  # noqa: E402
 CHILD = r"""
 import os, sys
 sys.path.insert(0, os.environ["LCS_SOURCE"])
-from luma_connect_sync.service import Service
-Service().run()
+from luma_connect_sync import service
+# The test talks from outside any session scope; the caller rules have their own tests (test_review.M4Callers).
+service.trusted_caller = lambda pid, proc=None: True
+service.Service().run()
 """
 
 
@@ -80,7 +82,7 @@ class ServiceTests(unittest.TestCase):
         child = subprocess.Popen([sys.executable, "-c", CHILD], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         self.children.append(child)
         connection = Gio.DBusConnection.new_for_address_sync(address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
-        for _ in range(100):
+        for _ in range(300):        # a loaded build machine can take a while to start Python and GLib
             try:
                 connection.call_sync("org.projectluma.ConnectSync1", "/org/projectluma/ConnectSync1", "org.freedesktop.DBus.Peer", "Ping", None, None, Gio.DBusCallFlags.NONE, 1000, None)
                 break

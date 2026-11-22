@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Frozen wire vectors (docs/operations/connect-sync-wire.md). A change here changes ids or keys on every device."""
+"""Frozen wire vectors, format 2 (docs/operations/connect-sync-wire.md). A change here changes ids or keys on every device."""
 from __future__ import annotations
 
 import sys
@@ -8,30 +8,34 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from luma_connect_sync import chunking, crypto  # noqa: E402
+from luma_connect_sync import crypto  # noqa: E402
 
 NAMES, ASK = bytes(range(32)), bytes(range(32, 64))
 
 
 class Vectors(unittest.TestCase):
     def test_vectors(self) -> None:
-        bundle = crypto.Bundle("acct-vector", 1, ASK, NAMES, bytes(32), {})
+        recovery = crypto.recovery_keys(bytes(32), "acct-vector")
+        self.assertEqual(recovery.box_pub.hex(), "5941fdbd613a3bdaffd58be905fecc4124ac28356e083c1027a536c783ed6f30")
+        self.assertEqual(recovery.auth_pub.hex(), "2424931bbae302926914b3098364f9d481698d1faa567fd71d25ec42085c3f79")
+        bundle = crypto.Bundle("acct-vector", 1, ASK, NAMES, recovery.box_pub, recovery.auth_pub, {})
         zone = bundle.zone_id("apps")
-        self.assertEqual(zone, "cc43b200902f0f924cabb928819cfb19")
-        self.assertEqual(crypto.record_name(NAMES, zone, "flatpak:org.gnome.TextEditor"), "5fca695e1bbc775ac3185f788dc1e78d4af7de9c70c3920ecc95a55e0b190261")
-        self.assertEqual(crypto.blob_id(NAMES, zone, b"hello"), "c6bc5f02192d440ac8517fd949638491b28536c2dbb7fa4a127a8f5f0f1778ab")
-        self.assertEqual(bundle.join_nonce("J" * 22, "dev", bytes(32)).hex(), "e258a48790c6ab41a167ae3a52b572e1c7c237ac089df53cae78606e2eec3e0f")
-        self.assertEqual(crypto.join_code("acct-vector", "dev", bytes(32), bytes(32), bytes(32), bytes(range(32))), "752196")
+        self.assertEqual(crypto.FORMAT, 2)
+        self.assertEqual(zone, "16c9216f5dc11edbbbe96ee469ee161d")
+        self.assertEqual(crypto.record_name(NAMES, zone, "flatpak:org.gnome.TextEditor"), "1c20cd601e781ad96ea4583f1f2ea51bfbf76c27bda197b41845826d1076e90b")
+        self.assertEqual(crypto.blob_id(bytes(range(64, 96)), zone, b"hello"), "91cafe89d793d11c50a01904f7885e393cc53f5f2d1f439aef1d205f6333bb79")
+        self.assertEqual(bundle.join_nonce("J" * 22, "dev", bytes(32)).hex(), "eabcaed811426dbbb6a346dcde81cfec8db4cdde9469d18ba74e8d44d59641d9")
+        self.assertEqual(crypto.join_code("acct-vector", "J" * 22, "dev", bytes(32), bytes(32), bytes(32), bytes(32), bytes(range(32))), "580704")
         self.assertEqual(crypto.join_commitment(bytes(32)).hex(), "9e5eaa0543b718c1f3978e29758fbffa0f283bb3b1a25f73b8b9d78ecfa33a03")
-        self.assertEqual(bundle.cert("dev", bytes(32), bytes(32)).hex(), "5eb3e4493fa639c2c0ae8321e402bc7e2923fa569b359506d6929bd7187ed76a")
-        self.assertEqual(crypto.hkdf(NAMES, "luma-sync-chunk-v1\0" + zone).hex(), "9ed12aa09cd155d60c6d1efdeb816a0b9651aac2d91a64f1a89cdbe57a4b3015")
-        self.assertEqual(chunking.gear(bytes(32))[0], 0x10e6878212a63cf1)
+        self.assertEqual(bundle.cert("dev", bytes(32), bytes(32)).hex(), "71b6018447f7a7853f4edd1746bdf04cd5628fc196a8f7e948c017dcb8158cb1")
+        self.assertEqual(bundle._wrap_key().hex(), "8c5b74c6d9ec7cb3c1a0a1de41746143cec4e20f8d8141b9280d8118f7746885")
+        self.assertEqual(crypto.lp("ab", 3, b"\x00").hex(), "00000002616200000001330000000100")
+        self.assertEqual([crypto.padme(n) for n in (0, 1, 100, 1000, 4096, 1 << 20, (1 << 20) + 1, 5 * (1 << 20) + 7)],
+                         [0, 1, 104, 1024, 4096, 1048576, 1081344, 5373952])
 
     def test_recovery_words_are_bip39(self) -> None:
         self.assertEqual(crypto.recovery_words(bytes(32)), ["abandon"] * 23 + ["art"])
         self.assertEqual(crypto.recovery_words(b"\xff" * 32), ["zoo"] * 23 + ["vote"])
-        key = crypto.recovery_keypair(bytes(32), "acct-vector").public_key().public_bytes(**crypto.RAW)
-        self.assertEqual(key.hex(), "5941fdbd613a3bdaffd58be905fecc4124ac28356e083c1027a536c783ed6f30")
 
 
 if __name__ == "__main__":

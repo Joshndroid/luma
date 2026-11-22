@@ -4,8 +4,8 @@
 
   proof.py --work DIR --hub-tree TREE STEP [STEP ...]
 
-Steps, in order: hub vms enrol setup join apps state running conflict
-revoke recover grep. Each prints JSON lines {"step", "check", "result",
+Steps, in order: hub vms enrol setup keys join apps state running conflict
+revoke rejoin recover signin grep. Each prints JSON lines {"step", "check", "result",
 "detail"} and appends them to DIR/results.jsonl. State between steps is in
 DIR/proof.json. The recovery words, tokens and canaries never reach the
 output: they move between VMs over stdin and are compared inside a VM.
@@ -206,6 +206,30 @@ class Proof:
         self.emit("a: Sync turned on; 24-word recovery key written to a private file in the VM (not shown)",
                   count == "24" and status["account"]["standing"] == "member" and status["account"]["epoch"] == 1, out.strip())
 
+    def s_keys(self) -> None:
+        """The device keys are systemd-creds sealed files, not keyring items, and an app's sandbox can't reach them."""
+        folder = f"{HOME}/.local/share/luma/sync/keys"
+        listing = self.ssh("a", f"stat -c '%a %n' {folder} {folder}/*.cred", check=False).split("\n")
+        modes = dict(line.split(" ", 1)[::-1] for line in listing if line.strip())
+        sealed = [path for path, mode in modes.items() if path.endswith(".cred") and mode == "600"]
+        self.emit("a: device keys, account key and recovery words are sealed files (0600 in a 0700 folder)",
+                  modes.get(folder) == "700" and len(sealed) >= 3, json.dumps(modes))
+        probe = ("import gi; gi.require_version('Secret','1'); from gi.repository import Secret; "
+                 "s = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS, None); "
+                 "print(sum(1 for c in s.get_collections() for i in c.get_items() if 'Luma Connect Sync' in (i.get_label() or '')))")
+        left = self.user("a", f"python3 -c {shlex.quote(probe)}", check=False).strip()
+        self.emit("a: nothing of Sync's is in the login keyring", left == "0", left)
+        opened = self.user("a", f"systemd-creds --user decrypt --name=luma-sync-device-keys {folder}/$(ls {folder} | grep device-keys) - | wc -c",
+                           check=False).strip()
+        self.emit("a: the person's own session can open them", opened == "64", opened)
+        app = "org.gnome.Calculator"
+        if app not in self.flatpaks("a"):
+            self.user("a", "flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo")
+            self.user("a", f"flatpak install --user --noninteractive -y flathub {app}", timeout=1800, check=False)
+        inside = self.sandbox("a", app, f"test -e /run/systemd/io.systemd.Credentials && echo socket; ls {folder} 2>/dev/null | head -1; "
+                                         "ls /run/user/$(id -u)/systemd 2>/dev/null | grep -i cred", check=False).strip()
+        self.emit(f"a: inside {app}'s sandbox neither the credentials service nor the sealed files are visible", inside == "", inside)
+
     def s_join(self) -> None:
         self.user("b", f"rm -f /tmp/lcs-code; setsid nohup luma-connect-sync join --wait 600 --code-file /tmp/lcs-code > /tmp/lcs-join.log 2>&1 &")
         ok, seconds = self.wait("code", lambda: self.user("b", "cat /tmp/lcs-code 2>/dev/null").strip() != "", 180, 2)
@@ -297,7 +321,7 @@ done
         ok, seconds = self.wait("state", arrived, 600, 5)
         self.emit("b: the setting and the document arrive after closing on a (quiet point 20 s + sync)", ok, f"{time.monotonic() - closed:.0f} s after closing")
         signed = self.user("b", f"flatpak run --command=sh {app} -c {shlex.quote(self.secret_script('lookup'))}", input=self.state["password_canary"], check=False).strip()
-        self.emit("b: the sign-in opens on b (portal secret carried in the keychain zone)", signed == "True", signed)
+        self.emit("b: the sign-in opens on b (portal secret carried in the app's owner-scoped portal record)", signed == "True", signed)
 
     def s_running(self) -> None:
         self.user("b", f"setsid nohup flatpak run --command=sleep {DOC_APP} 75 > /dev/null 2>&1 &")
@@ -338,7 +362,8 @@ done
                   json.dumps(self.status("b").get("attention")))
 
     def s_rejoin(self) -> None:
-        """The removed laptop signs in again (same installation, same device id) and still has the words: not enough."""
+        """The removed laptop signs in again (same installation, same device id) and still has the words: not enough.
+        Its old keys never come back; approved by code, it joins with new ones."""
         self.enrol("b", self.state["devices"]["b"])
         refused = self.vm("ssh", "b", "/root/as-user.sh luma-connect-sync recover", input=self.ssh("a", f"cat {HOME}/.recovery-words"), check=False)
         self.emit("b: the recovery key is refused for a removed device; another device must approve it",
@@ -386,7 +411,7 @@ done
             return self.user(other, f"flatpak run --command=sh {app} -c {shlex.quote(self.secret_script('lookup'))}",
                              input=self.state["password_canary"], check=False).strip() == "True"
         ok, seconds = self.wait("sign-in", opens, 900, 60)  # probing runs the app; leave room for its quiet point
-        self.emit(f"{other}: the sign-in opens in {app} (its items carried in the keychain zone, stored under {other}'s own portal secret)", ok, f"{seconds:.0f} s")
+        self.emit(f"{other}: the sign-in opens in {app} (its items carried in the portal record, stored under {other}'s own portal secret)", ok, f"{seconds:.0f} s")
 
     def s_grep(self) -> None:
         hub = self.state["hub_state"]

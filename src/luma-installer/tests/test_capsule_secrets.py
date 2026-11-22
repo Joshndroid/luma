@@ -243,6 +243,23 @@ class Rules(unittest.TestCase):
         got = self.policy.handle(self.mine, secrets.ITEM_INTERFACE, "GetSecret", session).unpack()[0]
         self.assertEqual(bytes(got[2]), b"mine")
 
+    def test_lumas_own_secrets_are_never_reachable(self):
+        sync = self.service.add({secrets.SCHEMA_ATTRIBUTE: "org.projectluma.ConnectSync", "kind": "bundle", "device": "d"}, b"ask")
+        tagged = self.service.add({secrets.SCHEMA_ATTRIBUTE: "org.projectluma.ConnectSync", "kind": "recovery",
+                                   secrets.ATTRIBUTE: "app-one"}, b"words")
+        adopting = secrets.Policy("app-one", self.service, adopt=True)
+        for policy in (self.policy, adopting):
+            found = policy.handle(secrets.ROOT, secrets.SERVICE_INTERFACE, "SearchItems", GLib.Variant(
+                "(a{ss})", ({secrets.SCHEMA_ATTRIBUTE: "org.projectluma.ConnectSync", "kind": "bundle", "device": "d"},))).unpack()
+            self.assertEqual([*found[0], *found[1]], [])
+            self.assertFalse(policy.is_own(tagged), "even one carrying the app's own mark")
+        self.assertNotIn(secrets.ATTRIBUTE, self.service.items[sync], "never adopted")
+        body = GLib.Variant("(a{sv}(oayays)b)", (
+            {secrets.ITEM_ATTRIBUTES: GLib.Variant("a{ss}", {secrets.SCHEMA_ATTRIBUTE: "org.projectluma.Messages"}),
+             "org.freedesktop.Secret.Item.Label": GLib.Variant("s", "x")},
+            (secrets.ROOT + "/session/s1", b"", b"x", "text/plain"), True))
+        self.assertEqual(self.refused(secrets.DEFAULT_ALIAS, secrets.COLLECTION_INTERFACE, "CreateItem", body), secrets.ACCESS_DENIED)
+
     def test_bulk_reads_drop_what_is_not_the_applications(self):
         reply = self.policy.handle(secrets.ROOT, secrets.SERVICE_INTERFACE, "GetSecrets", GLib.Variant(
             "(aoo)", ([self.mine, self.theirs, self.session], secrets.ROOT + "/session/s1"))).unpack()[0]

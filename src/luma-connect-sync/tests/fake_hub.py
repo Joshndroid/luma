@@ -6,6 +6,10 @@ feed, epochs, envelopes, join steps, zone-key completeness, membership) and
 stores only what it is sent, so tests can search everything it holds for a
 canary. Rate limits are left out. Devices are enrolled with ``POST
 /__test/devices`` {"account", "name"} -> {"device_id", "token"}.
+
+Like the real Hub it checks every signature it can (review C2). Setting
+``hub.verify = False`` turns it into a Hub that accepts anything, so tests can
+show that devices refuse what a dishonest Hub lets through.
 """
 from __future__ import annotations
 
@@ -30,6 +34,25 @@ def unb64(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+MAX_BLOB = 4 * 1024 * 1024
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def signed(public: str | bytes | None, signature: str, message: bytes) -> bool:
+    try:
+        Ed25519PublicKey.from_public_bytes(unb64(public) if isinstance(public, str) else public).verify(unb64(signature), message)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def envelope_message(account: str, target: str, epoch: int, ciphertext: str) -> bytes:
+    return f"luma-sync-envelope-sig-v1\0{account}\0{target}\0{epoch}\0".encode() + hashlib.sha256(unb64(ciphertext)).digest()
+
+
 class Refused(Exception):
     def __init__(self, status: int, code: str, message: str = "") -> None:
         super().__init__(message or code)
@@ -44,10 +67,14 @@ class FakeHub:
         self.accounts: dict[str, dict] = {}
         self.quota = quota
         self.requests = 0
+        self.verify = True
+        self.rewrite_join = None        # (asking device, join row) -> the row it is shown
+        self.put_order: list[str] = []  # blob ids in the order they were uploaded
 
     # -- storage helpers
     def acct(self, account: str) -> dict:
-        return self.accounts.setdefault(account, {"seq": 0, "epoch": 0, "rekey": False, "recovery": None, "devices": {},
+        return self.accounts.setdefault(account, {"seq": 0, "epoch": 0, "rekey": False, "recovery": None, "recovery_auth_pub": None,
+                                                  "membership": [], "devices": {},
                                                   "envelopes": {}, "joins": {}, "zones": {}, "bytes": 0})
 
     def bump(self, a: dict) -> int:
@@ -101,6 +128,17 @@ class FakeHub:
             rest = path[len("/api/sync/v1/"):]
             data = json.loads(body) if body and not re.fullmatch(r"zones/[0-9a-f]{32}/blobs/[0-9a-f]{64}", rest) else {}
             names = {t["device"]: t["name"] for t in self.tokens.values()}
+            if rest == "account" and method == "DELETE":
+                self.member(a, device)
+                at = int(data.get("at", 0))
+                if self.verify and (abs(time.time() - at) > 600 or not a["recovery_auth_pub"] or not signed(
+                        a["recovery_auth_pub"], data.get("proof", ""), f"luma-sync-delete-account-v1\0{who['account']}\0{at}".encode())):
+                    raise Refused(403, "recovery_proof")
+                del self.accounts[who["account"]]
+                return 200, {"deleted": True}
+            if rest == "membership" and method == "GET":
+                self.member(a, device)
+                return 200, {"statements": a["membership"]}
             if rest == "account" and method == "GET":
                 return 200, {"account": who["account"], "device": device, "seq": a["seq"], "epoch": a["epoch"], "rekey": a["rekey"],
                              "recovery": a["recovery"] is not None,
@@ -137,8 +175,16 @@ class FakeHub:
                 me = a["devices"].get(device)
                 if not me or me["state"] == "revoked" or (a["epoch"] and me["state"] != "member"):
                     raise Refused(403, "not_member")
-                if a["epoch"] == 0 and not data.get("recovery"):
+                if a["epoch"] == 0 and not (data.get("recovery") and data.get("recovery_auth_pub")):
                     raise Refused(400, "fields")
+                if self.verify:
+                    if a["epoch"] and not a["rekey"]:
+                        raise Refused(403, "proof_required")
+                    if a["epoch"] and me.get("cert_epoch") != a["epoch"]:
+                        raise Refused(403, "not_member")
+                    if not all(signed(me["sign_pub"], e["signature"], envelope_message(who["account"], e["device"], data["epoch"], e["ciphertext"]))
+                               for e in data["envelopes"]):
+                        raise Refused(400, "bad_signature")
                 live = {d for d, row in a["devices"].items() if row["state"] != "revoked"}
                 if any(e["device"] not in live for e in data["envelopes"]):
                     raise Refused(400, "fields")
@@ -162,6 +208,8 @@ class FakeHub:
                         row.update(state="pending", cert=None, cert_epoch=None)
                 if data.get("recovery"):
                     a["recovery"] = data["recovery"]
+                if data.get("recovery_auth_pub"):
+                    a["recovery_auth_pub"] = data["recovery_auth_pub"]
                 a.update(epoch=data["epoch"], rekey=False, joins={})
                 return 201, {"epoch": a["epoch"], "seq": self.bump(a)}
             if rest == "keys/envelope" and method == "POST":
@@ -180,6 +228,11 @@ class FakeHub:
                     raise Refused(403, "no_recovery")
                 elif a["devices"][target].get("was_revoked"):
                     raise Refused(403, "approval_required")
+                if self.verify:
+                    self.check_statement(a, who["account"], device, data)
+                a["membership"].append({"id": len(a["membership"]) + 1, "epoch": data["epoch"], "device": target,
+                                        "statement": data.get("statement", ""), "signature": data.get("statement_signature", ""),
+                                        "created_at": int(time.time() * 1000)})
                 a["envelopes"][target] = {"epoch": data["epoch"], "wrapper": device, "ciphertext": data["ciphertext"], "signature": data["signature"]}
                 a["devices"][target].update(state="member", cert=data["cert"], cert_epoch=data["epoch"],
                                             joined_via="recovery" if target == device else "approval", joined_at=int(time.time() * 1000))
@@ -204,8 +257,11 @@ class FakeHub:
             if rest == "joins" and method == "GET":
                 me = a["devices"].get(device)
                 rows = [j for j in a["joins"].values() if (me and me["state"] == "member") or j["device"] == device]
-                return 200, {"joins": [{**j, "name": names.get(j["device"], ""), "sign_pub": a["devices"][j["device"]]["sign_pub"],
-                                        "box_pub": a["devices"][j["device"]]["box_pub"], "class": a["devices"][j["device"]]["class"]} for j in rows]}
+                out = [{**j, "name": names.get(j["device"], ""), "sign_pub": a["devices"][j["device"]]["sign_pub"],
+                        "box_pub": a["devices"][j["device"]]["box_pub"], "class": a["devices"][j["device"]]["class"]} for j in rows]
+                if self.rewrite_join:      # a dishonest Hub shows each device what it likes
+                    out = [self.rewrite_join(device, row) for row in out]
+                return 200, {"joins": out}
             if rest.startswith("joins/"):
                 parts = rest.split("/")
                 join = a["joins"].get(parts[1])
@@ -269,11 +325,13 @@ class FakeHub:
                 saved, conflicts = [], []
                 for record in data["records"]:
                     current = zone["records"].get(record["name"])
+                    if self.verify and not record.get("ciphertext"):
+                        raise Refused(400, "fields")
                     if (current["version"] if current else 0) != record["base"] or (not current and record.get("deleted")):
                         conflicts.append(current or {"name": record["name"], "version": 0, "deleted": True})
                         continue
                     row = {"name": record["name"], "version": record["base"] + 1, "seq": self.bump(a), "generation": record["generation"],
-                           "deleted": bool(record.get("deleted")), "ciphertext": None if record.get("deleted") else record["ciphertext"],
+                           "deleted": bool(record.get("deleted")), "ciphertext": record.get("ciphertext"),
                            "writer": device, "updated_at": int(time.time() * 1000)}
                     zone["records"][record["name"]] = row
                     saved.append({"name": row["name"], "version": row["version"], "seq": row["seq"]})
@@ -289,8 +347,11 @@ class FakeHub:
             if sub.startswith("blobs/"):
                 blob = sub.split("/")[1]
                 if method == "PUT":
+                    if len(body) > MAX_BLOB:
+                        raise Refused(413, "too_large")
                     if a["bytes"] + len(body) > self.quota:
                         raise Refused(413, "quota")
+                    self.put_order.append(blob)
                     if blob not in zone["blobs"]:
                         zone["blobs"][blob] = body
                         a["bytes"] += len(body)
@@ -299,6 +360,27 @@ class FakeHub:
                     raise Refused(404, "blob_unknown")
                 return 200, zone["blobs"][blob]
             raise Refused(404, "not_found")
+
+    def check_statement(self, a: dict, account: str, device: str, data: dict) -> None:
+        """The Hub's copy of what devices check again: the statement names this envelope, cert and the device's keys."""
+        target = a["devices"][data["device"]]
+        recovery = data["device"] == device
+        try:
+            raw = unb64(data["statement"])
+            said = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            raise Refused(400, "fields") from None
+        if (canonical(said) != raw or said.get("kind") != "add" or said.get("account") != account or said.get("epoch") != data["epoch"]
+                or said.get("device") != data["device"] or said.get("sign_pub") != target["sign_pub"] or said.get("box_pub") != target["box_pub"]
+                or said.get("via") != ("recovery" if recovery else "approval") or said.get("signer") != ("recovery" if recovery else device)
+                or said.get("envelope_sha256") != hashlib.sha256(unb64(data["ciphertext"])).hexdigest()
+                or said.get("cert_sha256") != hashlib.sha256(unb64(data["cert"])).hexdigest()):
+            raise Refused(400, "bad_statement")
+        key = a["recovery_auth_pub"] if recovery else a["devices"][device]["sign_pub"]
+        if not key or not signed(key, data["statement_signature"], b"luma-sync-membership-v1\0" + raw):
+            raise Refused(403 if recovery else 400, "recovery_proof" if recovery else "bad_signature")
+        if not signed(a["devices"][device]["sign_pub"], data["signature"], envelope_message(account, data["device"], data["epoch"], data["ciphertext"])):
+            raise Refused(400, "bad_signature")
 
 
 def serve(hub: FakeHub, port: int = 0) -> ThreadingHTTPServer:

@@ -66,6 +66,8 @@ class Sync:
         self.account = Account(self.hub, self.keystore, self.local, self.device_class)
         self.engine = Engine(self.hub, self.account, self.local)
         self.appdata = appdata.AppData(self.engine, self.local, registration.device, registration.name or socket.gethostname())
+        # Checked again, live, right before a snapshot is published or an update swapped in (review M3).
+        self.appdata.still_quiet = lambda app: app not in quiet_points.running()
         self.watcher = None
         self.events: list[tuple[str, tuple]] = []
         self.last: dict[str, object] = self.local.get("last", {})
@@ -105,10 +107,10 @@ class Sync:
     def local_fingerprint(self) -> str:
         """Cheap: what is installed, and the metadata of every closed app's folder. No Hub request."""
         parts = sorted(apps.installed_names())
-        for app, target in sorted(appdata.targets().items()):
+        for app, target in sorted(appdata.targets(self.hub.device).items()):
             if self.watcher is None or self.watcher.quiet(app):
                 parts.append(app + json.dumps(appdata.quick_state(target.folder, self.appdata.patterns), sort_keys=True))
-                parts.append(json.dumps(portal_secrets._stamp(app)))   # sign-ins change without the synced folder changing
+                parts.append(json.dumps(portal_secrets._stamp(target.app)))   # sign-ins change without the synced folder changing
         return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
     def idle(self, remote_seq: int | None) -> bool:
@@ -230,7 +232,7 @@ class Sync:
 
     # ------------------------------------------------------------ app data
     def sync_appdata(self, only_app: str | None = None) -> None:
-        targets = appdata.targets()
+        targets = appdata.targets(self.hub.device)
         for app, target in sorted(targets.items()):
             if only_app and app != only_app:
                 continue
@@ -242,6 +244,11 @@ class Sync:
             except appdata.SnapshotAborted as error:
                 log.info("%s: %s; trying again at the next quiet point", app, error)
                 continue
+            except HubError as error:
+                if error.code != "stale_generation":
+                    raise
+                log.info("%s: waiting for its zone key to be replaced", app)
+                continue
             if state != before:
                 self.emit("RestoreChanged", app)
 
@@ -252,19 +259,26 @@ class Sync:
         ids = {row["id"] for row in current}
         for row in current:
             if row["id"] not in seen and row["code"]:
-                self.emit("JoinRequested", row["id"], row["device"], row["name"], row["class"], row["code"])
+                # No code in the signal: every session-bus client hears signals; the card fetches it (review L8).
+                self.emit("JoinRequested", row["id"], row["device"], row["name"], row["class"])
                 seen.add(row["id"])
         for gone in seen - ids:
             self.emit("JoinCleared", gone, "answered")
         self.local.put("joins_seen", sorted(seen & ids))
-        # A device that let itself in with the recovery key is shown on every member, with Remove.
+        # A device that let itself in with the recovery key is shown on every member, with Remove. Known from the
+        # statement the recovery key signed, not from what the Hub says (review M2); a device the Hub calls a member
+        # without a signed statement is "suspicious" and gets no key.
         known = set(self.local.get("recovery_joins_seen", []))
-        for device in self.account.state(fresh=False)["devices"]:
-            key = f"{device['device']}:{device.get('joined_at')}"
-            if device.get("joined_via") == "recovery" and device["state"] == "member" and device["device"] != self.hub.device and key not in known:
-                self.emit("RecoveryJoined", device["device"], device["name"], device.get("class", "computer"))
+        members = self.account.members()
+        names = {d["device"]: d for d in self.account.state(fresh=False)["devices"]}
+        for device, entry in members.items():
+            key = f"{device}:{entry['sign']}"
+            if entry.get("via") == "recovery" and device != self.hub.device and key not in known:
+                row = names.get(device, {})
+                self.emit("RecoveryJoined", device, row.get("name", ""), row.get("class", "computer"))
                 known.add(key)
         self.local.put("recovery_joins_seen", sorted(known))
+        self.local.put("suspicious", sorted(d for d, row in names.items() if row["state"] == "member" and d not in members))
 
     # ------------------------------------------------------------ what the UI reads
     def state(self) -> dict:
@@ -302,7 +316,7 @@ class Sync:
 
     def app_list(self) -> list[dict]:
         out = []
-        for app, target in sorted(appdata.targets().items()):
+        for app, target in sorted(appdata.targets(self.hub.device).items()):
             info = self.appdata.info(app)
             out.append({"app": app, "name": target.name or app, "kind": target.kind,
                         "size": appdata.folder_bytes(target.folder, self.appdata.patterns),

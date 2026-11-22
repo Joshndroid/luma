@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -24,8 +25,9 @@ from . import crypto
 from .crypto import CryptoError, b64, unb64
 from .hub import Hub, HubError
 
-RAW, ZLIB = 0, 1
-PAD = 64 * 1024          # every stored piece is a multiple of this many bytes
+MAX_BLOB = 4 * 1024 * 1024          # the Hub's limit for one stored piece (review M5)
+MAX_RECORD_PLAIN = 4 * 1024 * 1024  # a record's inflated size; more is refused (review L2)
+BLOB_ID = re.compile(r"[0-9a-f]{64}")
 
 
 def state_directory(device: str) -> Path:
@@ -151,7 +153,17 @@ class Engine:
         return key
 
     def current(self, zone: str) -> tuple[int, bytes]:
+        """The generation new writes use. Never one older than this device has seen or than the floor set at the last
+        account key change: the Hub reports generations, devices decide which they accept (review H2.4)."""
         generation = (self._zones.get(zone) or self.refresh_zones()[zone])["generation"]
+        seen = self.local.get("zone_generations", {})
+        floor = self.local.get("zone_floor", {}).get(zone, 0)
+        if generation < max(seen.get(zone, 0), floor):
+            generation = (self.refresh_zones().get(zone) or {}).get("generation", 0)
+            if generation < max(seen.get(zone, 0), floor):
+                raise HubError(409, "This zone's key hasn't been replaced yet; writing waits.", "stale_generation")
+        if generation > seen.get(zone, 0):
+            self.local.put("zone_generations", {**seen, zone: generation})
         return generation, self.key(zone, generation)
 
     def delete_zone(self, label: str) -> None:
@@ -165,16 +177,24 @@ class Engine:
         self._zones.pop(zone, None)
 
     # ------------------------------------------------------------ records
-    def _open(self, zone: str, row: dict) -> tuple[str, object | None]:
-        if row["deleted"]:
-            return "", None
+    def _open(self, zone: str, row: dict) -> tuple[str, object | None, bool, str]:
+        """(name, value, deleted, writer) from a row; a deletion is a sealed tombstone too (review M2)."""
+        if not row.get("ciphertext"):
+            raise CryptoError("a record has no sealed body")
         key = self.key(zone, row["generation"])
         plain = crypto.open_sealed(key, unb64(row["ciphertext"]),
                                    crypto.record_ad(self.bundle().account, zone, row["name"], row["generation"], row["version"]))
-        body = json.loads(zlib.decompress(plain))
+        inflater = zlib.decompressobj()
+        text = inflater.decompress(plain, MAX_RECORD_PLAIN)
+        if inflater.unconsumed_tail:
+            raise CryptoError("a record is larger than allowed")
+        body = json.loads(text)
         if crypto.record_name(self.bundle().names, zone, body["n"]) != row["name"]:
             raise CryptoError("a record's name does not match its contents")
-        return body["n"], body["v"]
+        deleted = body.get("d") is True
+        if deleted != bool(row["deleted"]):
+            raise CryptoError("a record's deletion flag does not match its contents")
+        return body["n"], None if deleted else body["v"], deleted, str(body.get("w") or "")
 
     def fetch(self, label: str) -> list[tuple[str, object | None, str]]:
         """Records changed since this device last looked: (name, value or None when deleted, writer)."""
@@ -183,23 +203,19 @@ class Engine:
             return []
         zone = info["zone"]
         changed = []
-        names = self.local.get(f"names:{zone}", {})
         after = self.local.token(zone)
         while True:
             page = self.hub.get(f"zones/{zone}/changes?after={after}&limit=200")
             for row in page["records"]:
-                name, value = self._open(zone, row)
-                if row["deleted"]:
-                    name = names.get(row["name"], "")
-                else:
-                    names[row["name"]] = name
-                if name:
-                    self.local.set_mirror(zone, name, row["version"], value, row["writer"], row["updated_at"])
-                    changed.append((name, value, row["writer"]))
+                try:
+                    name, value, _deleted, writer = self._open(zone, row)
+                except (CryptoError, ValueError, KeyError):
+                    continue        # unreadable or forged: ignored, never applied
+                self.local.set_mirror(zone, name, row["version"], value, writer, row["updated_at"])
+                changed.append((name, value, writer))
             after = page["seq"]
             if not page["more"]:
                 break
-        self.local.put(f"names:{zone}", names)
         self.local.set_token(zone, after)
         return changed
 
@@ -215,32 +231,32 @@ class Engine:
         zone = info["zone"]  # type: ignore[index]
         base, _ = self.local.mirror(zone, name)
         hashed = crypto.record_name(self.bundle().names, zone, name)
-        entry: dict[str, object] = {"name": hashed, "base": base}
         generation, key = self.current(zone)
-        entry["generation"] = generation
+        body = {"n": name, "w": self.hub.device, "t": int(time.time() * 1000)}
+        body.update({"d": True} if value is None else {"v": value})
+        plain = zlib.compress(crypto.canonical(body), 6)
+        entry: dict[str, object] = {"name": hashed, "base": base, "generation": generation,
+                                    "ciphertext": b64(crypto.seal(key, plain, crypto.record_ad(self.bundle().account, zone, hashed, generation, base + 1)))}
         if value is None:
             entry["deleted"] = True
-        else:
-            plain = zlib.compress(crypto.canonical({"n": name, "v": value}), 6)
-            entry["ciphertext"] = b64(crypto.seal(key, plain, crypto.record_ad(self.bundle().account, zone, hashed, generation, base + 1)))
         answer = self.hub.post(f"zones/{zone}/records", {"records": [entry]})
-        names = self.local.get(f"names:{zone}", {})
-        names[hashed] = name
-        self.local.put(f"names:{zone}", names)
         if answer["saved"]:
             self.local.set_mirror(zone, name, answer["saved"][0]["version"], value, self.hub.device, int(time.time() * 1000))
             return True, value
         current = answer["conflicts"][0]
-        _, now = self._open(zone, current) if not current.get("deleted") else ("", None)
-        self.local.set_mirror(zone, name, current["version"], now, current.get("writer", ""), current.get("updated_at", 0))
+        now, writer = None, current.get("writer", "")
+        if current.get("ciphertext"):
+            try:
+                _, now, _deleted, writer = self._open(zone, current)
+            except (CryptoError, ValueError, KeyError):
+                now = None
+        self.local.set_mirror(zone, name, current["version"], now, writer, current.get("updated_at", 0))
         return False, now
 
-    # ------------------------------------------------------------ blobs
+    # ------------------------------------------------------------ blobs (one ciphertext each, the same from any source)
     def blob_id(self, zone: str, data: bytes) -> str:
-        return crypto.blob_id(self.bundle().names, zone, data)
-
-    def chunk_key(self, zone: str) -> bytes:
-        return crypto.hkdf(self.bundle().names, "luma-sync-chunk-v1\0" + zone)
+        _generation, key = self.current(zone)
+        return crypto.blob_id(key, zone, data)
 
     def missing(self, zone: str, ids: list[str]) -> set[str]:
         out: set[str] = set()
@@ -248,30 +264,43 @@ class Engine:
             out.update(self.hub.post(f"zones/{zone}/blobs/check", {"ids": ids[start:start + 1000]})["missing"])
         return out
 
-    def put_blob(self, zone: str, data: bytes, blob: str | None = None) -> str:
-        blob = blob or self.blob_id(zone, data)
+    def seal_blob(self, zone: str, data: bytes, pad_to: int | None = None) -> tuple[str, int, bytes]:
+        """(id, generation, sealed bytes): generation (4) ‖ format ‖ nonce ‖ AEAD(length (4) ‖ data ‖ zero padding).
+
+        No compression: sizes would then depend on content. ``pad_to`` is the plaintext length to pad to (Padmé, by the caller).
+        """
         generation, key = self.current(zone)
-        packed = zlib.compress(data, 3)
-        payload, kind = (packed, ZLIB) if len(packed) < len(data) else (data, RAW)
-        # One ciphertext per piece, the same from any source: generation, nonce, then
-        # [kind][length][payload][zero padding] sealed, padded to a multiple of PAD.
-        overhead = 4 + 24 + 16 + 5
-        padding = (-(overhead + len(payload))) % PAD
-        body = bytes([kind]) + len(payload).to_bytes(4, "big") + payload + bytes(padding)
+        blob = crypto.blob_id(key, zone, data)
+        target = max(len(data), pad_to or 0)
+        body = len(data).to_bytes(4, "big") + data + bytes(target - len(data))
         sealed = generation.to_bytes(4, "big") + crypto.seal(key, body, crypto.blob_ad(self.bundle().account, zone, blob, generation))
+        if len(sealed) > MAX_BLOB:
+            raise ValueError("a piece would be larger than the Hub accepts")
+        return blob, generation, sealed
+
+    def upload(self, zone: str, blob: str, sealed: bytes) -> None:
         self._retrying(lambda: self.hub.put_blob(zone, blob, sealed))
-        return blob
+
+    def put_blob(self, zone: str, data: bytes, pad_to: int | None = None) -> tuple[str, int]:
+        blob, generation, sealed = self.seal_blob(zone, data, pad_to)
+        if blob in self.missing(zone, [blob]):
+            self.upload(zone, blob, sealed)
+        return blob, generation
 
     def get_blob(self, zone: str, blob: str) -> bytes:
+        if not BLOB_ID.fullmatch(blob):
+            raise CryptoError("not a piece id")
         sealed = self._retrying(lambda: self.hub.get_blob(zone, blob))
+        if len(sealed) > MAX_BLOB or len(sealed) < 5:
+            raise CryptoError("a piece has the wrong size")
         generation = int.from_bytes(sealed[:4], "big")
-        body = crypto.open_sealed(self.key(zone, generation), sealed[4:], crypto.blob_ad(self.bundle().account, zone, blob, generation))
-        length = int.from_bytes(body[1:5], "big")
-        if length > len(body) - 5 or any(body[5 + length:]):
+        key = self.key(zone, generation)
+        body = crypto.open_sealed(key, sealed[4:], crypto.blob_ad(self.bundle().account, zone, blob, generation))
+        length = int.from_bytes(body[:4], "big")
+        if length > len(body) - 4 or any(body[4 + length:]):
             raise CryptoError("a piece is malformed")
-        payload = body[5:5 + length]
-        data = zlib.decompress(payload) if body[0] == ZLIB else payload
-        if self.blob_id(zone, data) != blob:
+        data = body[4:4 + length]
+        if crypto.blob_id(key, zone, data) != blob:
             raise CryptoError("a piece did not match its name")
         return data
 

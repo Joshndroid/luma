@@ -8,15 +8,19 @@ the Luma Connect Hub's `/api/sync/v1/` (website repo,
 ## What it syncs
 
 - **Apps installed** (zone `apps`): one record per Flatpak (remote name and
-  URL, branch, hold) and per ADR-052 store app (the store record's origin:
-  package, userland, repositories it added). The receiving computer installs
-  Flatpaks with `--user` from a remote it already trusts at the same URL, and
-  rebuilds store apps from their repositories with its own installer
-  (`store_rebuild.py`); no binary is copied. The set is a union: removing an
+  URL, branch, hold) and per ADR-052 store app (id, package, userland, the
+  vendor hosts it needed). The receiving computer installs Flatpaks with
+  `--user` from a remote it already trusts at the same URL, and rebuilds
+  store apps from its own repositories for that userland with its own
+  installer (`store_rebuild.py`); no binary, repository file, key or command
+  comes from the record. A store app that needed a vendor's repository is
+  listed, not installed. The set is a union: removing an
   app on one device doesn't remove it elsewhere.
-- **App data** (zone `appdata:<app>`): the app's data folder
+- **App data** (zone `appdata:<owner>:<app>`, owner = the Flatpak remote's
+  URL and signing keys, or the store app's userland; an app from an unsigned
+  source stays on its device): the app's data folder
   (`~/.var/app/<id>`, or the ADR-052 data folder), its host dconf path, and,
-  through the `keychain` zone, the secret portal's per-app secret, so
+  through the `portal:<owner>:<app>` record, the secret portal's per-app secret, so
   `data/keyrings/` opens on the other device. Snapshots are taken only when
   the app has been closed for 20 s; an incoming snapshot is built beside the
   folder and swapped in by rename while the app is closed. Caches, `tmp/`,
@@ -34,18 +38,29 @@ Not in Phase 1: settings, appearance, keyboard, Wi-Fi, passwords, browser
 
 | Key | Where | Primitive |
 | --- | --- | --- |
-| Device identity and envelope keys | Secret Service (`keystore.py`) | Ed25519, X25519 |
-| Account key bundle (ASK, naming key, recovery public key, members) | Secret Service; on the Hub only as HPKE envelopes, one per device and one for the recovery key | HPKE X25519 / HKDF-SHA256 / ChaCha20-Poly1305 (python-cryptography) |
-| Zone keys, one per zone and key generation | Hub, wrapped by the ASK | XChaCha20-Poly1305 (libsodium) |
-| Records and blobs | Hub | XChaCha20-Poly1305, associated data binding account, zone, name, generation, version |
-| Names, zone ids, blob ids | | HMAC-SHA256 under the naming key |
-| Recovery key | the person; also this device's keyring, for Settings > Show… | 24 BIP-39 words, Argon2id (64 MiB, 3 passes) |
+| Device identity and envelope keys | `systemd-creds --user` sealed files in `~/.local/share/luma/sync/keys/` (`keystore.py`); never the login keyring | Ed25519, X25519 |
+| Account key bundle (ASK, naming key, recovery keys' public halves, members, removed devices, signer) | sealed files as above; on the Hub only as HPKE envelopes, one per device and one for the recovery key | HPKE X25519 / HKDF-SHA256 / ChaCha20-Poly1305 (python-cryptography), Ed25519-signed from epoch 2 |
+| Zone keys, one per zone and key generation | Hub, wrapped under HKDF(ASK) | XChaCha20-Poly1305 (libsodium) |
+| Records and blobs | Hub | XChaCha20-Poly1305 with a format byte, associated data binding account, zone, name, generation, version |
+| Names, zone ids | | HMAC-SHA256 under the naming key |
+| Blob ids | | HMAC-SHA256 under the zone key of the generation |
+| Recovery key | the person; sealed on the device that made it, for Settings > Show… | 24 BIP-39 words, Argon2id (64 MiB, 3 passes) → X25519 envelope key and Ed25519 auth key |
+
+The wire format is `docs/operations/connect-sync-wire.md` (format 2).
 
 Joining: the new device commits to its half of the code; the first member
 online posts the approvers' half (the same on every member, derived from the
-ASK); the new device reveals; both show six digits over the account, the
-device's keys and both halves. Revoking a device makes a new ASK chained to
-the old one and new zone key generations for new writes.
+ASK); the new device keeps the first half it sees and reveals once; the
+approver checks the reveal opens the commitment; both show six digits over
+the whole transcript. The approver signs a membership statement and the
+envelope; the new device accepts only an envelope from a member that matches
+its code. Members are the signed bundle plus signed statements, never the
+Hub's list.
+
+Revoking a device makes a new ASK chained to the old one, signed by the
+remover, listing the removed device for good, and new zone key generations;
+devices refuse to write with an older one. If the removed device held the
+recovery words, the recovery key is replaced too.
 
 ## org.projectluma.ConnectSync1
 
@@ -65,26 +80,38 @@ Errors are `org.projectluma.ConnectSync1.Error.<Code>` with a plain message
 (`WrongKey`: "That key doesn't match this account").
 
 Callers in a sandbox (Flatpak, ADR-052 store apps and capsules, snaps) are
-refused on every method. `ApproveJoin`, `RemoveDevice`, `DeleteAppData` and
+refused on every method. Setup, join, approval, removal, recovery and
+delete-everything calls answer only a login session, the shell or Settings
+(by the caller's cgroup). `ApproveJoin`, `RemoveDevice`, `DeleteAppData` and
 `SetEnabled(false)` need polkit `org.projectluma.connect-sync.manage`
 (`auth_self_keep`), `RevealRecoveryKey` needs
-`org.projectluma.connect-sync.reveal-recovery-key`.
+`org.projectluma.connect-sync.reveal-recovery-key`. The bus name is never
+queued for. `JoinRequested` carries no code; callers read it with
+`ListJoinRequests`.
 
 ## Hardening
 
-- Incoming manifests: every path relative and normalised, nothing created
-  below or through a symlink, symlinks that leave the folder dropped, file
-  modes stripped of set-id bits; snapshots never follow a symlink.
+- Incoming manifests: every path relative and normalised, owner and app
+  checked, nothing created below or through a symlink, symlink targets with
+  `..` or `/` dropped, piece ids checked, file modes stripped of set-id bits.
+- Files are opened beneath the folder one component at a time with
+  `O_NOFOLLOW` and checked with `fstat`; incoming files are copied from the
+  verified descriptor.
 - dconf: only `/<app id as path>/`, and never an app whose path is or holds
   `/org/gnome/desktop/`, `/org/gnome/shell/`, `/org/gnome/mutter/`,
-  `/org/gnome/settings-daemon/`, `/org/freedesktop/`, `/org/projectluma/`,
+  `/org/gnome/settings-daemon/`, `/org/gnome/terminal/`, `/org/gnome/ptyxis/`,
+  `/org/gnome/online-accounts/`, `/org/gnome/crypto/`, `/org/gnome/system/`,
+  `/org/gnome/login-screen/`, `/org/freedesktop/`, `/org/projectluma/`,
   `/ca/desrt/` or `/system/`.
-- Chunk boundaries come from a gear table keyed per zone; every stored piece
-  is one ciphertext padded to a multiple of 64 KiB, the same whichever way
-  it later travels.
-- A removed device gets new keys and must be approved again; removing a
-  device can replace the recovery key; a recovery-key join raises
-  `RecoveryJoined` on every member.
+- Pieces: files over 1 MiB in fixed 1 MiB blocks padded with random blocks
+  to the Padmé size of the file; small files in packs padded to Padmé; no
+  compression; uploads in random order; every piece at most 4 MiB.
+- Deletions are sealed tombstones naming their writer; a Hub-set deletion
+  flag is ignored. Hub answers are capped and redirects are refused.
+- A removed device gets new keys and must be approved again; a recovery-key
+  join needs the recovery key's signature on the Hub and raises
+  `RecoveryJoined` on every member; deleting all synced data needs the
+  recovery key.
 - A file changed on two devices keeps both: the newer is current, the other
   stays as a labelled sibling record in the app's zone (`ListConflicts`).
 

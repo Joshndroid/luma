@@ -129,12 +129,13 @@ def store_records() -> list[dict[str, object]]:
         if tree.get("format") not in {"deb", "rpm"}:
             continue  # AppImages and archives arrive as files; there is no repository to rebuild them from
         origin = dict(tree.get("origin") or {})
+        # Only what names the app: never repository files, keys, extra packages or commands (review H5).
+        hosts = sorted({row["uri"].split("/")[2] for row in record.get("vendor_repositories") or [] if "://" in str(row.get("uri", ""))})
         out.append({"id": str(meta["id"]), "name": str(record.get("name") or meta["id"]), "format": tree["format"],
                     "sha256": str(record.get("sha256") or ""), "icon": str(record.get("icon") or ""),
-                    "tree": {key: tree.get(key) for key in ("id", "format", "userland", "architecture", "foreign_architectures",
-                                                             "extra_packages", "language", "windowed", "command", "display_name")}
-                    | {"origin": {"package": origin.get("package"), "file": "", "sha256": origin.get("sha256", ""),
-                                  "from_repository": True, "added_repositories": origin.get("added_repositories") or []}},
+                    "package": str(origin.get("package") or ""), "userland": str(tree.get("userland") or ""),
+                    "vendor_hosts": hosts, "needs_vendor_repository": bool(origin.get("added_repositories")),
+                    "tree": {"userland": tree.get("userland"), "origin": {"added_repositories": [1] if origin.get("added_repositories") else []}},
                     "hold": bool(record.get("held") or record.get("hold"))})
     return out
 
@@ -155,8 +156,9 @@ def local_records(device: str, device_class: str = "computer") -> dict[str, dict
                                        "url": remote["url"], "hold": app["id"] in held, "class": device_class, "from": device}
     for record in store_records():
         out[f"store:{record['id']}"] = {"kind": "store", "id": record["id"], "name": record["name"], "format": record["format"],
-                                        "sha256": record["sha256"], "tree": record["tree"], "hold": record["hold"],
-                                        "class": device_class, "from": device}
+                                        "sha256": record["sha256"], "package": record["package"], "userland": record["userland"],
+                                        "vendor_hosts": record["vendor_hosts"], "needs_vendor_repository": record["needs_vendor_repository"],
+                                        "hold": record["hold"], "class": device_class, "from": device}
     return out
 
 
@@ -209,7 +211,14 @@ def install_flatpak(value: dict[str, object]) -> None:
 
 
 def install_store(value: dict[str, object]) -> None:
-    """Rebuild a store app from its repositories, in a child process so a long build doesn't hold the service."""
+    """Rebuild a store app from this device's own repositories for its distribution, in a child process.
+
+    A record that needed a vendor's repository on the other device is not installed here on its own: the person
+    installs it on this device (review H5).
+    """
+    if value.get("needs_vendor_repository"):
+        hosts = ", ".join(str(h) for h in value.get("vendor_hosts") or []) or "its maker's site"
+        raise Unavailable(f"Installed from {hosts} on another device. Install it here yourself if you want it.")
     try:
         import luma_installer  # noqa: F401
     except ImportError:

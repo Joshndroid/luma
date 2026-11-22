@@ -50,6 +50,12 @@ ROOT = "/org/freedesktop/secrets"
 DEFAULT_ALIAS = ROOT + "/aliases/default"
 ATTRIBUTE = "luma:application"
 SCHEMA_ATTRIBUTE = "xdg:schema"
+# Luma's own secrets (Connect Sync, Messages): no application searches, reads, adopts or writes them, whatever it names.
+PROTECTED_SCHEMA_PREFIXES = ("org.projectluma.",)
+
+
+def protected(attributes: dict[str, str]) -> bool:
+    return str(attributes.get(SCHEMA_ATTRIBUTE, "")).startswith(PROTECTED_SCHEMA_PREFIXES)
 
 SERVICE_INTERFACE = "org.freedesktop.Secret.Service"
 COLLECTION_INTERFACE = "org.freedesktop.Secret.Collection"
@@ -327,7 +333,8 @@ class Policy:
         if not default or _kind(path) != "item" or path.rsplit("/", 1)[0] not in {default, DEFAULT_ALIAS}:
             return False
         try:
-            mine = self._attributes(path).get(ATTRIBUTE) == self.tag
+            attributes = self._attributes(path)
+            mine = attributes.get(ATTRIBUTE) == self.tag and not protected(attributes)
         except Exception:
             return False
         if mine:
@@ -351,7 +358,7 @@ class Policy:
 
     def _adopt(self, attributes: dict[str, str]) -> tuple[list[str], list[str]]:
         """Mark as this application's the older entries this search names in full."""
-        if not self.adopt or not attributes:
+        if not self.adopt or not attributes or protected(attributes):
             return [], []
         unlocked, locked = self.call(ROOT, SERVICE_INTERFACE, "SearchItems",
                                      self._variant("(a{ss})", (attributes,))).unpack()
@@ -363,7 +370,7 @@ class Policy:
                     continue
                 try:
                     found = self._attributes(path)
-                    if ATTRIBUTE in found or any(attributes.get(key) != value for key, value in found.items()
+                    if ATTRIBUTE in found or protected(found) or any(attributes.get(key) != value for key, value in found.items()
                                                  if key != SCHEMA_ATTRIBUTE):
                         continue
                     self.call(path, PROPERTIES, "Set", self._variant(
@@ -374,6 +381,8 @@ class Policy:
         return adopted
 
     def _search(self, attributes: dict[str, str]) -> tuple[list[str], list[str]]:
+        if protected(attributes):
+            return [], []
         unlocked, locked = self.call(ROOT, SERVICE_INTERFACE, "SearchItems",
                                      self._variant("(a{ss})", (self._tagged(attributes),))).unpack()
         default = self.default_collection()
@@ -502,6 +511,8 @@ class Policy:
         self._require_collection(path)
         properties = self._properties(body.get_child_value(0))
         current = properties.get(ITEM_ATTRIBUTES)
+        if current and protected(dict(current.unpack())):
+            raise Refused(ACCESS_DENIED, "That kind of entry belongs to Luma.")
         properties[ITEM_ATTRIBUTES] = self._variant("a{ss}", self._tagged(dict(current.unpack()) if current else {}))
         reply = self.call(path, COLLECTION_INTERFACE, "CreateItem", self.GLib.Variant.new_tuple(
             self._variant("a{sv}", properties), body.get_child_value(1), body.get_child_value(2)))

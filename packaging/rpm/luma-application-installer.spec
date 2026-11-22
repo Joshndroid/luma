@@ -2,7 +2,7 @@
 
 Name:           luma-application-installer
 Version:        0.1.0
-Release:        1.luma.104%{?dist}
+Release:        1.luma.105%{?dist}
 Summary:        Project Luma universal application package broker
 License:        Apache-2.0
 URL:            https://projectluma.org/applications
@@ -374,6 +374,10 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 %{_unitdir}/timers.target.wants/luma-depot-appstream.timer
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.105
+- The keyring broker never lets an application search, read, adopt or
+  write entries of Luma's own schemas (org.projectluma.*).
+
 * Sat Nov 21 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.104
 - Package files (.deb, .rpm, AppImage, archives) are installed into the
   application store (ADR-052): a tree of the package and its dependencies,

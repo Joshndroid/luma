@@ -91,26 +91,18 @@ class CryptoTests(unittest.TestCase):
 
     def test_bundle_chain_and_envelope(self) -> None:
         keys = crypto.DeviceKeys.generate()
-        bundle = crypto.Bundle.first("acct", os.urandom(32), "dev", keys.sign_pub)
+        recovery = crypto.recovery_keys(crypto.new_recovery_entropy(), "acct")
+        bundle = crypto.Bundle.first("acct", recovery, "dev", keys)
         sealed = crypto.wrap(bundle, "dev", keys.box_pub)
         self.assertEqual(crypto.unwrap(sealed, keys.box, "acct", "dev", 1).ask, bundle.ask)
         with self.assertRaises(crypto.CryptoError):
             crypto.unwrap(sealed, keys.box, "acct", "other", 1)
-        nxt = bundle.successor({"dev": crypto.b64(keys.sign_pub)})
+        nxt = bundle.successor({"dev": keys.entry()}, [], "dev", keys, ["dev"])
         self.assertTrue(nxt.follows(bundle))
-        forged = crypto.Bundle("acct", 2, os.urandom(32), bundle.names, bundle.recovery_pub, nxt.members, nxt.prev)
-        self.assertFalse(forged.follows(bundle), "a new key not made with the old one is refused")
+        forged = crypto.Bundle.from_bytes(nxt.to_bytes())
+        forged.ask = os.urandom(32)
+        self.assertFalse(forged.follows(bundle), "a new key not signed as made is refused")
         self.assertEqual(bundle.zone_id("apps"), nxt.zone_id("apps"), "zone ids survive a new account key")
-
-    def test_chunks_are_content_defined(self) -> None:
-        from luma_connect_sync import chunking
-        import io
-        data = os.urandom(9 * 1024 * 1024)
-        first = list(chunking.chunks(io.BytesIO(data), b"k" * 32))
-        self.assertEqual(b"".join(first), data)
-        self.assertTrue(all(len(c) <= chunking.MAX for c in first))
-        shifted = list(chunking.chunks(io.BytesIO(b"x" * 1000 + data), b"k" * 32))
-        self.assertGreater(len(set(first) & set(shifted)), 0, "an insertion at the start keeps later chunks")
 
 
 class KeyTests(Base):

@@ -64,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
     app = commands.add_parser("app")
     app.add_argument("action", choices=["on", "off", "delete"])
     app.add_argument("app")
+    wipe = commands.add_parser("delete-account", help="delete everything synced, from the Hub (needs the recovery key)")
+    wipe.add_argument("--words-file")
     once = commands.add_parser("sync")
     once.add_argument("--app")
     arguments = parser.parse_args(argv)
@@ -120,12 +122,14 @@ def main(argv: list[str] | None = None) -> int:
                     view = sync.account.join_view()
                 if view.state == "code" and view.code != shown:
                     shown = view.code
-                    print(f"Code: {view.code[:3]} {view.code[3:]}  (approve on: {', '.join(a['name'] for a in view.approvers)})", flush=True)
+                    print(f"Code: {view.code[:3]} {view.code[3:]}  (approve on: {', '.join(a['name'] for a in view.approvers)}; "
+                          f"this device's key: {view.fingerprint})", flush=True)
                     if arguments.code_file:
                         Path(arguments.code_file).write_text(f"{view.join} {view.code}\n")
-                if view.state in {"approved", "denied", "expired"}:
+                if view.state in {"approved", "denied", "expired", "tampered"}:
                     print({"approved": "Approved. This device now syncs.", "denied": "Not approved",
-                           "expired": "The request lapsed. Ask again."}[view.state])
+                           "expired": "The request lapsed. Ask again.",
+                           "tampered": "Someone changed this request on the way. Don't approve it; ask again."}[view.state])
                     return 0 if view.state == "approved" else 1
                 time.sleep(2)
             print("No device answered yet; the request stays open. Run join again to keep waiting.")
@@ -145,12 +149,17 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "revoke":
             with sync.exclusive():
                 epoch, words = sync.account.revoke(arguments.device, new_recovery=bool(arguments.new_recovery_key))
-            if words:
+            print(f"Removed. Your other devices have new keys (epoch {epoch}).")
+            if words and arguments.new_recovery_key:
                 _private_write(Path(arguments.new_recovery_key), " ".join(words) + "\n")
-            print(f"Removed. Your other devices have new keys (epoch {epoch})." + (" The new recovery key was written to the file you named." if words else ""))
+                print("The recovery key was replaced; the new one was written to the file you named.")
+            elif words:
+                print("That device held the recovery key, so it was replaced. Your new recovery key (shown once):")
+                for index in range(0, 24, 4):
+                    print("  " + "  ".join(f"{index + i + 1:2d} {words[index + i]:<9}" for i in range(4)))
         elif arguments.command == "app":
             if arguments.action == "delete":
-                target = appdata.targets().get(arguments.app)
+                target = appdata.targets(sync.hub.device).get(arguments.app)
                 if target is None:
                     raise SyncStateError("unknown_app", "That app isn't on this device.")
                 with sync.exclusive():
@@ -158,6 +167,11 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 sync.appdata.set_info(arguments.app, enabled=arguments.action == "on")
             print("Done.")
+        elif arguments.command == "delete-account":
+            text = Path(arguments.words_file).read_text() if arguments.words_file else sys.stdin.read()
+            with sync.exclusive():
+                sync.account.delete_everything(crypto.normalise_words(text))
+            print("Everything synced was deleted from the Hub. This device keeps its files.")
         elif arguments.command == "sync":
             _print(sync.cycle(only_app=arguments.app))
     except (SyncStateError, HubError, KeystoreError, crypto.CryptoError) as error:

@@ -15,9 +15,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPErrorProcessor, HTTPRedirectHandler, OpenerDirector, Request, build_opener
 
 PREFIX = "/api/sync/v1/"
+MAX_RESPONSE = 32 * 1024 * 1024    # the largest answer read (a key rotation's zone list); more is refused (review L2)
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """A redirect is an error: the bearer token never follows one to another host or to plain http (review L3)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise HTTPError(req.full_url, code, "The Hub answered with a redirect, which Sync doesn't follow.", headers, fp)
+
+
+_OPENER: OpenerDirector = build_opener(_NoRedirect, HTTPErrorProcessor)
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 TIMEOUT = 30
 USER_AGENT = "luma-connect-sync/1"
@@ -85,10 +96,13 @@ class Hub:
         request = Request(url, data=data, method=method, headers=headers)
         self.requests += 1
         try:
-            with urlopen(request, timeout=timeout or self.timeout) as response:
-                return response.status, response.read(), response.headers.get("Content-Type", "")
+            with _OPENER.open(request, timeout=timeout or self.timeout) as response:
+                body = response.read(MAX_RESPONSE + 1)
+                if len(body) > MAX_RESPONSE:
+                    raise HubError(0, "The Hub's answer was larger than Sync accepts.", "too_large")
+                return response.status, body, response.headers.get("Content-Type", "")
         except HTTPError as error:
-            raw = error.read()
+            raw = error.read(65536) if error.fp else b""
             try:
                 body = json.loads(raw)
             except ValueError:

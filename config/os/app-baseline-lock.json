@@ -95,7 +95,11 @@
         "x86_64": "f377886e3b98d347d5e84b2a35c957c1601961d1320904dd7e60ef780b5ecc23"
       },
       "source_sha256": "f1a11d654a1d28273fe0c5494fee680cd56febacdb93be90fcc506b037742fd0",
-      "version": "0.1.5"
+      "version": "0.1.5",
+      "pending": {
+        "reason": "only the host-side capsule keyring broker changed (luma-application-installer 1.luma.105: capsule_secrets refuses org.projectluma.* schemas, app_host_compatibility floor); the app does not run it, the next Depot rebuild carries it",
+        "expires": "2026-11-25"
+      }
     },
     "org.projectluma.Imager": {
       "commits": {

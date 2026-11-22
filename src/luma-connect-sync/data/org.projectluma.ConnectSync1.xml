@@ -5,6 +5,9 @@
      (see README.md). The recovery key is only ever in a method reply. -->
 <node>
   <!-- Callers in a sandbox (Flatpak, ADR-052 store apps and capsules, snaps) are refused on every method.
+       ApproveJoin, RemoveDevice, JoinWithRecoveryKey, RevealRecoveryKey, BeginSetup, FinishSetup and DeleteAllSyncedData
+       answer only the shell, Settings or a login session (cgroup allow-list). Clients must check that the name's owner
+       runs in luma-connect-syncd.service before sending words or showing codes.
        ApproveJoin, RemoveDevice, DeleteAppData and SetEnabled(false) need polkit org.projectluma.connect-sync.manage
        (auth_self_keep); RevealRecoveryKey needs org.projectluma.connect-sync.reveal-recovery-key (auth_self). -->
   <interface name="org.projectluma.ConnectSync1">
@@ -41,9 +44,9 @@
     <method name="ListJoinRequests"><arg name="json" type="s" direction="out"/></method>
     <method name="ApproveJoin"><arg name="join" type="s" direction="in"/><arg name="code" type="s" direction="in"/></method>
     <method name="DenyJoin"><arg name="join" type="s" direction="in"/></method>
+    <!-- No code in the signal (every client hears it); the card reads it with ListJoinRequests. -->
     <signal name="JoinRequested">
-      <arg name="join" type="s"/><arg name="device" type="s"/><arg name="name" type="s"/>
-      <arg name="class" type="s"/><arg name="code" type="s"/>
+      <arg name="join" type="s"/><arg name="device" type="s"/><arg name="name" type="s"/><arg name="class" type="s"/>
     </signal>
     <!-- outcome: approved | denied | answered (on another device) | expired -->
     <signal name="JoinCleared"><arg name="join" type="s"/><arg name="outcome" type="s"/></signal>
@@ -52,6 +55,8 @@
     <method name="ListApps"><arg name="json" type="s" direction="out"/></method>
     <method name="SetAppEnabled"><arg name="app" type="s" direction="in"/><arg name="on" type="b" direction="in"/></method>
     <method name="DeleteAppData"><arg name="app" type="s" direction="in"/></method>
+    <!-- Everything synced for the account; needs the recovery key and polkit. -->
+    <method name="DeleteAllSyncedData"><arg name="words" type="s" direction="in"/></method>
     <method name="ApplyPending"><arg name="app" type="s" direction="in"/><arg name="applied" type="b" direction="out"/></method>
     <method name="Quiesce"><arg name="app" type="s" direction="in"/></method>
     <!-- {recent: [{app, name, from, at, files}], versions: {app: [{path, label, device, at}]}}: the losing copy of a

@@ -66,6 +66,25 @@ def sandboxed(pid: int, proc: Path = PROC) -> str:
     return ""
 
 
+# Methods that hand out keys or take a recovery key answer only the shell, Settings and a person's terminal (review M4).
+TRUSTED_ONLY = {"ApproveJoin", "RemoveDevice", "JoinWithRecoveryKey", "RevealRecoveryKey", "BeginSetup", "FinishSetup", "ListJoinRequests", "GetJoin", "RequestJoin",
+                "DeleteAllSyncedData"}
+TRUSTED_UNITS = ("org.gnome.Shell@", "gnome-shell", "org.gnome.Settings", "gnome-control-center", "org.projectluma.Settings",
+                 "app-gnome-org.gnome.Settings", "luma-settings")
+
+
+def trusted_caller(pid: int, proc: Path = PROC) -> bool:
+    """The caller's cgroup is the shell's or Settings' unit, or a login session (a terminal)."""
+    try:
+        cgroup = (proc / str(pid) / "cgroup").read_text().strip().splitlines()[-1].split("::", 1)[-1]
+    except (OSError, IndexError):
+        return False
+    leaf = cgroup.rstrip("/").rsplit("/", 1)[-1]
+    if leaf.startswith(("session-",)) and leaf.endswith(".scope"):
+        return True
+    return any(leaf.startswith(prefix) for prefix in TRUSTED_UNITS)
+
+
 def introspection() -> str:
     for path in (Path("/usr/share/dbus-1/interfaces/org.projectluma.ConnectSync1.xml"),
                  Path(__file__).resolve().parent.parent / "data" / "org.projectluma.ConnectSync1.xml"):
@@ -136,7 +155,7 @@ class Service:
         if self.connection is None:
             return False
         signature = {"StateChanged": "()", "AppsChanged": "()", "RestoreChanged": "(s)", "JoinChanged": "(s)",
-                     "JoinRequested": "(sssss)", "JoinCleared": "(ss)", "RecoveryJoined": "(sss)"}[name]
+                     "JoinRequested": "(ssss)", "JoinCleared": "(ss)", "RecoveryJoined": "(sss)"}[name]
         self.connection.emit_signal(None, OBJECT_PATH, INTERFACE, name, GLib.Variant(signature, tuple(args)))
         return False
 
@@ -151,7 +170,12 @@ class Service:
             self.connection = connection
             connection.register_object(OBJECT_PATH, node.interfaces[0], self._call, None, None)
 
-        Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE, acquired, None, lambda *_: self.loop.quit())
+        def lost(*_args) -> None:
+            # Another process holds the name: never queue behind it or take it back silently (review M4).
+            log.error("Lost or never got %s: another process owns it. Sync stops; clients must not trust that owner.", BUS_NAME)
+            self.loop.quit()
+
+        Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.DO_NOT_QUEUE, acquired, None, lost)
         try:
             self.loop.run()
         finally:
@@ -167,6 +191,9 @@ class Service:
         why = sandboxed(pid) if pid else "unknown"
         if why:
             invocation.return_dbus_error(f"{ERROR}.NotAuthorized", "Apps in a sandbox can't use Luma Connect Sync.")
+            return
+        if method in TRUSTED_ONLY and not trusted_caller(pid):
+            invocation.return_dbus_error(f"{ERROR}.NotAuthorized", "Only the shell, Settings or a terminal may do this.")
             return
 
         def run() -> None:
@@ -286,7 +313,8 @@ class Service:
 
     def m_DeleteAppData(self, sender, app):
         self._require(sender, MANAGE_ACTION)
-        target = appdata.targets().get(app)
+
+        target = appdata.targets(self.sync.hub.device).get(app)
         if target is None:
             raise SyncStateError("unknown_app", "That app isn't on this device.")
         with self.sync.exclusive():
@@ -321,7 +349,16 @@ class Service:
         with self.sync.exclusive():
             _epoch, words = self.sync.account.revoke(device, new_recovery=bool(new_recovery_key))
         self.sync.emit("StateChanged")
+        # Words come back whenever the recovery key was replaced, including automatically because the device held it.
         return GLib.Variant("(as)", (words or [],))
+
+    def m_DeleteAllSyncedData(self, sender, words):
+        """Everything synced for the account, from the Hub. The Hub asks for the recovery key (review C2.4)."""
+        self._require(sender, MANAGE_ACTION)
+        with self.sync.exclusive():
+            self.sync.account.delete_everything(crypto.normalise_words(words))
+        self.sync.emit("StateChanged")
+        return None
 
     # Restore
     def m_GetRestore(self, _sender):
@@ -336,7 +373,7 @@ class Service:
     def m_ListConflicts(self, _sender):
         """{recent: conflicts merged on this device, versions: {app: [labelled siblings kept in the app's zone]}}"""
         versions = {}
-        for app, target in appdata.targets().items():
+        for app, target in appdata.targets(self.sync.hub.device).items():
             kept = self.sync.appdata.siblings(target)
             if kept:
                 versions[app] = [{k: v for k, v in entry.items() if k != "file"} for entry in kept]

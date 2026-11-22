@@ -20,6 +20,9 @@ from luma_connect_sync.hub import Hub, Registration  # noqa: E402
 from luma_connect_sync.keystore import FileKeystore  # noqa: E402
 
 
+OWNER = "flatpak:test-remote"     # every test device installs its apps from the same remote
+
+
 @dataclass
 class Device:
     name: str
@@ -32,7 +35,7 @@ class Device:
     appdata: AppData
 
     def target(self, app: str) -> Target:
-        return Target(app, "flatpak", self.root / "home/.var/app" / app, app)
+        return Target(app, "flatpak", self.root / "home/.var/app" / app, app, owner=OWNER)
 
 
 def make_device(name: str, hub_url: str, device_id: str, token: str, root: Path) -> Device:

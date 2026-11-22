@@ -2,7 +2,7 @@
 # Phase 1 of ADR-054. Not composed into an image until the Settings UI and
 # the Hub module are live; it runs as a user-level preview until then.
 Name:           luma-connect-sync
-Version:        0.1.0
+Version:        0.2.0
 Release:        1.luma.1%{?dist}
 Summary:        Luma Connect Sync: end-to-end encrypted sync of apps and app state
 License:        Apache-2.0
@@ -21,6 +21,10 @@ Requires:       python3dist(cryptography) >= 50
 Requires:       libsodium
 Requires:       python3-gobject-base
 Requires:       libsecret
+# Device keys are sealed with systemd-creds --user (systemd 256 and later).
+Requires:       systemd >= 256
+# An app's publisher is its Flatpak remote's URL and signing keys.
+Requires:       gnupg2
 Requires:       dconf
 Requires:       flatpak
 Requires:       polkit
@@ -69,5 +73,10 @@ cd tests && PYTHONPATH=$PWD/..:$PWD %{python3} -m unittest discover -p "test_*.p
 %{_datadir}/luma/sync/
 
 %changelog
+* Sun Nov 22 2026 Project Luma <dev@projectluma.org> - 0.2.0-1.luma.1
+- Security review fixes, wire format 2: signed membership, approvals bound to
+  the joining device's keys, signed bundles with removed devices, zone key
+  generation floor, owner-scoped app zones, fixed 1 MiB blocks with Padmé
+  padding, sealed tombstones, keys sealed with systemd-creds --user.
 * Sun Nov 22 2026 Project Luma <dev@projectluma.org> - 0.1.0-1.luma.1
 - Phase 1 of ADR-054: keys, join, installed apps and closed-app state.

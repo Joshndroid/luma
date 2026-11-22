@@ -2,18 +2,24 @@
 """The five fixes from the architecture review (ARCHITECTURE.md §10), one test each or more."""
 from __future__ import annotations
 
-import io
-import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from harness import tree
+from harness import OWNER, tree
 from test_sync import Base
 
-from luma_connect_sync import appdata, chunking, crypto
+from luma_connect_sync import appdata, crypto
 from luma_connect_sync.account import SyncStateError
+
+
+def target(app: str) -> appdata.Target:
+    return appdata.Target(app, "flatpak", Path("/nonexistent") / app, app, owner=OWNER)
+
+
+def mine(target: appdata.Target, manifest: dict) -> dict:
+    return {"v": 2, "app": target.app, "owner": target.owner, **manifest}
 
 
 class SandboxedCallers(unittest.TestCase):
@@ -51,22 +57,11 @@ class DconfFence(unittest.TestCase):
             self.assertEqual(appdata.allowed_dconf(app), set(), app)
 
     def test_incoming_manifest_paths_are_filtered(self) -> None:
+        editor, desktop = target("org.gnome.TextEditor"), target("org.gnome.desktop")
         manifest = {"files": {}, "dconf": {"/org/gnome/TextEditor/": "[/]\nx=1\n", "/org/gnome/desktop/screensaver/": "[/]\nlock-enabled=false\n",
                                            "/": "[/]\n"}}
-        self.assertEqual(appdata.check_manifest("org.gnome.TextEditor", manifest)["dconf"], {"/org/gnome/TextEditor/": "[/]\nx=1\n"})
-        self.assertEqual(appdata.check_manifest("org.gnome.desktop", {**manifest, "dconf": {"/org/gnome/desktop/": "x"}})["dconf"], {})
-
-
-class KeyedChunks(unittest.TestCase):
-    """3. Chunk boundaries depend on a per-zone secret."""
-
-    def test_boundaries_differ_by_key(self) -> None:
-        data = os.urandom(12 * 1024 * 1024)
-        a = [len(c) for c in chunking.chunks(io.BytesIO(data), b"a" * 32)]
-        b = [len(c) for c in chunking.chunks(io.BytesIO(data), b"b" * 32)]
-        self.assertEqual(sum(a), len(data))
-        self.assertNotEqual(a, b, "the same file cuts differently in another zone or account")
-        self.assertEqual(a, [len(c) for c in chunking.chunks(io.BytesIO(data), b"a" * 32)], "and the same within one")
+        self.assertEqual(appdata.check_manifest(editor, mine(editor, manifest))["dconf"], {"/org/gnome/TextEditor/": "[/]\nx=1\n"})
+        self.assertEqual(appdata.check_manifest(desktop, mine(desktop, {**manifest, "dconf": {"/org/gnome/desktop/": "x"}}))["dconf"], {})
 
 
 class PathRules(unittest.TestCase):
@@ -79,15 +74,20 @@ class PathRules(unittest.TestCase):
         self.assertTrue(appdata.is_excluded("data/keyrings/default.keyring", appdata.excludes()), "sign-ins travel as items, never as the file")
         self.assertFalse(appdata.safe_link("data/l", "/etc/shadow"))
         self.assertFalse(appdata.safe_link("data/l", "../../x"))
-        self.assertTrue(appdata.safe_link("data/l", "../config/x"))
+        self.assertFalse(appdata.safe_link("data/l", "../config/x"), "no '..' in a link at all (review L1)")
+        self.assertTrue(appdata.safe_link("data/l", "config/x"))
+        app = target("org.example.App")
         with self.assertRaises(appdata.SnapshotAborted):
-            appdata.check_manifest("org.example.App", {"files": {"../escape": {"t": "f"}}})
+            appdata.check_manifest(app, mine(app, {"files": {"../escape": {"t": "f"}}}))
         with self.assertRaises(appdata.SnapshotAborted):
-            appdata.check_manifest("org.example.App", {"files": {"l": {"t": "l", "to": "data"}, "l/x": {"t": "f"}}})
+            appdata.check_manifest(app, mine(app, {"files": {"l": {"t": "l", "to": "data"}, "l/x": {"t": "f"}}}))
         with self.assertRaises(appdata.SnapshotAborted):
-            appdata.check_manifest("org.example.App", {"files": {"dev": {"t": "c"}}})
-        kept = appdata.check_manifest("org.example.App", {"files": {"out": {"t": "l", "to": "/home/x/.ssh"}, "in": {"t": "l", "to": "data/a"}}})
+            appdata.check_manifest(app, mine(app, {"files": {"dev": {"t": "c"}}}))
+        kept = appdata.check_manifest(app, mine(app, {"files": {"out": {"t": "l", "to": "/home/x/.ssh"}, "in": {"t": "l", "to": "data/a"}}}))
         self.assertEqual(set(kept["files"]), {"in"}, "a link out of the folder is dropped")
+        # Review L1: a chain of links that each look harmless.
+        chain = appdata.check_manifest(app, mine(app, {"files": {"d1/d2/s": {"t": "l", "to": "../.."}, "d1/d2/l": {"t": "l", "to": "s/../../../x"}}}))
+        self.assertEqual(chain["files"], {})
 
 
 class Applied(Base):
@@ -108,22 +108,11 @@ class Applied(Base):
         self.b.appdata.sync_app(tb, quiet=True)
         self.assertEqual(tree(tb.folder), {"data/ok.txt": b"ok"}, "the link out was neither read nor recreated")
         zone = self.a.engine.zone(ta.zone, create=False)["zone"]
-        hostile = {"v": 1, "app": ta.app, "files": {"../../evil": {"t": "f", "s": 1, "mt": 1, "m": 0o644, "h": "0" * 64, "p": []}}, "dconf": {}}
+        hostile = {"v": 2, "app": ta.app, "owner": ta.owner, "files": {"../../evil": {"t": "f", "s": 1, "mt": 1, "m": 0o644, "h": "0" * 64, "p": []}}, "dconf": {}}
         stored = self.a.appdata.store_manifest(zone, hostile, None)
         with self.assertRaises(appdata.SnapshotAborted):
             self.b.appdata.apply(tb, stored)
         self.assertFalse((self.root / "evil").exists())
-
-    def test_pieces_are_padded(self) -> None:
-        if self.fake is None:
-            self.skipTest("inspects the fake Hub's storage")
-        ta = self.a.target("org.example.Kiln")
-        (ta.folder / "data").mkdir(parents=True)
-        (ta.folder / "data/tiny.txt").write_text("x")
-        (ta.folder / "data/big.bin").write_bytes(os.urandom(5 * 1024 * 1024 + 7))
-        self.a.appdata.sync_app(ta, quiet=True)
-        sizes = [len(b) for z in self.fake.accounts[self.account]["zones"].values() for b in z["blobs"].values()]
-        self.assertTrue(sizes and all(size % (64 * 1024) == 0 for size in sizes), sizes)
 
 
 class Revocation(Base):
