@@ -2,7 +2,7 @@
 
 Name:           luma-application-installer
 Version:        0.1.0
-Release:        1.luma.105%{?dist}
+Release:        1.luma.106%{?dist}
 Summary:        Project Luma universal application package broker
 License:        Apache-2.0
 URL:            https://projectluma.org/applications
@@ -374,6 +374,11 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 %{_unitdir}/timers.target.wants/luma-depot-appstream.timer
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.106
+- SELinux: capsules and store applications may use ~/Music (audio_home_t)
+  with the same rights as the other standard folders (user_home_t). A music
+  player saw the folder and could not list, read or save into it.
+
 * Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.105
 - The keyring broker never lets an application search, read, adopt or
   write entries of Luma's own schemas (org.projectluma.*).

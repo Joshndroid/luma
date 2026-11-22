@@ -35,6 +35,18 @@
     (rangetransition process user_home_t dir ((s0) (s0)))
     (rangetransition process user_home_t file ((s0) (s0)))
     (rangetransition process user_home_t lnk_file ((s0) (s0)))
+    ; Music is the one standard folder with a type of its own in the policy
+    ; (audio_home_t, ~/Music); the others are user_home_t. Without these rules
+    ; a music player saw that ~/Music was there and could not list, read or
+    ; save into it ({ read } and { write } on the dir, { read } on a file).
+    ; The same rights as above, for that type only. Keys, keyrings and browser
+    ; profiles keep their own types and stay refused.
+    (allow process audio_home_t (dir (getattr search open read ioctl lock watch create write add_name remove_name rename reparent rmdir setattr)))
+    (allow process audio_home_t (file (getattr open read write append create unlink rename link lock ioctl map setattr watch)))
+    (allow process audio_home_t (lnk_file (getattr read create unlink rename setattr)))
+    (rangetransition process audio_home_t dir ((s0) (s0)))
+    (rangetransition process audio_home_t file ((s0) (s0)))
+    (rangetransition process audio_home_t lnk_file ((s0) (s0)))
     ; Applications that sandbox their own work (ChatGPT's Codex and Claude's
     ; command runner use bubblewrap; browsers and Flatpak use namespaces too)
     ; build a private root inside the capsule's user namespace: a fresh tmpfs
