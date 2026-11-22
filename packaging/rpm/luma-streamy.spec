@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.10%{?dist}
+Release:        1.luma.11%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -66,8 +66,13 @@ Requires:       gstreamer1-plugin-openh264
 Requires:       xdg-desktop-portal
 # Chat sockets and sign-in (Soup 3 through GObject introspection).
 Requires:       libsoup3
-# SRT destinations.
+# SRT destinations. Not on aarch64: Raspberry Pi 5 replaces bad-free and
+# bad-free-libs with its own build (rpm-ostree override), and Fedora's -extras
+# requires the libs of its own release, so a generic ARM image carrying it
+# cannot take the Pi override (card builds and Pi updates both fail).
+%ifnarch aarch64
 Recommends:     gstreamer1-plugins-bad-free-extras
+%endif
 
 %description
 Streamy puts displays, windows, cameras, images and sound together in scenes
@@ -174,6 +179,10 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sat Nov 21 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.11
+- aarch64: no gstreamer1-plugins-bad-free-extras recommendation; it conflicts
+  with the Raspberry Pi 5 bad-free override
+
 * Sat Nov 21 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.10
 - Hide Streamy from screen capture (app menu, on by default): Streamy's
   windows stay out of display widgets and screen shares through
