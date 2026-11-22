@@ -103,6 +103,7 @@ class StreamyWindow(AppWindow):
                          commands=commands, default_width=1280, default_height=800,
                          minimum_width=360, minimum_height=480)
         self.commands = commands
+        self._apply_capture_hiding()
         style = Path(__file__).resolve().parent.parent / "style" / "streamy.css"
         if not style.is_file():
             style = Path("/usr/share/luma-streamy/streamy.css")
@@ -213,6 +214,8 @@ class StreamyWindow(AppWindow):
                 Command("app.destinations", "Destinations", lambda: self._toggle_panel("destinations"),
                         icon="radio-tower", checked=lambda: self._is_open("destinations")),
                 Command("app.recordings", "Show recordings", self.show_recordings, icon="folder-open"),
+                Command("app.hide-from-capture", "Hide Streamy from screen capture", self.toggle_hide_from_capture,
+                        icon="eye-off", checked=lambda: self.hide_from_capture),
             )),
             CommandGroup("Canvases", tuple(
                 Command(f"view.{key}", label, lambda k=key: self._canvas_command(k),
@@ -718,6 +721,23 @@ class StreamyWindow(AppWindow):
             return data if isinstance(data, dict) else {}
         except (FileNotFoundError, ValueError):
             return {}
+
+    @property
+    def hide_from_capture(self) -> bool:
+        """Whether Streamy keeps its windows out of screen captures (on unless turned off): a display
+        widget showing the display Streamy is on would otherwise fill with copies of Streamy."""
+        return self.settings.get("hide-from-capture", True) is not False
+
+    def toggle_hide_from_capture(self) -> None:
+        self._setting("hide-from-capture", not self.hide_from_capture)
+        self._apply_capture_hiding()
+
+    def _apply_capture_hiding(self) -> None:
+        """Hidden from display shares and screenshots, still shareable as a window (LumaUI API 14)."""
+        try:
+            self.set_hidden_from_capture(self.hide_from_capture)
+        except AttributeError:  # a platform from before window capture hiding: nothing to ask
+            pass
 
     def _setting(self, key: str, value) -> None:
         import json

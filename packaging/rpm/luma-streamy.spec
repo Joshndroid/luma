@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.9%{?dist}
+Release:        1.luma.10%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -174,6 +174,12 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sat Nov 21 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.10
+- Hide Streamy from screen capture (app menu, on by default): Streamy's
+  windows stay out of display widgets and screen shares through
+  AppWindow.set_hidden_from_capture(), so a display widget of Streamy's own
+  display shows no copies of Streamy. No effect on platforms without it.
+
 * Fri Nov 20 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.9
 - Outputs: one encode per canvas and quality, teed to RTMP(S), SRT, WHIP and
   recording rows, each reconnecting on its own; Destinations, Stats and Chat
