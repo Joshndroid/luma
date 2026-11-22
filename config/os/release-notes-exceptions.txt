@@ -30,3 +30,6 @@ sfizz removed The instrument engine is omitted with optional Studio instruments;
 luma-vitals-energy 0.1.0-1.luma.16.fc44 Rebuilt unchanged with luma-vitals 1.luma.16; its payload is identical to 1.luma.15.
 luma-vitals-crash-evidence 0.1.0-1.luma.16.fc44 Rebuilt unchanged with luma-vitals 1.luma.16; its payload is identical to 1.luma.15.
 luma-vitals-power-guard 0.1.0-1.luma.16.fc44 Rebuilt unchanged with luma-vitals 1.luma.16; its payload is identical to 1.luma.15.
+luma-vitals-energy 0.1.0-1.luma.17.fc44 Rebuilt unchanged with luma-vitals 1.luma.17; its payload is identical to 1.luma.16.
+luma-vitals-crash-evidence 0.1.0-1.luma.17.fc44 Rebuilt unchanged with luma-vitals 1.luma.17; its payload is identical to 1.luma.16.
+luma-vitals-memory-guard 0.1.0-1.luma.17.fc44 Rebuilt unchanged with luma-vitals 1.luma.17; its payload is identical to 1.luma.16.

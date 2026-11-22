@@ -24,6 +24,15 @@ while the machine is plugged in.
   and are never overridden.
 - Every switch, and every choice it records, is logged to Vitals:
   `journalctl -t luma-vitals LUMA_VITALS_KIND=power-profile`.
+
+It also keeps the battery floor while plugged in. UPower takes its critical
+action only on battery: a charger that gives less than the machine draws
+counts as mains power, so the battery runs flat and the machine loses power
+without shutting down. Measured on a Fairphone 6 on a laptop's USB port
+(2026-11-22): 5-9 W drawn against 2.5 W supplied, 69 brownouts in one night.
+When every system battery is at 2% or less and discharging, on mains power,
+for a minute, the guard powers off cleanly (logind PowerOff). A phone then
+comes back in charger mode (luma-charger.target) and charges.
 """
 from __future__ import annotations
 
@@ -52,6 +61,15 @@ PROFILES = (
 )
 LOGIN = ("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")
 PROPERTIES = "org.freedesktop.DBus.Properties"
+DEVICE = "org.freedesktop.UPower.Device"
+#: The battery floor on mains power: UPower's own PercentageAction default.
+FLOOR_PERCENT = 2.0
+#: How long the battery must stay at the floor and discharging before the
+#: guard powers off; a charger negotiating or a load spike passes sooner.
+FLOOR_SECONDS = float(os.environ.get("LUMA_POWER_GUARD_FLOOR_SECONDS", "60"))
+#: UPower device Type and State values.
+TYPE_BATTERY = 2
+STATE_CHARGING, STATE_DISCHARGING, STATE_EMPTY = 1, 2, 3
 
 
 def state_path() -> Path:
@@ -59,18 +77,18 @@ def state_path() -> Path:
     return Path(directory) / "state.json"
 
 
-def log(message: str, priority: int = 5, **details) -> None:
+def log(message: str, priority: int = 5, kind: str = "power-profile", **details) -> None:
     """One Vitals event per change; `journalctl -t luma-vitals` shows them."""
     if os.environ.get("LUMA_VITALS_LOG") != "stderr":
         try:
             from systemd import journal  # python3-systemd, when installed
             journal.send(message, SYSLOG_IDENTIFIER="luma-vitals", PRIORITY=priority,
-                         LUMA_VITALS_KIND="power-profile", LUMA_VITALS_UNIT="luma-vitals-power-guard.service",
+                         LUMA_VITALS_KIND=kind, LUMA_VITALS_UNIT="luma-vitals-power-guard.service",
                          LUMA_VITALS_DETAILS=json.dumps(details, sort_keys=True))
             return
         except ImportError:
             pass
-    print(f"<{priority}>power-profile: {message} {json.dumps(details, sort_keys=True)}", file=sys.stderr, flush=True)
+    print(f"<{priority}>{kind}: {message} {json.dumps(details, sort_keys=True)}", file=sys.stderr, flush=True)
 
 
 class Guard:
@@ -196,6 +214,42 @@ class Guard:
         self._set(target, "power returned; restoring the person's choice", active, False)
 
 
+class Floor:
+    """Power off cleanly when the battery runs flat on a charger too weak for the load.
+
+    ``observe`` takes UPower's OnBattery and every system battery as
+    (percentage, state) and answers whether to power off now. On battery
+    UPower's CriticalPowerAction applies, so the floor stays out of it.
+    """
+
+    def __init__(self, clock=time.monotonic) -> None:
+        self.clock = clock
+        self.since: float | None = None
+
+    @staticmethod
+    def at_floor(on_battery: bool, batteries: list[tuple[float, int]]) -> bool:
+        if on_battery or not batteries:
+            return False
+        if any(state == STATE_CHARGING for _p, state in batteries):
+            return False
+        return (all(percentage <= FLOOR_PERCENT for percentage, _s in batteries)
+                and any(state in (STATE_DISCHARGING, STATE_EMPTY) for _p, state in batteries))
+
+    def observe(self, on_battery: bool, batteries: list[tuple[float, int]]) -> bool:
+        if not self.at_floor(on_battery, batteries):
+            if self.since is not None:
+                log("Battery off the floor", 6, kind="battery-floor", batteries=batteries)
+            self.since = None
+            return False
+        now = self.clock()
+        if self.since is None:
+            self.since = now
+            log(f"Battery at {max(p for p, _s in batteries):.0f}% and discharging on mains power; "
+                f"powering off in {FLOOR_SECONDS:.0f} s unless it starts charging", 4,
+                kind="battery-floor", batteries=batteries)
+        return now - self.since >= FLOOR_SECONDS
+
+
 class Bus:
     """Gio glue: three facts in, one switch out, and when to look again."""
 
@@ -204,6 +258,9 @@ class Bus:
         self.Gio, self.GLib = Gio, GLib
         self.conn = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         self.guard = Guard(state_path(), self.switch)
+        self.floor = Floor()
+        self.floor_timer = 0
+        self.powering_off = False
         self.loop = GLib.MainLoop()
 
     def _get(self, target, prop):
@@ -230,6 +287,50 @@ class Bus:
         except self.GLib.Error:
             return None
         return on_battery, str(self._get(target, "ActiveProfile")), bool(self._get(target, "ActiveProfileHolds"))
+
+    def batteries(self) -> list[tuple[float, int]]:
+        name, path, iface = UPOWER
+        reply = self.conn.call_sync(name, path, iface, "EnumerateDevices", None, self.GLib.VariantType("(ao)"),
+                                    self.Gio.DBusCallFlags.NO_AUTO_START, 5000, None)
+        found = []
+        for device in reply.unpack()[0]:
+            target = (name, device, DEVICE)
+            if self._get(target, "Type") != TYPE_BATTERY or not self._get(target, "PowerSupply"):
+                continue
+            if not self._get(target, "IsPresent"):
+                continue
+            found.append((float(self._get(target, "Percentage")), int(self._get(target, "State"))))
+        return found
+
+    def check_floor(self, why: str) -> bool:
+        self.floor_timer = 0
+        if self.powering_off:
+            return False
+        try:
+            on_battery = bool(self._get(UPOWER, "OnBattery"))
+            batteries = self.batteries()
+        except self.GLib.Error:
+            return False
+        if self.floor.observe(on_battery, batteries):
+            self.power_off(batteries, why)
+        elif self.floor.since is not None:
+            # Look again when the minute is up, whether or not UPower reports.
+            self.floor_timer = self.GLib.timeout_add_seconds(
+                max(1, int(FLOOR_SECONDS - (time.monotonic() - self.floor.since)) + 1),
+                self.check_floor, "battery floor timer")
+        return False
+
+    def power_off(self, batteries, why: str) -> None:
+        self.powering_off = True
+        log("Battery empty on a charger that cannot keep up: powering off", 2, kind="battery-floor",
+            batteries=batteries, reason=why)
+        try:
+            name, path, iface = LOGIN
+            self.conn.call_sync(name, path, iface, "PowerOff", self.GLib.Variant("(b)", (False,)), None,
+                                self.Gio.DBusCallFlags.NONE, 25000, None)
+        except self.GLib.Error as error:
+            self.powering_off = False
+            log(f"Powering off failed: {error.message}", 3, kind="battery-floor")
 
     def switch(self, profile: str) -> bool:
         target = self.profiles()
@@ -259,6 +360,11 @@ class Bus:
         self.guard.evaluate(on_battery, active, holds, why)
         return False
 
+    def floor_changed(self, why: str) -> None:
+        if self.floor_timer:
+            self.GLib.source_remove(self.floor_timer)
+        self.check_floor(why)
+
     def run(self) -> int:
         Gio = self.Gio
         none = Gio.DBusSignalFlags.NONE
@@ -266,6 +372,11 @@ class Bus:
         def upower_changed(_c, _s, _p, _i, _m, params):
             if "OnBattery" in params.unpack()[1]:
                 self.sync("power source changed")
+                self.floor_changed("power source changed")
+
+        def device_changed(_c, _s, _p, _i, _m, params):
+            if {"Percentage", "State", "IsPresent"} & set(params.unpack()[1]):
+                self.floor_changed("battery changed")
 
         def profile_changed(_c, _s, _p, _i, _m, params):
             if {"ActiveProfile", "ActiveProfileHolds"} & set(params.unpack()[1]):
@@ -277,6 +388,8 @@ class Bus:
 
         self.conn.signal_subscribe(UPOWER[0], PROPERTIES, "PropertiesChanged", UPOWER[1], UPOWER[2], none,
                                    upower_changed)
+        self.conn.signal_subscribe(UPOWER[0], PROPERTIES, "PropertiesChanged", None, DEVICE, none,
+                                   device_changed)
         for _name, path, iface in PROFILES:
             self.conn.signal_subscribe(None, PROPERTIES, "PropertiesChanged", path, iface, none, profile_changed)
         self.conn.signal_subscribe(LOGIN[0], LOGIN[2], "PrepareForSleep", LOGIN[1], None, none, sleep)
@@ -284,6 +397,8 @@ class Bus:
         for name in [UPOWER[0]] + [p[0] for p in PROFILES]:
             Gio.bus_watch_name_on_connection(self.conn, name, Gio.BusNameWatcherFlags.NONE,
                                              lambda *_a, n=name: self.sync(f"{n} appeared"), None)
+        Gio.bus_watch_name_on_connection(self.conn, UPOWER[0], Gio.BusNameWatcherFlags.NONE,
+                                         lambda *_a: self.floor_changed("UPower appeared"), None)
         self.GLib.unix_signal_add(self.GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.loop.quit)
         self.GLib.unix_signal_add(self.GLib.PRIORITY_DEFAULT, signal.SIGINT, self.loop.quit)
         self.GLib.idle_add(self.sync, "started")

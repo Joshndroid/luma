@@ -71,7 +71,7 @@ class PowerGuardTest(unittest.TestCase):
 
     def start_guard(self):
         env = dict(os.environ, DBUS_SYSTEM_BUS_ADDRESS=self.address, STATE_DIRECTORY=str(self.tmp / "state"),
-                   LUMA_VITALS_LOG="stderr")
+                   LUMA_VITALS_LOG="stderr", LUMA_POWER_GUARD_FLOOR_SECONDS="1")
         with open(self.guard_log, "a") as log:
             self.guard = subprocess.Popen([sys.executable, str(GUARD)], env=env,
                                           stderr=log, stdout=subprocess.DEVNULL)
@@ -261,6 +261,42 @@ class PowerGuardTest(unittest.TestCase):
             self.plug_in()
         self.assertEqual(self.active(), "balanced", "a hold was remembered as the person's choice")
         self.assertEqual(self.guard_sets(), [])
+
+    # --- the battery floor on mains power ------------------------------------
+
+    def power_offs(self):
+        return self.fake_call("PowerOffs", None, "(u)").unpack()[0]
+
+    def battery(self, percentage, state):
+        self.fake_call("SetBattery", GLib.Variant("(du)", (percentage, state)))
+
+    def test_flat_on_a_weak_charger_powers_off_cleanly(self):
+        self.start_fake("ac", "balanced")
+        self.start_guard()
+        self.battery(2.0, 2)  # discharging at 2% while plugged in
+        self.wait_log("powering off in 1 s unless it starts charging")
+        self.wait_log("Battery empty on a charger that cannot keep up: powering off")
+        self.assertEqual(self.power_offs(), 1)
+
+    def test_the_floor_ignores_a_dip_charging_and_battery_power(self):
+        self.start_fake("ac", "balanced")
+        self.start_guard()
+        self.battery(1.0, 2)
+        self.wait_log("powering off in 1 s")
+        self.battery(1.0, 1)  # the charger caught up
+        self.wait_log("Battery off the floor")
+        time.sleep(1.5)
+        self.assertEqual(self.power_offs(), 0, "powered off while charging")
+        with self.after("power source changed"):
+            self.unplug()
+        self.battery(1.0, 2)  # on battery, UPower's critical action applies
+        time.sleep(1.5)
+        self.assertEqual(self.power_offs(), 0, "powered off on battery, where UPower acts")
+        self.battery(3.0, 2)
+        with self.after("power source changed"):
+            self.plug_in()
+        time.sleep(1.5)
+        self.assertEqual(self.power_offs(), 0, "powered off above the floor")
 
 
 if __name__ == "__main__":

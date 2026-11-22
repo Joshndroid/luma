@@ -1,0 +1,465 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MPL-2.0
+"""luma-charger: a phone charging while it is off.
+
+Measured on a Fairphone 6 (2026-11-22): left on a laptop's USB-C port with a
+flat battery, the bootloader powered it on 69 times overnight because a
+charger was present (androidboot.mode=charger). Each time the whole phone
+came up, drew 5-9 W against the 2.5 W the port gave it, and browned out 27
+minutes later. Phones expect a charger boot to charge.
+
+luma-charger-generator makes luma-charger.target the default target of that
+boot, and this service is all that runs in it. It behaves the way Android's
+charger mode does:
+
+- the battery level is shown for a few seconds on the boot splash, then the
+  display is switched off;
+- a press of the power key shows it again; holding the key for two seconds
+  starts the phone (the full boot), unless the battery is still too low;
+- when the charger has been gone for ten seconds the phone powers off;
+- the modem, Wi-Fi and compute processors are stopped while it charges (the
+  audio DSP stays: it runs the charger), and restarted for the full boot.
+"""
+from __future__ import annotations
+
+import errno
+import fcntl
+import json
+import os
+import select
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+KEY_POWER = 116
+EV_KEY = 1
+EVIOCGRAB = 0x40044590
+#: Android's charger starts the phone after the key is held this long.
+LONG_PRESS_SECONDS = 2.0
+SHOW_SECONDS = 4.0
+#: Android's charger powers off when the charger has been gone this long.
+UNPLUGGED_SECONDS = 10.0
+#: A fallback for a power supply that sends no change events.
+POLL_SECONDS = 60.0
+#: The battery appears once the charger firmware is up.
+BATTERY_WAIT_SECONDS = 90.0
+#: A charger that gives less than even this boot draws (a port that never
+#: enumerated the phone gives 0.5 W): power off cleanly at the power guard's
+#: floor rather than brown out. Off, the PMIC charges on its own.
+FLOOR_PERCENT = 2
+FLOOR_SECONDS = 60.0
+#: Below this a full boot would only drain the battery to the power guard's
+#: floor (2%) and turn the phone off again.
+START_MIN_PERCENT = 3
+#: Remote processors that do nothing for a phone that is off. The audio DSP
+#: (adsp) is never stopped: on Qualcomm phones it runs the charger and USB-C.
+IDLE_PROCESSORS = ("modem", "mpss", "wpss", "cdsp")
+EXTERNAL_TYPES = ("Mains", "USB", "Wireless")
+NETLINK_KOBJECT_UEVENT = 15
+EVENT = struct.Struct("llHHi")
+
+
+def sysfs() -> Path:
+    return Path(os.environ.get("LUMA_CHARGER_SYSFS", "/sys"))
+
+
+def log(message: str, priority: int = 6, **details) -> None:
+    """Journal lines from stdout; LUMA_VITALS_KIND=charger in the details."""
+    details = json.dumps(dict(details, kind="charger"), sort_keys=True)
+    print(f"<{priority}>{message} {details}", flush=True)
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def write(path: Path, value: str) -> bool:
+    try:
+        path.write_text(value)
+        return True
+    except OSError:
+        return False
+
+
+class Supplies:
+    """The power_supply class: the phone's battery and whether a charger is in."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root / "class" / "power_supply"
+
+    def _each(self):
+        try:
+            entries = sorted(self.root.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            # A peripheral's own battery (a pen, a headset) has scope Device.
+            if read(entry / "scope") == "Device":
+                continue
+            yield entry, read(entry / "type")
+
+    def battery(self) -> tuple[int | None, str] | None:
+        """(capacity, status) of the system battery, or None without one."""
+        for entry, kind in self._each():
+            if kind != "Battery" or read(entry / "present") == "0":
+                continue
+            text = read(entry / "capacity")
+            capacity = int(text) if text.lstrip("-").isdigit() else None
+            return capacity, read(entry / "status") or "Unknown"
+        return None
+
+    def external(self) -> bool:
+        for entry, kind in self._each():
+            if (kind in EXTERNAL_TYPES or kind.startswith("USB")) and read(entry / "online") == "1":
+                return True
+        return False
+
+
+def message(battery: tuple[int | None, str] | None, too_low: bool = False) -> str:
+    if battery is None or battery[0] is None:
+        return "Charging"
+    capacity, status = battery
+    if too_low:
+        return f"{capacity}% · Charge a little longer to start"
+    if status == "Full" or capacity >= 100:
+        return "Charged · 100%"
+    if status == "Charging":
+        return f"Charging · {capacity}%"
+    return f"{capacity}%"
+
+
+class Screen:
+    """The boot splash for the level; the display off the rest of the time.
+
+    Plymouth is quit, not hidden, between showings: a hidden plymouthd with
+    the display blanked kept a core at 95% on the FP6.
+    """
+
+    PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.plymouth = shutil.which("plymouth", path=self.PATH)
+        self.plymouthd = shutil.which("plymouthd", path=self.PATH)
+        self.lit = True
+
+    def _run(self, *argv: str) -> bool:
+        try:
+            return subprocess.run(argv, timeout=5, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _splash(self) -> bool:
+        """The splash on screen, starting plymouthd as plymouth-start does."""
+        if not (self.plymouth and self.plymouthd):
+            return False
+        if not self._run(self.plymouth, "--ping"):
+            self._run(self.plymouthd, "--mode=boot", "--pid-file=/run/plymouth/pid", "--attach-to-session")
+        return self._run(self.plymouth, "show-splash")
+
+    def _blank(self, value: str) -> None:
+        # fbdev blanking switches the display pipeline and the panel off
+        # (FB_BLANK_POWERDOWN), not just the backlight.
+        done = False
+        for fb in sorted((self.root / "class" / "graphics").glob("fb[0-9]*")):
+            done = write(fb / "blank", value) or done
+        if not done:
+            for light in sorted((self.root / "class" / "backlight").glob("*")):
+                write(light / "bl_power", value)
+
+    def _light(self) -> None:
+        if not self.lit:
+            self._blank("0")
+            self.lit = True
+
+    def show(self, text: str) -> None:
+        self._light()
+        if self._splash():
+            self._run(self.plymouth, "display-message", f"--text={text}")
+
+    def off(self) -> None:
+        if self.plymouth and self._run(self.plymouth, "--ping"):
+            self._run(self.plymouth, "quit")
+            # Blanking before plymouthd has let go of the display is undone
+            # when the console takes it back.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and self._run(self.plymouth, "--ping"):
+                time.sleep(0.1)
+            time.sleep(0.5)
+        self._blank("4")
+        self.lit = False
+
+    def booting(self) -> None:
+        """The splash stays up for the full boot, which quits it at the login screen."""
+        self._light()
+        if self._splash():
+            self._run(self.plymouth, "display-message", "--text=")
+
+
+class Processors:
+    """Idle remote processors, stopped for the charger and restarted for the phone.
+
+    What was stopped is kept in /run, so a restarted service still restarts it.
+    """
+
+    def __init__(self, root: Path, record: Path | None = None) -> None:
+        self.root = root / "class" / "remoteproc"
+        self.record = record or Path(os.environ.get("LUMA_CHARGER_RECORD", "/run/luma-charger.stopped"))
+
+    def _stopped(self) -> list[str]:
+        return read(self.record).split()
+
+    def stop_idle(self) -> None:
+        stopped = self._stopped()
+        for entry in sorted(self.root.glob("remoteproc*")):
+            name = read(entry / "name")
+            if name in IDLE_PROCESSORS and read(entry / "state") == "running":
+                if write(entry / "state", "stop"):
+                    stopped.append(entry.name)
+                    write(self.record, " ".join(dict.fromkeys(stopped)) + "\n")
+                    log(f"Stopped {name} while charging", 7, processor=name)
+
+    def restart(self) -> None:
+        for name in self._stopped():
+            entry = self.root / name
+            if read(entry / "state") != "running" and not write(entry / "state", "start"):
+                log(f"Could not restart {read(entry / 'name')}", 4, processor=read(entry / "name"))
+        try:
+            self.record.unlink()
+        except OSError:
+            pass
+
+
+def has_key(bitmap: str, code: int, word_bits: int = struct.calcsize("l") * 8) -> bool:
+    """A capabilities/key bitmap from sysfs: hex words, most significant first."""
+    words = bitmap.split()
+    index, bit = divmod(code, word_bits)
+    return len(words) > index and bool(int(words[-1 - index], 16) >> bit & 1)
+
+
+def power_keys(root: Path) -> list[int]:
+    """Open every input device that has a power key."""
+    fds = []
+    for entry in sorted((root / "class" / "input").glob("event[0-9]*")):
+        if not has_key(read(entry / "device" / "capabilities" / "key"), KEY_POWER):
+            continue
+        try:
+            fd = os.open(f"/dev/input/{entry.name}", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as error:
+            log(f"Cannot read {entry.name}: {error.strerror}", 4)
+            continue
+        # The key is the charger's alone: systemd-logind, started on demand
+        # by a login, would otherwise power the phone off on a short press.
+        try:
+            fcntl.ioctl(fd, EVIOCGRAB, 1)
+        except OSError as error:
+            log(f"Cannot take {entry.name} for the charger: {error.strerror}", 4)
+        fds.append(fd)
+    return fds
+
+
+def uevents() -> socket.socket | None:
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT)
+        sock.bind((0, 1))
+        sock.setblocking(False)
+        return sock
+    except OSError:
+        return None
+
+
+def default_target() -> str:
+    """The target this boot would have had without the charger generator."""
+    for path in ("/etc/systemd/system/default.target", "/usr/lib/systemd/system/default.target"):
+        try:
+            name = os.path.basename(os.readlink(path))
+        except OSError:
+            continue
+        if name.endswith(".target") and name != "luma-charger.target":
+            return name
+    return "graphical.target"
+
+
+def systemctl(*args: str) -> None:
+    subprocess.run(["systemctl", "--no-block", *args], check=False)
+
+
+class Charger:
+    def __init__(self, root: Path, clock=time.monotonic, record: Path | None = None) -> None:
+        self.supplies = Supplies(root)
+        self.screen = Screen(root)
+        self.processors = Processors(root, record)
+        self.root = root
+        self.clock = clock
+        self.hide_at: float | None = None
+        self.held_since: float | None = None
+        self.unplugged_since: float | None = None
+        self.floor_since: float | None = None
+
+    def show(self, too_low: bool = False) -> None:
+        battery = self.supplies.battery()
+        self.screen.show(message(battery, too_low))
+        self.hide_at = self.clock() + SHOW_SECONDS
+
+    def start_phone(self, why: str) -> None:
+        battery = self.supplies.battery()
+        log(f"Starting the phone ({why})", 5, battery=battery, reason=why)
+        self.screen.booting()
+        self.processors.restart()
+        systemctl("isolate", default_target())
+
+    def power_off(self) -> None:
+        log("Charger removed: powering off", 5, battery=self.supplies.battery())
+        systemctl("poweroff")
+
+    def key(self, down: bool) -> None:
+        """A power key press shows the level; tick() acts on a long one."""
+        if not down:
+            self.held_since = None
+        elif self.held_since is None:
+            self.held_since = self.clock()
+            self.show()
+
+    def tick(self) -> str | None:
+        """Deadlines: 'start', 'off' or 'empty' end the charger."""
+        now = self.clock()
+        # The kernel boots the modem on its own, often after this service
+        # started (FP6: modem up ~25 s into a charger boot), so look each time.
+        self.processors.stop_idle()
+        if self.held_since is not None and now - self.held_since >= LONG_PRESS_SECONDS:
+            self.held_since = None
+            battery = self.supplies.battery()
+            if battery and battery[0] is not None and battery[0] < START_MIN_PERCENT:
+                log("Power key held: battery too low to start", 5, battery=battery)
+                self.show(too_low=True)
+            else:
+                return "start"
+        battery = self.supplies.battery()
+        if (battery and battery[0] is not None and battery[0] <= FLOOR_PERCENT
+                and battery[1] == "Discharging"):
+            if self.floor_since is None:
+                self.floor_since = now
+                log("Battery at the floor and discharging on the charger", 4, battery=battery)
+            elif now - self.floor_since >= FLOOR_SECONDS:
+                return "empty"
+        else:
+            self.floor_since = None
+        if self.supplies.external():
+            self.unplugged_since = None
+        elif self.unplugged_since is None:
+            self.unplugged_since = now
+        elif now - self.unplugged_since >= UNPLUGGED_SECONDS:
+            return "off"
+        if self.hide_at is not None and now >= self.hide_at and self.held_since is None:
+            self.hide_at = None
+            self.screen.off()
+        return None
+
+    def timeout(self) -> float:
+        now = self.clock()
+        deadlines = [now + POLL_SECONDS]
+        if self.hide_at is not None:
+            deadlines.append(self.hide_at)
+        if self.held_since is not None:
+            deadlines.append(self.held_since + LONG_PRESS_SECONDS)
+        if self.unplugged_since is not None:
+            deadlines.append(self.unplugged_since + UNPLUGGED_SECONDS)
+        if self.floor_since is not None:
+            deadlines.append(self.floor_since + FLOOR_SECONDS)
+        return max(0.05, min(deadlines) - now)
+
+    def wait_for_battery(self, sock) -> bool:
+        deadline = self.clock() + BATTERY_WAIT_SECONDS
+        while self.supplies.battery() is None:
+            left = deadline - self.clock()
+            if left <= 0:
+                return False
+            if sock is not None:
+                ready, _, _ = select.select([sock], [], [], min(left, 2.0))
+                if ready:
+                    drain(sock)
+            else:
+                time.sleep(min(left, 1.0))
+        return True
+
+    def run(self) -> int:
+        sock = uevents()
+        if not self.wait_for_battery(sock):
+            # Nothing to charge: this is no phone on a charger.
+            self.start_phone("no battery")
+            return 0
+        battery = self.supplies.battery()
+        log("Charging while off", 5, battery=battery, external=self.supplies.external())
+        self.processors.stop_idle()
+        keys = power_keys(self.root)
+        self.show()
+        while True:
+            fds = keys + ([sock] if sock is not None else [])
+            try:
+                ready, _, _ = select.select(fds, [], [], self.timeout())
+            except InterruptedError:
+                ready = []
+            for fd in ready:
+                if fd is sock:
+                    drain(sock)
+                    continue
+                for down in key_events(fd):
+                    self.key(down)
+            outcome = self.tick()
+            if outcome == "start":
+                for fd in keys:
+                    os.close(fd)
+                self.start_phone("power key held")
+                return 0
+            if outcome == "off":
+                self.power_off()
+                return 0
+            if outcome == "empty":
+                log("Battery empty on a charger that cannot keep up: powering off", 2,
+                    battery=self.supplies.battery())
+                systemctl("poweroff")
+                return 0
+
+
+def drain(sock: socket.socket) -> None:
+    while True:
+        try:
+            sock.recv(16384)
+        except BlockingIOError:
+            return
+        except OSError as error:
+            if error.errno in (errno.ENOBUFS, errno.EINTR):
+                continue
+            return
+
+
+def key_events(fd: int):
+    while True:
+        try:
+            data = os.read(fd, EVENT.size * 32)
+        except BlockingIOError:
+            return
+        except OSError:
+            return
+        if not data:
+            return
+        for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _s, _u, kind, code, value = EVENT.unpack_from(data, offset)
+            if kind == EV_KEY and code == KEY_POWER and value in (0, 1):
+                yield value == 1
+
+
+def main() -> int:
+    return Charger(sysfs()).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

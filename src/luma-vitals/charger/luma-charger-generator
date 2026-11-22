@@ -1,0 +1,33 @@
+#!/bin/sh
+# SPDX-License-Identifier: MPL-2.0
+#
+# A phone's bootloader powers it on when a charger is plugged into it while
+# it is off, and says so on the kernel command line: androidboot.mode=charger
+# (Qualcomm ABL, MediaTek LK and most other Android bootloaders). That boot is
+# for charging, not for the phone: make luma-charger.target the default
+# target, so it charges with the screen off and nothing else running until the
+# power key is held or the charger comes out. Every other boot is untouched.
+#
+# luma.charger=0 on the command line, an explicit systemd.unit= and rescue or
+# emergency boots keep the normal default. $SYSTEMD_PROC_CMDLINE replaces
+# /proc/cmdline, as it does for systemd's own generators.
+set -euf
+
+early=${2:-}
+[ -n "$early" ] || exit 0
+if [ -n "${SYSTEMD_PROC_CMDLINE+set}" ]; then
+  cmdline=$SYSTEMD_PROC_CMDLINE
+else
+  read -r cmdline </proc/cmdline || exit 0
+fi
+
+charger=0
+for word in $cmdline; do
+  case "$word" in
+    androidboot.mode=charger) charger=1 ;;
+    luma.charger=0|systemd.unit=*|rescue|emergency|single|s|S|1) exit 0 ;;
+  esac
+done
+[ "$charger" -eq 1 ] || exit 0
+
+ln -sf /usr/lib/systemd/system/luma-charger.target "$early/default.target"

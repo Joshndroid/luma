@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MPL-2.0
+[Unit]
+Description=Charging while off: battery level, power key and charger removal
+Documentation=https://projectluma.org/vitals
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target plymouth-start.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/luma-charger
+# Root: it blanks the display, stops and restarts remote processors and asks
+# PID 1 to power off or start the full boot. Nothing else is reachable.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryMax=64M

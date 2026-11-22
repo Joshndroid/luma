@@ -12,6 +12,8 @@ methods live on org.luma.Test:
   Resume()                emit PrepareForSleep(false)
   Hold(s) / Release()     an application holding a profile
   Sets() -> a(ss)         every ActiveProfile write so far: (sender, profile)
+  SetBattery(d, u)        the battery's Percentage and State, with a signal
+  PowerOffs() -> u        how many times logind's PowerOff was called
 """
 import sys
 import warnings
@@ -23,25 +25,41 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 XML = """
 <node>
-  <interface name="org.freedesktop.UPower"><property name="OnBattery" type="b" access="read"/></interface>
+  <interface name="org.freedesktop.UPower">
+    <property name="OnBattery" type="b" access="read"/>
+    <method name="EnumerateDevices"><arg type="ao" direction="out"/></method>
+  </interface>
+  <interface name="org.freedesktop.UPower.Device">
+    <property name="Type" type="u" access="read"/>
+    <property name="PowerSupply" type="b" access="read"/>
+    <property name="IsPresent" type="b" access="read"/>
+    <property name="Percentage" type="d" access="read"/>
+    <property name="State" type="u" access="read"/>
+  </interface>
   <interface name="%s">
     <property name="ActiveProfile" type="s" access="readwrite"/>
     <property name="ActiveProfileHolds" type="aa{sv}" access="read"/>
     <property name="Profiles" type="aa{sv}" access="read"/>
   </interface>
-  <interface name="org.freedesktop.login1.Manager"><signal name="PrepareForSleep"><arg type="b"/></signal></interface>
+  <interface name="org.freedesktop.login1.Manager">
+    <signal name="PrepareForSleep"><arg type="b"/></signal>
+    <method name="PowerOff"><arg type="b" direction="in"/></method>
+  </interface>
   <interface name="org.luma.Test">
     <method name="SetOnBattery"><arg type="b" direction="in"/><arg type="b" direction="in"/></method>
     <method name="Resume"/>
     <method name="Hold"><arg type="s" direction="in"/></method>
     <method name="Release"/>
     <method name="Sets"><arg type="a(ss)" direction="out"/></method>
+    <method name="SetBattery"><arg type="d" direction="in"/><arg type="u" direction="in"/></method>
+    <method name="PowerOffs"><arg type="u" direction="out"/></method>
   </interface>
 </node>
 """
 PROFILE_OBJECTS = (("org.freedesktop.UPower.PowerProfiles", "/org/freedesktop/UPower/PowerProfiles"),
                    ("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles"))
 PROPS = "org.freedesktop.DBus.Properties"
+BATTERY = "/org/freedesktop/UPower/devices/battery_BAT0"
 
 
 class Fake:
@@ -50,6 +68,8 @@ class Fake:
         self.base = profile
         self.hold = None
         self.sets = []
+        self.percentage, self.state = 80.0, 1 if not on_battery else 2
+        self.power_offs = 0
 
     def holds(self):
         if not self.hold:
@@ -69,7 +89,11 @@ class Fake:
             self.conn.emit_signal(None, path, PROPS, "PropertiesChanged",
                                   GLib.Variant("(sa{sv}as)", (iface, changed, [])))
 
-    def get(self, _c, _s, _p, iface, prop):
+    def get(self, _c, _s, path, iface, prop):
+        if iface == "org.freedesktop.UPower.Device":
+            return {"Type": GLib.Variant("u", 2), "PowerSupply": GLib.Variant("b", True),
+                    "IsPresent": GLib.Variant("b", True), "Percentage": GLib.Variant("d", self.percentage),
+                    "State": GLib.Variant("u", self.state)}.get(prop)
         if prop == "OnBattery":
             return GLib.Variant("b", self.on_battery)
         if prop == "ActiveProfile":
@@ -110,6 +134,20 @@ class Fake:
         elif method == "Release":
             self.hold = None
             self.emit_profile("ActiveProfile", "ActiveProfileHolds")
+        elif method == "EnumerateDevices":
+            invocation.return_value(GLib.Variant("(ao)", ([BATTERY],)))
+            return
+        elif method == "SetBattery":
+            self.percentage, self.state = params.unpack()
+            self.conn.emit_signal(None, BATTERY, PROPS, "PropertiesChanged",
+                                  GLib.Variant("(sa{sv}as)", ("org.freedesktop.UPower.Device",
+                                                              {"Percentage": GLib.Variant("d", self.percentage),
+                                                               "State": GLib.Variant("u", self.state)}, [])))
+        elif method == "PowerOff":
+            self.power_offs += 1
+        elif method == "PowerOffs":
+            invocation.return_value(GLib.Variant("(u)", (self.power_offs,)))
+            return
         elif method == "Sets":
             invocation.return_value(GLib.Variant("(a(ss))", (self.sets,)))
             return
@@ -128,6 +166,8 @@ def main():
          "org.freedesktop.UPower.PowerProfiles"),
         ("/net/hadess/PowerProfiles", "net.hadess.PowerProfiles", "net.hadess.PowerProfiles"),
         ("/org/luma/Test", "org.luma.Test", "net.hadess.PowerProfiles"),
+        (BATTERY, "org.freedesktop.UPower.Device", "net.hadess.PowerProfiles"),
+        ("/org/freedesktop/login1", "org.freedesktop.login1.Manager", "net.hadess.PowerProfiles"),
     ]
     for path, iface, profiles_iface in registrations:
         info = Gio.DBusNodeInfo.new_for_xml(XML % profiles_iface).lookup_interface(iface)

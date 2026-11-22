@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MPL-2.0
+# The default target of a boot the bootloader started because a charger was
+# plugged in (luma-charger-generator). Only sysinit.target and luma-charger:
+# no session, Shell, modem, IMS, Android, network, timers or sockets.
+[Unit]
+Description=Charging while off
+Documentation=https://projectluma.org/vitals
+Requires=sysinit.target
+Wants=luma-charger.service
+After=sysinit.target
+Conflicts=rescue.service rescue.target
+AllowIsolate=yes

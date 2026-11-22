@@ -2,7 +2,7 @@
 
 Name:           luma-vitals
 Version:        0.1.0
-Release:        1.luma.16%{?dist}
+Release:        1.luma.17%{?dist}
 Summary:        What every application and service costs, and when one misbehaves
 License:        Apache-2.0 AND MPL-2.0
 URL:            https://projectluma.org/vitals
@@ -24,6 +24,9 @@ Requires:       %{name}-memory-guard = %{version}-%{release}
 # Performance must not stay on when the charger comes out (ADR-046 §5); on a
 # machine without a battery the guard never switches anything.
 Requires:       %{name}-power-guard = %{version}-%{release}
+# A phone the bootloader powers on for a charger charges instead of starting;
+# anywhere else the generator finds no androidboot.mode=charger and does nothing.
+Requires:       %{name}-charger = %{version}-%{release}
 # A laptop's battery report is only complete with the processor's own energy
 # counters, which no session may read; a machine without a battery loses
 # nothing by having it, and the service stops itself where there is no RAPL.
@@ -121,6 +124,30 @@ hold alone. It switches only through the power-profiles D-Bus API, so the
 power mode control always shows the truth, and records every change it makes
 as a Luma Vitals event.
 
+It also powers the machine off cleanly when every battery has stayed at 2% or
+less and discharging for a minute while plugged in, on a charger that gives
+less than the machine draws. UPower acts only on battery, so without this the
+battery runs flat and the machine loses power without shutting down.
+
+%package charger
+Summary:        Charge a phone that was off instead of starting it
+License:        MPL-2.0
+Requires:       python3 >= 3.11
+Requires:       systemd
+
+%description charger
+When a charger is plugged into a phone that is off, its bootloader powers it
+on and tells the kernel (androidboot.mode=charger). A generator then boots
+luma-charger.target instead of the session: no Shell, modem, IMS, Android or
+network. The battery level is shown on the boot splash for a few seconds and
+on each press of the power key, and the display is off otherwise. Holding the
+power key for two seconds starts the phone; when the charger has been gone
+for ten seconds the phone powers off, and so it does, cleanly, when the
+battery stays at 2% and discharging for a minute on a charger too weak even
+for this. The modem, Wi-Fi and compute processors are stopped while it
+charges. Every other boot, and every machine without
+that bootloader flag, is untouched.
+
 %package crash-evidence
 Summary:        Keep the evidence of why a Luma machine last stopped
 Requires:       python3 >= 3.11
@@ -164,10 +191,20 @@ ln -s ../luma-vitals-power-guard.service %{buildroot}%{_unitdir}/multi-user.targ
 %check
 PYTHONPATH=$PWD %{python3} -m unittest discover -s tests -p "test_*.py" -v >unit.log 2>&1 || { cat unit.log; exit 1; }
 cat unit.log
-# A runner that reaches no tests exits 0 too: the power guard's ten, run
+# A runner that reaches no tests exits 0 too: the power guard's twelve, run
 # against a fake UPower and profiles service, must each have passed.
 guard_ok=$(grep -c '(test_power_guard\.PowerGuardTest\.test_[a-z_]*) \.\.\. ok$' unit.log || :)
-[ "$guard_ok" -eq 10 ] || { echo "power guard: 10 tests must pass, $guard_ok did" >&2; exit 1; }
+[ "$guard_ok" -eq 12 ] || { echo "power guard: 12 tests must pass, $guard_ok did" >&2; exit 1; }
+grep -q '(test_charger\.ChargerTest\.test_charger_removed_powers_off_after_ten_seconds) \.\.\. ok$' unit.log
+grep -q '(test_charger\.GeneratorTest\.test_charger_boot_defaults_to_the_charger_target) \.\.\. ok$' unit.log
+test -x %{buildroot}%{_prefix}/lib/systemd/system-generators/luma-charger-generator
+test -x %{buildroot}%{_libexecdir}/luma-charger
+%{python3} -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' %{buildroot}%{_libexecdir}/luma-charger
+grep -qx 'Requires=sysinit.target' %{buildroot}%{_unitdir}/luma-charger.target
+# The charger boot must not reach the session, the network or timers.
+if grep -nE '^(Wants|Requires)=.*(basic|multi-user|graphical|network)' %{buildroot}%{_unitdir}/luma-charger.target; then exit 1; fi
+# The audio DSP runs the charger on Qualcomm phones: never stopped.
+grep -qx 'IDLE_PROCESSORS = ("modem", "mpss", "wpss", "cdsp")' %{buildroot}%{_libexecdir}/luma-charger
 for slice in app.slice luma-background.slice; do
   grep -qx 'ManagedOOMSwap=kill' %{buildroot}%{_userunitdir}/$slice.d/60-luma-oomd-swap.conf
 done
@@ -271,6 +308,13 @@ if [ "$1" -eq 0 ]; then /usr/sbin/semodule -r luma_oomd; fi
 %{_prefix}/lib/sysctl.d/60-luma-memory.conf
 %{_datadir}/selinux/packages/luma_oomd.cil
 
+%files charger
+%license LICENSE.md
+%{_libexecdir}/luma-charger
+%{_prefix}/lib/systemd/system-generators/luma-charger-generator
+%{_unitdir}/luma-charger.target
+%{_unitdir}/luma-charger.service
+
 %files crash-evidence
 %license LICENSE.md
 %{_libexecdir}/luma-crash-evidence
@@ -285,6 +329,16 @@ if [ "$1" -eq 0 ]; then /usr/sbin/semodule -r luma_oomd; fi
 %{_prefix}/lib/bootc/kargs.d/60-luma-crash-evidence.toml
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.17
+- Add luma-vitals-charger: a boot with androidboot.mode=charger gets
+  luma-charger.target (sysinit only); the level on the boot splash, display
+  off otherwise, power key shows it, a 2 s hold starts the phone from 3%, the
+  phone powers off 10 s after the charger is removed or after 60 s at 2% and
+  discharging, and the modem, Wi-Fi and compute processors are stopped while
+  it charges
+- power-guard: power off cleanly when every system battery stays at 2% or
+  less and discharging on mains power for 60 s
+
 * Sat Nov 07 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.16
 - Memory policy for apps: warn about an app holding a quarter of memory or
   growing fast, with Close and Keep Open; hold a growing app the person is not

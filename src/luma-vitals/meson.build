@@ -29,6 +29,15 @@ install_data('power-guard/luma-vitals-power-guard', install_dir: get_option('lib
 install_data('power-guard/luma-vitals-power-guard.service',
              install_dir: get_option('prefix') / 'lib/systemd/system')
 
+# Charger mode: system-wide, packaged as luma-vitals-charger. A boot the
+# bootloader started for a charger (androidboot.mode=charger) gets
+# luma-charger.target instead of the session.
+install_data('charger/luma-charger', install_dir: get_option('libexecdir'), install_mode: 'rwxr-xr-x')
+install_data('charger/luma-charger-generator', install_dir: get_option('prefix') / 'lib/systemd/system-generators',
+             install_mode: 'rwxr-xr-x')
+install_data('charger/luma-charger.target', 'charger/luma-charger.service',
+             install_dir: get_option('prefix') / 'lib/systemd/system')
+
 # Crash evidence (ADR-026 §6): system-wide, packaged as luma-vitals-crash-evidence.
 prefix_lib = get_option('prefix') / 'lib'
 install_data('crash-evidence/luma-crash-evidence', install_dir: get_option('libexecdir'),
