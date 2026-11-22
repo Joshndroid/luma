@@ -1,0 +1,63 @@
+From: Project Luma <luma@local>
+Subject: [PATCH] power: supply: qcom_battmgr: derive SM8350 power_now from voltage and current
+
+The SM8350-protocol firmware's BATT_POWER_NOW property has no defined
+unit and the driver passes it through as microwatts. On the Fairphone 6
+(milos, SM7635) it reads ten times the battery's voltage times its
+current: over 100 s of charging, power_now averaged 60.5 W while
+voltage_now x current_now averaged 5.93 W. UPower takes power_now as the
+energy rate, so its rate, time to empty and time to full were all wrong.
+
+Read the battery voltage and current when power_now is asked for and
+report their product, which is right whatever unit a firmware build uses.
+The SC8280XP and X1E80100 paths are unchanged.
+---
+ drivers/power/supply/qcom_battmgr.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -14,6 +14,7 @@
+ #include <linux/soc/qcom/pdr.h>
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include <linux/math.h>
++#include <linux/math64.h>
+ #include <linux/units.h>
+ 
+ #define BATTMGR_CHEMISTRY_LEN	4
+@@ -463,7 +464,20 @@
+ 	prop = sm8350_bat_prop_map[psp];
+ 
+ 	mutex_lock(&battmgr->lock);
+-	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
++	if (psp == POWER_SUPPLY_PROP_POWER_NOW) {
++		/*
++		 * BATT_POWER_NOW has no defined unit: the milos (SM7635)
++		 * firmware reports ten times voltage times current. Derive the
++		 * power from the voltage and current it reports instead.
++		 */
++		ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++						    BATT_VOLT_NOW, 0);
++		if (!ret)
++			ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++							    BATT_CURR_NOW, 0);
++	} else {
++		ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
++	}
+ 	mutex_unlock(&battmgr->lock);
+ 
+ 	return ret;
+@@ -562,7 +576,11 @@
+ 		val->intval = battmgr->status.current_now;
+ 		break;
+ 	case POWER_SUPPLY_PROP_POWER_NOW:
+-		val->intval = battmgr->status.power_now;
++		if (battmgr->variant == QCOM_BATTMGR_SM8350)
++			val->intval = div_s64((s64)battmgr->status.voltage_now *
++					      battmgr->status.current_now, MICRO);
++		else
++			val->intval = battmgr->status.power_now;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+ 		if (unit != QCOM_BATTMGR_UNIT_mAh)

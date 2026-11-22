@@ -25,7 +25,7 @@
 
 Name:           kernel-modules-luma-fp6
 Version:        7.1.2
-Release:        1.luma.ims1.gmu2.selinux1.8%{?dist}
+Release:        1.luma.ims1.gmu2.selinux1.9%{?dist}
 Summary:        Kernel modules for the Fairphone 6 kernel
 License:        GPL-2.0-only
 URL:            https://github.com/SimplyLuma/linux/tree/luma-fp6-alpha1-7.1.2-luma-fp-ims1.gmu2.selinux1
@@ -110,6 +110,11 @@ done
 %{_prefix}/lib/luma/device-boot/fairphone-fp6/
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 7.1.2-1.luma.ims1.gmu2.selinux1.9
+- Build the kernel with patches 0041 (UFS powered down in system suspend),
+  0042 (touch controller reset before its interrupt is unmasked) and 0043
+  (battery power_now from voltage times current) and carry its boot image
+
 * Wed Nov 18 2026 Project Luma <maintainers@projectluma.org> - 7.1.2-1.luma.ims1.gmu2.selinux1.8
 - Ship directories 0755 and files world-readable. selinux1.7 kept the build
   host's 2750/0770 modes, so luma-android could not read the GPU admission

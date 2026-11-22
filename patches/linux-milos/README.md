@@ -161,3 +161,12 @@ code, so the kernel release and `kernel-modules-luma-fp6` are unchanged.
 - `0042`: the EPH861x driver left the touch controller running with its
   interrupt masked during suspend and unmasked it again on resume. It now
   pulses the reset line first, as the vendor driver's wake path does.
+
+## Battery power
+
+- `0043`: the FP6 battery firmware reports `power_now` at ten times voltage
+  times current (60.5 W against 5.93 W measured over 100 s of charging), and
+  UPower uses it as the energy rate. For SM8350-protocol firmware the driver
+  now reports voltage times current. The driver is shared by every
+  pmic-glink phone SoC (SM8350 and later, milos), so the same commit goes to
+  the shared kernel base; it only touches built-in code.
