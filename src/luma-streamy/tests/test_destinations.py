@@ -25,6 +25,8 @@ class DestinationTest(unittest.TestCase):
 
     def test_urls(self):
         self.assertEqual(new("twitch").url("abc"), "rtmps://live.twitch.tv/app/abc")
+        self.assertEqual(new("restream").url("re_1"), "rtmp://live.restream.io/live/re_1")
+        self.assertTrue(new("restream").is_stream)
         row = new("custom")
         row.server = "srt://example.org:9000?streamid=x"
         self.assertEqual(row.url("ignored"), "srt://example.org:9000?streamid=x")

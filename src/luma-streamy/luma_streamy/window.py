@@ -777,10 +777,14 @@ class StreamyWindow(AppWindow):
 
     def _update_preview_running(self) -> None:
         """The program runs while the window is shown or something is sent; otherwise nothing captures."""
+        from .engine import log
+
         visible = self._on_screen()
         if not visible and not self.engine.outputs and self.engine.running:
+            log("the window is off screen and nothing is sent: the program rests")
             self.engine.stop()
         elif visible and not self.engine.running and getattr(self, "_tick", 0):
+            log("the window is on screen: the program runs")
             self._start_engine()  # shown again (the first start is _start_engine's own, at idle)
 
     def _fill_fake_sources(self) -> None:
@@ -806,12 +810,16 @@ class StreamyWindow(AppWindow):
     def _ask_missing_sources(self) -> None:
         """The scene's sources without a capture reconnect, one at a time: each from its restore token,
         silently. One that brought up a picker (it took a person's answer) stops the walk; the rest wait
-        for "Share" in the bar. Nothing is asked while the session is locked."""
+        for "Share" in the bar. Nothing is asked while the session is locked (cameras, which ask nothing,
+        still open)."""
         scene = self.project.active_scene
-        if scene is None or self.fake or self.portals is None or getattr(self, "locked", False):
+        if scene is None or self.fake or self.portals is None:
             return
-        wanted = [w for w in scene.widgets if w.kind in ("display", "window", "camera", "app-audio") and w.visible
-                  and w.id not in self.portals.captures and w.id not in self.widget_errors]
+        # While locked only cameras open: they ask nothing, and they aren't paused by a lock.
+        kinds = ("camera",) if getattr(self, "locked", False) else ("display", "window", "camera", "app-audio")
+        wanted = [w for w in scene.widgets if w.kind in kinds and w.visible
+                  and w.id not in self.portals.captures and w.id not in self.widget_errors
+                  and w.id not in getattr(self, "_camera_opening", set())]
         # Only what restores without a picker starts by itself (a camera, a share with its restore token);
         # the rest say "Needs sharing again" and wait for Share in the bar: no picker pops up on its own.
         silent = [w for w in wanted if w.kind == "camera" or w.source.get("restore-token")]
@@ -980,14 +988,23 @@ class StreamyWindow(AppWindow):
             self._widget_failed(None, widget.id, reason)
 
         if widget.kind == "camera":
+            if not hasattr(self, "_camera_opening"):
+                self._camera_opening: set[str] = set()
+            self._camera_opening.add(widget.id)
+
             def opened(capture) -> None:
+                self._camera_opening.discard(widget.id)
                 camera = getattr(capture, "camera", None)
                 if camera is not None:
                     widget.source["camera"] = camera.name  # remembered by its stable node name
                     widget.source["device-name"] = camera.label
                 done(capture)
 
-            self.portals.camera(widget.id, done=opened, failed=failed, name=widget.source.get("camera"))
+            def not_opened(reason: str) -> None:
+                self._camera_opening.discard(widget.id)
+                failed(reason)
+
+            self.portals.camera(widget.id, done=opened, failed=not_opened, name=widget.source.get("camera"))
             return
         token = widget.source.get("restore-token") if restore else None
         if widget.kind == "app-audio":
@@ -1083,11 +1100,16 @@ class StreamyWindow(AppWindow):
         return "Try again"
 
     def _widget_waiting(self, _engine, widget_id: str) -> None:
+        if self._recovering_now(widget_id) and self.portals is not None and widget_id in self.portals.captures:
+            # Recovering from a restart, its stream opened but nothing comes: open it again.
+            self._widget_failed(None, widget_id, "stopped")
+            return
         self.widget_waiting.add(widget_id)
         self.refresh_all()
         self._show_scene()
 
     def _widget_ready(self, _engine, widget_id: str) -> None:
+        getattr(self, "_recovering", {}).pop(widget_id, None)
         if widget_id in self.widget_waiting:
             self.widget_waiting.discard(widget_id)
             self.refresh_all()
@@ -1235,8 +1257,9 @@ class StreamyWindow(AppWindow):
 
         if reason in ("missing", "stopped", "nocamera") and self.device_missing(w):
             reason = "unplugged"  # it reconnects by itself (_sync_unplugged)
-        elif getattr(self, "locked", False) and reason in ("ended", "stopped", "missing", "timeout", "unshared"):
-            reason = "paused"  # it comes back after unlock
+        elif getattr(self, "locked", False) and w.kind != "camera" and \
+                reason in ("ended", "stopped", "missing", "timeout", "unshared"):
+            reason = "paused"  # it comes back after unlock (a camera isn't paused: it asks nothing)
         log(f"{w.kind} widget {w.name!r}: {self.cause_line(w, reason)} ({reason})")
         self.widget_waiting.discard(widget_id)
         self.widget_errors[widget_id] = reason
@@ -2355,33 +2378,65 @@ class StreamyWindow(AppWindow):
         self._refresh_bar()
         self._regrow("source")
 
+    #: After the camera service restarted (or a camera came back on a new node), a camera that fails or
+    #: sends nothing is opened again: its new node may not be ready, or Streamy's access to it not set
+    #: up yet, the first time. Up to RECOVER_TRIES times within RECOVER_S, RECOVER_GAP_S apart.
+    RECOVER_S, RECOVER_TRIES, RECOVER_GAP_S = 30.0, 6, 1.0
+
+    def _recover(self, widget_id: str) -> None:
+        if not hasattr(self, "_recovering"):
+            self._recovering: dict[str, list] = {}
+        self._recovering[widget_id] = [time.monotonic() + self.RECOVER_S, 0, 0.0]
+
+    def _recovering_now(self, widget_id: str) -> bool:
+        """Still recovering, and a try is due (not too soon after the last)."""
+        state = getattr(self, "_recovering", {}).get(widget_id)
+        now = time.monotonic()
+        if state is None or now > state[0] or state[1] >= self.RECOVER_TRIES:
+            return False
+        return now - state[2] >= self.RECOVER_GAP_S
+
     def _follow_cameras(self) -> None:
         """A camera on another node now (its service restarted, or it was plugged in again) opens again on
-        it by itself: a stream on the old node shows nothing more, and one that ended is worth another try
-        only on a new node (the same node failing again would only fail again)."""
+        it by itself: a stream on the old node shows nothing more. One that ended is worth another try on
+        a new node, or while it recovers from a restart (the same node failing again otherwise would only
+        fail again). Cameras open while the session is locked too: they ask nothing."""
         if self.portals is None or self.fake or self.portals.cameras is None:
             return
         from .engine import log
 
-        shown = {w.id for w in self.project.active_scene.widgets} if self.project.active_scene else set()
+        shown = {w.id for w in self.project.active_scene.widgets if w.visible} if self.project.active_scene else set()
+        opening = getattr(self, "_camera_opening", set())
         changed = False
         for w in [w for scene in self.project.scenes for w in scene.widgets if w.kind == "camera"]:
             camera = self.portals.cameras.find(w.source.get("camera"))
-            if camera is None:
+            if camera is None or w.id in opening:
                 continue
             capture = self.portals.captures.get(w.id)
+            reason = self.widget_errors.get(w.id)
+            recovering = w.id in shown and self._recovering_now(w.id)
             if capture is not None:
                 if capture.node == camera.target:
                     continue
-            elif self.widget_errors.get(w.id) not in ("missing", "stopped", "nocamera") or \
-                    self.portals.last_node.get(w.id) == camera.target:
+                why = "is on a new node"
+            elif reason in ("missing", "stopped", "nocamera") and self.portals.last_node.get(w.id) != camera.target:
+                why = "is on a new node"
+            elif reason in ("missing", "stopped", "nocamera", None) and recovering:
+                why = "is back after a restart"
+            else:
                 continue
-            log(f"camera widget {w.name!r}: {camera.label} is on a new node; opening it again")
+            state = getattr(self, "_recovering", {}).get(w.id)
+            if why == "is on a new node" and state is None:
+                self._recover(w.id)
+            state = self._recovering[w.id] if w.id in getattr(self, "_recovering", {}) else None
+            if state is not None:
+                state[1], state[2] = state[1] + 1, time.monotonic()
+            log(f"camera widget {w.name!r}: {camera.label} {why}; opening it again")
             self.widget_errors.pop(w.id, None)
             self.widget_waiting.discard(w.id)
             self.portals.close(w.id)
             self.engine._remove_branch(w.id)
-            if w.id in shown and not getattr(self, "locked", False):
+            if w.id in shown:
                 self._choose_source(w, restore=True)
             changed = True
         if changed:
@@ -2394,6 +2449,9 @@ class StreamyWindow(AppWindow):
         self.devices.restart()
         cameras = self.portals.cameras if self.portals is not None else None
         if hasattr(cameras, "reopen"):
+            for w in self.project.active_scene.widgets if self.project.active_scene else []:
+                if w.kind == "camera":
+                    self._recover(w.id)
             cameras.reopen(f"{unit} started again")
 
     #: Why the camera list is empty, in words.
@@ -2438,8 +2496,8 @@ class StreamyWindow(AppWindow):
     def _refresh_bar(self) -> None:
         """The bar: the selection (its chip and quick actions) on the left when there is one, then always
         the two outputs. Record becomes "Stop recording" with its running time while recording; Go live
-        becomes "End stream" with the LIVE time and bitrate while live (or "Add a destination" when no
-        stream row would go live). Each runs on its own; both can run together."""
+        becomes "End stream" with the LIVE time and bitrate while live, and is there only when a stream
+        row would go live (adding one lives in Destinations). Each runs on its own; both can run together."""
         items: list = []
         live = self.stream_state != "off"
         w = self._selected_widget()
@@ -2506,8 +2564,6 @@ class StreamyWindow(AppWindow):
             items.append(BarAction("square", "End stream", danger=True, primary=True, on_activate=self.ask_end_stream))
         elif self._streams_ready():
             items.append(BarAction("radio-tower", "Go live", primary=True, on_activate=self.go_live))
-        else:
-            items.append(BarAction("plus", "Add a destination", primary=True, on_activate=self.add_destination))
         self._sync_canvas_state()
         self._sync_output_title()
         if more is not None:

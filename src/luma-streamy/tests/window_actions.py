@@ -291,7 +291,7 @@ def inspector(win) -> None:
 
 def outputs(win) -> None:
     """The bar's own keys, pressed: Record shows Stop recording at once and Stop ends it (three times);
-    Go live with no stream destination is "Add a destination" and opens the Destinations + menu."""
+    with no stream destination there is no Go live key, and no key for adding one."""
     import time
 
     shown = []
@@ -318,7 +318,7 @@ def outputs(win) -> None:
             assert "Record" in labels(), labels()
             print("record: no encoder here; Record stays", labels())
             break
-        assert "Stop recording" in labels() and "Go live" in labels() or "Add a destination" in labels(), labels()
+        assert "Stop recording" in labels(), labels()
         pump(1.0)
         key("Stop recording").on_activate()
         started = time.monotonic()
@@ -334,18 +334,11 @@ def outputs(win) -> None:
     picture = next(w for w in scene.widgets if w.has_picture)
     win.select(picture.id)
     pump(0.1)
-    assert "Record" in labels() and ("Go live" in labels() or "Add a destination" in labels()), labels()
+    assert "Record" in labels() and ("Go live" in labels()) == win._streams_ready(), labels()
     win.select(None)
-    if not win._streams_ready():
-        grown = []
-        grow = win.center.grow
-        win.center.grow = lambda name=None, *a, **kw: (grown.append(name), grow(name, *a, **kw))[1]
-        key("Add a destination").on_activate()
-        pump(0.2)
-        win.center.grow = grow
-        assert "add-destination" in grown, grown
-        win.center.fold()
-        print("go live with no destination: Add a destination opens the + menu")
+    win._refresh_bar()
+    assert "Add a destination" not in labels(), labels()
+    print("bar: outputs only, never a key for adding a destination")
     win.center.show_bar = show_bar
 
 

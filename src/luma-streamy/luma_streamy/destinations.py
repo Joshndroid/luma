@@ -21,6 +21,7 @@ PLATFORMS: dict[str, tuple[str, str, str, str, int, int]] = {
     "youtube": ("YouTube", "rtmps://a.rtmps.youtube.com/live2", "key", "youtube", 8000, 160),
     "kick": ("Kick", "", "key", "kick", 6000, 160),
     "tiktok": ("TikTok", "", "key", "tiktok", 6000, 128),
+    "restream": ("Restream", "rtmp://live.restream.io/live", "key", "restream", 6000, 160),
     "custom": ("Custom", "", "key", "server", 6000, 160),
     "record": ("Recording", "", "file", "circle", 12000, 192),
 }

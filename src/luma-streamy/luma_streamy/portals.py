@@ -542,6 +542,7 @@ class CameraWatch:
             if self._missing_since.pop(name, None) is not None and not self._missing_since:
                 self._recheck_s = RECHECK_S
                 self._cancel("recheck")
+                self._cancel("confirm")  # it is back: nothing to confirm
             return False
         now = time.monotonic()
         since = self._missing_since.setdefault(name, now)

@@ -3,7 +3,7 @@
 
 A row shows the platform's logo, the account or name, the canvas it takes (a chip that switches
 it), an on/off switch and its status in words. Adding and editing happen in the action bar's editor:
-Twitch and YouTube sign in (accounts.py); Kick, TikTok and Custom take a server and a stream key;
+Twitch and YouTube sign in (accounts.py); Kick, TikTok, Restream and Custom take a server and a stream key;
 the recording takes a format, a canvas and a folder. Keys and sign-ins live in the keyring (Secret
 schema org.projectluma.Streamy.Destination, attributes account = the row's id, kind).
 
@@ -38,7 +38,7 @@ SECRET_SCHEMA = "org.projectluma.Streamy.Destination"
 KEY, SIGN_IN = "stream-key", "oauth"
 CANVAS_ICONS = {"landscape": "rectangle-horizontal", "vertical": "smartphone"}
 #: What "Add" offers, in order.
-ADDABLE = ("twitch", "youtube", "kick", "tiktok", "custom")
+ADDABLE = ("twitch", "youtube", "kick", "tiktok", "restream", "custom")
 
 
 def logos_dir() -> Path:
@@ -338,7 +338,7 @@ class DestinationsPanel(Gtk.Box):
             body.append(sign_in_box)
         if row.platform == "custom":
             fields.append(("Name", name))
-        if row.platform in ("custom", "kick", "tiktok") or row.signs_in:
+        if row.is_stream:
             fields += [("Server", server), ("Stream key", key)]
         fields.append(("Canvas", canvas))
 
