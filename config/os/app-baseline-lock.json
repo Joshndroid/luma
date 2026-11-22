@@ -2,10 +2,10 @@
   "schema": "org.projectluma.os-app-baseline-lock/v1",
   "baselines": {
     "aarch64": {
-      "manifest_sha256": "5e6f33226a4686138b20012a5bcc0d20ff8a420f321cb1b23116ed32105e5606"
+      "manifest_sha256": "00ae5f5adfc887cd9b559f6431bbc94dbdcf9ab6d6b118ed8a336d798a266de0"
     },
     "x86_64": {
-      "manifest_sha256": "7d4d9308af9f58850dda2cd33a91b148d44c5a0bbfdd109c3266b7d71d82832b"
+      "manifest_sha256": "5c1960126cfa0b944e252f0436a71762ea3ce07a5a011a5f7bad2b16d097ed55"
     }
   },
   "applications": {
@@ -91,15 +91,11 @@
     },
     "org.projectluma.Depot": {
       "commits": {
-        "aarch64": "1cd72f20b14324743c1d768391c86ffc2ce27d01ea8d4622849f41f54f512209",
-        "x86_64": "f377886e3b98d347d5e84b2a35c957c1601961d1320904dd7e60ef780b5ecc23"
+        "aarch64": "3840cf0ad63bfcedda5ef0b1de340147dbe2c2b0490702763afd14fd741853b5",
+        "x86_64": "dc623400dec6c6b0b8f5cbbd364b30000914c0a36f4311f678b88ffe1a502827"
       },
-      "source_sha256": "f1a11d654a1d28273fe0c5494fee680cd56febacdb93be90fcc506b037742fd0",
-      "version": "0.1.5",
-      "pending": {
-        "reason": "only the host-side capsule keyring broker changed (luma-application-installer 1.luma.105: capsule_secrets refuses org.projectluma.* schemas, app_host_compatibility floor); the app does not run it, the next Depot rebuild carries it",
-        "expires": "2026-11-25"
-      }
+      "source_sha256": "0f0817a00a5587bd3889a145ce1b44cf7c940bde7f016e7ed4e5e524690be12d",
+      "version": "0.1.7"
     },
     "org.projectluma.Imager": {
       "commits": {

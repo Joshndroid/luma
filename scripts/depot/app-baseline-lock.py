@@ -12,6 +12,9 @@ this repository (tests excluded) plus the Flatpak recipe.
       Fail when an application's source no longer matches the fingerprint of
       its baseline bundle (the source changed but the bundle was not rebuilt),
       or when its version differs from its metainfo. Runs in source checks.
+      A "pending" hold ({"reason", "expires", "source_sha256"}) excuses one
+      unrebuilt source until it expires: the fingerprint it names. Any later
+      change to that application's source fails again.
 
   app-baseline-lock.py fingerprint [APP_ID...]
       Print the current source fingerprints.
@@ -132,7 +135,12 @@ def check(repo, today=None):
             except ValueError:
                 expires = None
             if expires and today < expires and hold.get('reason'):
-                print(f'PENDING {app_id}: {hold["reason"]} (until {expires})')
+                if hold.get('source_sha256') == current:
+                    print(f'PENDING {app_id}: {hold["reason"]} (until {expires})')
+                    continue
+                failures.append(
+                    f'{app_id}: its pending hold covers source {hold.get("source_sha256") or "(none named)"}, '
+                    f'not the current {current}; rebuild it or renew the hold for this source')
                 continue
         failures.append(
             f'{app_id}: source changed since its baseline bundle was built '

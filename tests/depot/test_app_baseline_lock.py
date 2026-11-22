@@ -77,10 +77,24 @@ class Lock(unittest.TestCase):
     def test_pending_rebuild_expires(self):
         clock = self.repo / 'src/prairie-core/prairie_apps/clock.py'
         clock.write_text(clock.read_text() + '\n# changed\n')
-        self.row['pending'] = {'reason': 'rebuild in progress', 'expires': '2026-11-16'}
+        self.row['pending'] = {'reason': 'rebuild in progress', 'expires': '2026-11-16',
+                               'source_sha256': self.lock.fingerprint(self.repo, APP)}
         self.write_lock()
         self.assertTrue(self.lock.check(self.repo, today=datetime.date(2026, 11, 15)))
         self.assertFalse(self.lock.check(self.repo, today=datetime.date(2026, 11, 16)))
+
+    def test_pending_hold_covers_only_the_source_it_names(self):
+        clock = self.repo / 'src/prairie-core/prairie_apps/clock.py'
+        clock.write_text(clock.read_text() + '\n# changed\n')
+        held = self.lock.fingerprint(self.repo, APP)
+        self.row['pending'] = {'reason': 'rebuild in progress', 'expires': '2026-11-16'}
+        self.write_lock()
+        self.assertFalse(self.lock.check(self.repo, today=datetime.date(2026, 11, 15)))
+        self.row['pending']['source_sha256'] = held
+        self.write_lock()
+        self.assertTrue(self.lock.check(self.repo, today=datetime.date(2026, 11, 15)))
+        clock.write_text(clock.read_text() + '\n# changed again\n')
+        self.assertFalse(self.lock.check(self.repo, today=datetime.date(2026, 11, 15)))
 
     def test_image_build_refuses_an_unpinned_baseline(self):
         baseline = self.repo / 'baseline'
