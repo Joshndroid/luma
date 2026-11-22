@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import sys
 import threading
 import time
 import weakref
@@ -51,6 +52,50 @@ def _stop_engines() -> None:
     interpreter finalizes; a GL thread still at work when Mesa unloads crashes the process."""
     for engine in list(_engines):
         engine.stop(wait=5.0)
+    # Then nothing GL may outlive the interpreter: a GL context still alive when libEGL's destructor runs
+    # is torn down by it, and llvmpipe rasterizes its last scene while the driver is being unloaded.
+    # Everything is NULL by now, so it all goes here, on the main thread.
+    global _gl_display
+    _dropping.clear()
+    _gl_display = None
+    import gc
+
+    gc.collect()
+    if os.environ.get("STREAMY_STOP_TRACE"):
+        try:
+            names = [open(f"/proc/self/task/{t}/comm").read().strip() for t in os.listdir("/proc/self/task")]
+        except OSError:
+            names = []
+        log(f"at exit: {names.count('gstglcontext')} GL context threads left")
+
+
+#: Elements and pipelines leaving the program, held until the main loop finds itself their only owner.
+_dropping: list[Gst.Element] = []
+
+
+def _drop_on_main(elements: list[Gst.Element]) -> None:
+    """Let ``elements`` go on the main thread. GTK's paintable sink holds GDK objects that may only be
+    dropped there (dropped elsewhere, it aborts the process), and a pipeline disposed on a close thread
+    could still be disposing GL elements when a quit exits. Whatever else still holds them (the old
+    pipeline going NULL on a close thread, a pool stop, a reference cycle the collector could free on a
+    streaming thread), the last reference is this list's, released from the main loop once they are out
+    of their pipeline and nothing else refers to them. At a quit they are simply never released (all NULL)."""
+    if not _dropping:
+        GLib.timeout_add(250, _release_dropped)
+    _dropping.extend(elements)
+
+
+def _release_dropped() -> bool:
+    i = 0
+    while i < len(_dropping):
+        element = _dropping[i]
+        # References: the list, the name ``element`` and getrefcount's own argument.
+        if element.get_parent() is None and element.__grefcount__ == 1 and sys.getrefcount(element) <= 3:
+            del _dropping[i]
+        else:
+            i += 1
+        element = None  # the last one goes here, on the main thread
+    return bool(_dropping)
 
 
 class Teardown:
@@ -260,6 +305,8 @@ class Branch:
     #: (Engine._redraw) instead of waiting for the source's next frame, which a still window sends
     #: only as a keepalive.
     last: Gst.Buffer | None = None
+    #: Out of the program: a late probe keeps no picture (its GPU memory would hold a GL context).
+    closed: bool = False
 
     def frame(self, fmt: str = "landscape") -> Gst.Element | None:
         layer = self.layers.get(fmt)
@@ -677,7 +724,8 @@ class Engine(GObject.Object):
             GLib.idle_add(lambda: [pipeline.remove(e) for e in elements if e.get_parent() is pipeline] and False)
 
         self._call_async(pipeline, stop, items)
-        program.paintable = None
+        _drop_on_main(program.preview)
+        program.preview, program.paintable, program.sink_pad = [], None, None
         self.emit("preview-changed", fmt)
 
     # ── The program pipeline ──
@@ -685,15 +733,21 @@ class Engine(GObject.Object):
     def _call_async(self, pipeline: Gst.Pipeline, func, data) -> None:
         """``func(pipeline, data)`` on GStreamer's pool, counted by the teardown a quit waits for."""
         what = func.__qualname__.replace("Engine.", "").replace(".<locals>", "")
+        # ``func`` and ``data`` (and everything their closures hold) are let go before the stop counts as
+        # done: an element released after it would be disposed while a quit no longer waits.
+        held = [func, data]
 
-        def run(p, d) -> None:
+        def run(p, holder) -> None:
             try:
-                func(p, d)
+                call, items = holder
+                holder.clear()
+                call(p, items)
             finally:
+                call = items = None
                 self._teardown.end(what)
 
         self._teardown.begin(what)
-        pipeline.call_async(run, data)
+        pipeline.call_async(run, held)
 
     def start(self, project: Project) -> None:
         """Show ``project``'s active scene. The pipeline itself exists only while something
@@ -722,6 +776,8 @@ class Engine(GObject.Object):
         # dropped: no branch stops on its own while the mixers it feeds are torn down.
         branches = list(self.branches.values()) + list(self.placeholders.values())
         self.branches, self.placeholders = {}, {}
+        for branch in branches:
+            branch.closed, branch.last = True, None  # its GPU memory would keep a GL context alive
         self._placeholder_words.clear()
         self._revs.clear()
         self._applied_rev.clear()
@@ -751,19 +807,29 @@ class Engine(GObject.Object):
             for element in program.preview:
                 element.set_locked_state(True)
                 element.set_state(Gst.State.NULL)
+            _drop_on_main(program.preview)  # the old pipeline may well go on the close thread
+            program.preview, program.paintable, program.sink_pad = [], None, None
         self.pipeline = None
         # Off the window's thread: a source still stuck opening holds its state lock, and the
         # pipeline's own NULL waits on it. Nothing here needs the old pipeline any more.
-        def close() -> None:
+        # The close thread lets the pipeline go before it counts as done; the last reference is the main
+        # thread's (_drop_on_main), so the pipeline is never disposed on a thread a quit no longer waits for.
+        held = [pipeline]
+        _drop_on_main([pipeline])
+        del pipeline
+
+        def close(holder) -> None:
             try:
-                pipeline.set_state(Gst.State.NULL)
+                old = holder.pop()
+                old.set_state(Gst.State.NULL)
                 for device in devices:
                     GLib.idle_add(self._released, device)
             finally:
+                old = None
                 self._teardown.end("close")
 
         self._teardown.begin("close")
-        threading.Thread(target=close, name="streamy-close", daemon=True).start()
+        threading.Thread(target=close, args=(held,), name="streamy-close", daemon=True).start()
         self._sound = False
         self._sound_tap = []
         for fmt in programs:
@@ -1136,10 +1202,13 @@ class Engine(GObject.Object):
         if widget.has_picture:
             for fmt in self.programs:
                 self._add_layer(branch, fmt, widget, zorder)
+            # Probes hold their branch weakly: a branch held by a probe on its own pads is a cycle through
+            # GStreamer the collector never sees, and its elements (and their GL objects) would never go.
             elements[-1].get_static_pad("sink").add_probe(
-                Gst.PadProbeType.BUFFER, self._first_picture, (branch, widget))
+                Gst.PadProbeType.BUFFER, self._first_picture, (weakref.ref(branch), widget))
             if not branch.still:
-                elements[-1].get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._keep_last, branch)
+                elements[-1].get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._keep_last,
+                                                              weakref.ref(branch))
         else:
             self._sync_monitor(branch, widget)
         # State changes run on GStreamer's thread pool: a source that takes its time
@@ -1150,7 +1219,7 @@ class Engine(GObject.Object):
             branch.watchdog = GLib.timeout_add_seconds(FIRST_PICTURE_S, self._no_picture, branch)
         if not self.fake and widget.kind in ("display", "window", "camera"):
             elements[0].get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._source_buffer,
-                                                        {"branch": branch, "seen": None})
+                                                        {"branch": weakref.ref(branch), "seen": None})
         alpha = next((e for e in elements if e.get_name().endswith("-alpha")), None)
         if alpha is not None:
             strict = widget.id not in self._no_alpha
@@ -1160,8 +1229,10 @@ class Engine(GObject.Object):
             self._trace(branch, elements)
 
     @staticmethod
-    def _keep_last(_pad: Gst.Pad, info: Gst.PadProbeInfo, branch: Branch) -> Gst.PadProbeReturn:
-        branch.last = info.get_buffer()
+    def _keep_last(_pad: Gst.Pad, info: Gst.PadProbeInfo, ref) -> Gst.PadProbeReturn:
+        branch = ref()
+        if branch is not None and not branch.closed:
+            branch.last = info.get_buffer()
         return Gst.PadProbeReturn.OK
 
     def _redraw(self, frame: Gst.Element) -> None:
@@ -1196,6 +1267,9 @@ class Engine(GObject.Object):
             if pad in self._supersede_probes:
                 return
             self._supersede_probes.add(pad)
+        # One probe per mixer pad for its life, never removed from a streaming thread: GStreamer frees a
+        # removed probe's Python closure while that thread holds the pad's lock, and the mixer's thread,
+        # holding the GIL in _samples_selected, takes the same lock to set the pad's geometry (a deadlock).
         pad.add_probe(Gst.PadProbeType.BUFFER, self._superseded, None)
 
     def _superseded(self, pad: Gst.Pad, info: Gst.PadProbeInfo, _data) -> Gst.PadProbeReturn:
@@ -1205,23 +1279,25 @@ class Engine(GObject.Object):
             if buffer is None or revision is None or buffer.offset < revision:
                 return Gst.PadProbeReturn.OK
             del self._superseding[pad]
-            self._supersede_probes.discard(pad)
         while True:
             waiting = pad.peek_buffer()
             if waiting is None or waiting.offset >= revision or not pad.drop_buffer():
                 break
-        return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK
 
     def _source_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo, state: dict) -> Gst.PadProbeReturn:
         """What a capture actually sends: its caps and, for a window cast, the crop region the window
         is in. The first is logged; a crop that changes (the window resized) is applied and reported."""
+        branch = state["branch"]()
+        if branch is None:
+            return Gst.PadProbeReturn.OK
         buffer = info.get_buffer()
         caps = pad.get_current_caps()
         if buffer is None or caps is None:
             return Gst.PadProbeReturn.OK
         state["n"] = state.get("n", 0) + 1
         if state["seen"] is not None:
-            if not state["branch"].widget_id.startswith("window"):
+            if not branch.widget_id.startswith("window"):
                 return Gst.PadProbeReturn.REMOVE  # only a window's crop region changes as it goes
             if state["n"] % 10:
                 return Gst.PadProbeReturn.OK  # a window resized shows within a third of a second
@@ -1231,7 +1307,6 @@ class Engine(GObject.Object):
         seen = (width, height, crop)
         if seen != state["seen"]:
             state["seen"] = seen
-            branch = state["branch"]
             if state.get("logged") is None:
                 state["logged"] = True
                 log(f"widget {branch.widget_id}: {caps.to_string()[:160]}; crop meta {crop or 'none'}")
@@ -1438,6 +1513,7 @@ class Engine(GObject.Object):
             self._applied_rev.pop(pad, None)
             self._pad_widget.pop(pad, None)
             self._superseding.pop(pad, None)
+            self._supersede_probes.discard(pad)
 
     def _samples_selected(self, mixer, _segment, pts, _dts, _duration, _info, program: Program) -> None:
         """The mixer's thread, before it composites a frame: each layer's pad takes the geometry of
@@ -1573,7 +1649,10 @@ class Engine(GObject.Object):
                 raise EngineError(f"{a.get_name()} does not link to {b.get_name()}")
 
     def _first_picture(self, _pad, _info, data) -> Gst.PadProbeReturn:
-        branch, widget = data
+        ref, widget = data
+        branch = ref()
+        if branch is None:
+            return Gst.PadProbeReturn.REMOVE
         branch.shown = True
         GLib.idle_add(self._fade_in, branch, widget)
         return Gst.PadProbeReturn.REMOVE
@@ -1677,7 +1756,7 @@ class Engine(GObject.Object):
         pipeline. A sound mixer goes only once no stopping branch still feeds it."""
         branch = self.branches.pop(widget_id, None)
         if branch is not None:
-            branch.last = None
+            branch.closed, branch.last = True, None
         if branch is None or self.pipeline is None:
             return
         self._drop_monitor(branch)

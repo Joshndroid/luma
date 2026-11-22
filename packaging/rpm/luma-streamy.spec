@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.12%{?dist}
+Release:        1.luma.13%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -149,6 +149,9 @@ HOME=$PWD/check-home XDG_DATA_HOME=$PWD/check-home/data XDG_CONFIG_HOME=$PWD/che
   XDG_CACHE_HOME=$PWD/check-home/cache PYTHONPATH=%{buildroot}%{python3_sitelib} \
   timeout 150 xvfb-run -a -s "-screen 0 1920x1080x24" dbus-run-session -- \
   env GDK_BACKEND=x11 GSK_RENDERER=cairo python3 -B tests/window_actions.py
+# A preview leaving the program lets GTK's sink go on the main thread (elsewhere it aborts).
+PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 120 xvfb-run -a -s "-screen 0 1920x1080x24" \
+  env GDK_BACKEND=x11 GSK_RENDERER=cairo python3 -B tests/engine_preview_teardown.py
 for width in 360 1280; do
   HOME=$PWD/check-home XDG_DATA_HOME=$PWD/check-home/data XDG_CONFIG_HOME=$PWD/check-home/config \
     XDG_CACHE_HOME=$PWD/check-home/cache STREAMY_FAKE_SOURCES=1 STREAMY_SHOT_DELAY=15000 STREAMY_SHOT_TRIES=120 \
@@ -179,6 +182,11 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.13
+- A preview leaving the program (a canvas hidden, the program closing) lets
+  GTK's paintable sink go on the main thread; dropped on the close thread it
+  aborted the app as it quit
+
 * Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.12
 - Quitting waits for the program and every pending stop to reach NULL, so
   no GL thread is mid-teardown when the process exits (exit segfaults)
