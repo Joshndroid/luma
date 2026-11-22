@@ -10,11 +10,12 @@ energy rate, so its rate, time to empty and time to full were all wrong.
 
 Read the battery voltage and current when power_now is asked for and
 report their product, which is right whatever unit a firmware build uses.
-The SC8280XP and X1E80100 paths are unchanged.
+This covers every variant that reads properties one by one
+(SM8350, SM8550 and the SoCs that fall back to them, milos included); the
+SC8280XP and X1E80100 paths are unchanged.
 ---
- drivers/power/supply/qcom_battmgr.c | 22 ++++++++++++++++++++--
- 1 file changed, 20 insertions(+), 2 deletions(-)
-
+ drivers/power/supply/qcom_battmgr.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
 diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
 --- a/drivers/power/supply/qcom_battmgr.c
 +++ b/drivers/power/supply/qcom_battmgr.c
@@ -48,16 +49,17 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  	mutex_unlock(&battmgr->lock);
  
  	return ret;
-@@ -562,7 +576,11 @@
+@@ -562,7 +576,12 @@
  		val->intval = battmgr->status.current_now;
  		break;
  	case POWER_SUPPLY_PROP_POWER_NOW:
 -		val->intval = battmgr->status.power_now;
-+		if (battmgr->variant == QCOM_BATTMGR_SM8350)
++		if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
++		    battmgr->variant == QCOM_BATTMGR_X1E80100)
++			val->intval = battmgr->status.power_now;
++		else
 +			val->intval = div_s64((s64)battmgr->status.voltage_now *
 +					      battmgr->status.current_now, MICRO);
-+		else
-+			val->intval = battmgr->status.power_now;
  		break;
  	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
  		if (unit != QCOM_BATTMGR_UNIT_mAh)
