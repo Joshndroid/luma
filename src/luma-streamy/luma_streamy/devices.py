@@ -243,7 +243,8 @@ class ServiceRestarts:
     server starts again (its main process changed): every device node is new then, and connections to
     it may have died with the old one. Nothing happens without systemd's user manager."""
 
-    UNITS = ("pipewire.service", "wireplumber.service", "pipewire-pulse.service")
+    #: wireplumber@video-capture hosts the camera monitors on Luma (cameras in their own instance).
+    UNITS = ("pipewire.service", "wireplumber.service", "wireplumber@video-capture.service", "pipewire-pulse.service")
     SYSTEMD = "org.freedesktop.systemd1"
 
     def __init__(self, on_restart: Callable[[str], None], bus=None) -> None:
