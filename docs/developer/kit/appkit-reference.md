@@ -205,6 +205,7 @@ moved and resized.
 | `remember(key, value)` | Saves one small JSON-serializable value beside the window geometry |
 | `recall(key, default=None)` | Returns a remembered value |
 | `set_geometry_scope(scope, *, default_width, default_height)` | Switches to a separately remembered size, for example a welcome surface. `scope` must be ASCII letters, digits, `-` or `_`. |
+| `set_hidden_from_capture(hidden=True)` | Keeps the window, with its dialogs and menus, out of screen shares of a display or an area and out of screenshots of the screen; it stays on screen, and sharing the window itself still shows it. Returns whether the compositor hides it. `hidden_from_capture` is the last value asked. API level 14. |
 
 State lives in `$XDG_STATE_HOME/luma/windows/<app_id>.json` (and
 `<app_id>.<scope>.json` for a scope), written with mode `0600` when the window

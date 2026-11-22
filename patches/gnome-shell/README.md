@@ -866,3 +866,11 @@ that arrived (`receive()`); a breath in flight is not restarted and an
 interrupted series finishes the breaths left. Tests:
 `tests/gnome-shell/notification-breaths-policy.js` (in `%check`),
 `tests/gnome-shell/idle-cost`. Shell .193.
+
+`0382-share-picker-marks-windows-hidden-from-capture.patch`: a window that
+keeps itself out of screen captures (`Meta.Window:hidden-from-capture`,
+Mutter 0042, ADR-053) is marked on its window tile with an eye-off chip,
+"Hidden from screen sharing", which follows the property live and joins the
+tile's accessible name; sharing that window still shows it. Screen tiles
+leave such windows out of their clones, so a screen preview shows what the
+screen share will. Tests: `tests/mutter/window-capture`. Shell .197.

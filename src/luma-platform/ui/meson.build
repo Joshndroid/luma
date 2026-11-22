@@ -19,6 +19,7 @@ ui_headers = files(
   'luma-context.h',
   'luma-surface-backdrop.h',
   'luma-window-shape.h',
+  'luma-window-capture.h',
   'luma-save-sheet.h',
   'luma-ui.h',
 )
@@ -76,9 +77,11 @@ wayland_protocol_sources = []
 if wayland_client_dep.found()
   ui_c_args += '-DLUMA_HAVE_WAYLAND'
   wayland_scanner = find_program('wayland-scanner')
-  # ext-background-effect-v1 (standard) and luma-window-shape-v1 (Luma's
-  # Mutter; the same XML is the Mutter package's protocol source).
-  foreach protocol : ['ext-background-effect-v1', 'luma-window-shape-v1']
+  # ext-background-effect-v1 (standard), luma-window-shape-v1 and
+  # luma-window-capture-v1 (Luma's Mutter; the same XML is the Mutter
+  # package's protocol source).
+  foreach protocol : ['ext-background-effect-v1', 'luma-window-shape-v1',
+                      'luma-window-capture-v1']
     protocol_xml = files('../protocols/' + protocol + '.xml')
     wayland_protocol_sources += custom_target(
       protocol + '-client-header',
@@ -120,6 +123,7 @@ ui_sources = files(
   'luma-context.c',
   'luma-surface-backdrop.c',
   'luma-window-shape.c',
+  'luma-window-capture.c',
   'luma-save-sheet.c',
   'luma-ui-init.c',
 )

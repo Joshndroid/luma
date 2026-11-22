@@ -57,7 +57,8 @@ from . import lumaui_tokens as tokens  # noqa: E402
 # 12: ActionCenter.show_bar(fill="edge"), BarSearch(span="medium"), FramedPicture(frost=), the places
 #     sidebar (lumaui-sidebar-places), Inset(padding="list") rows 4 apart.
 # 13: TvActionBar (tv.action_bar), TvFocus.add(console=), TvRoom.set_wallpaper(), desktop_wallpaper.
-LUMAUI_API_LEVEL = 13
+# 14: AppWindow.set_hidden_from_capture() and .hidden_from_capture (C luma_window_set_hidden_from_capture).
+LUMAUI_API_LEVEL = 14
 
 _PACKAGE = Path(__file__).resolve().parent
 _portable_installed: set[int] = set()

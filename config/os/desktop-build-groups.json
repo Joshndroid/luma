@@ -47,7 +47,8 @@
       "recipe": "scripts/packages/build-mutter.sh",
       "paths": [
         "patches/mutter/",
-        "src/luma-platform/protocols/luma-window-shape-v1.xml"
+        "src/luma-platform/protocols/luma-window-shape-v1.xml",
+        "src/luma-platform/protocols/luma-window-capture-v1.xml"
       ]
     },
     "gnome-settings-daemon": {

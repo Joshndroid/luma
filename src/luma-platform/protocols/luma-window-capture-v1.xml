@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="luma_window_capture_v1">
+  <copyright>
+    SPDX-License-Identifier: MIT
+
+    Copyright 2026 Project Luma
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="keep toplevels out of screen captures">
+    This protocol lets a client keep one of its toplevels out of captures of
+    the screen: screen casts of monitors and areas, and screenshots of the
+    screen. The window stays on the screen. It is meant for windows that
+    would otherwise capture themselves, such as a recorder's controls or a
+    streaming app's preview, and for content the client does not want
+    shared.
+
+    Hiding only removes content from what is captured, so the compositor
+    needs no permission for it. A capture of the window itself, chosen by
+    the user, still shows it.
+  </description>
+
+  <interface name="luma_window_capture_manager_v1" version="1">
+    <description summary="create capture objects for toplevels">
+      A global that gives toplevels a luma_window_capture_v1 object.
+    </description>
+
+    <enum name="error">
+      <entry name="already_constructed" value="0"
+             summary="the surface already has a luma_window_capture_v1 object"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroys the manager. Objects created through it are not affected.
+      </description>
+    </request>
+
+    <request name="get_window_capture">
+      <description summary="get the capture object of a surface">
+        Creates the capture object of the given surface. A surface has at
+        most one; asking for a second one while the first exists is the
+        already_constructed protocol error.
+
+        The object takes a wl_surface rather than an xdg_toplevel so that
+        toolkits which keep their xdg_toplevel private can use it. Its state
+        has an effect only while the surface has the xdg_toplevel role, and
+        it stays with the surface if the role object is destroyed and
+        created again.
+      </description>
+      <arg name="id" type="new_id" interface="luma_window_capture_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+
+  <interface name="luma_window_capture_v1" version="1">
+    <description summary="capture visibility of one toplevel">
+      Whether captures of the screen show the xdg_toplevel of one
+      wl_surface. A new object starts visible. set_visibility is double
+      buffered: it takes effect on the next wl_surface.commit, like
+      xdg_toplevel.set_min_size. Once the surface is destroyed, requests are
+      ignored; the object should then be destroyed.
+    </description>
+
+    <enum name="error">
+      <entry name="invalid_visibility" value="0"
+             summary="the visibility is not a value of the visibility enum"/>
+    </enum>
+
+    <enum name="visibility">
+      <entry name="visible" value="0"
+             summary="captures of the screen show the window"/>
+      <entry name="hidden" value="1"
+             summary="captures of the screen leave the window out"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="show the window in captures again">
+        Destroys the object. The window is visible to captures again at
+        once.
+      </description>
+    </request>
+
+    <request name="set_visibility">
+      <description summary="show or hide the window in captures">
+        With hidden, captures of the screen leave the window out: screen
+        casts of a monitor or an area, and screenshots of the screen or an
+        area, show what is behind it instead, as if the window were not
+        there. Windows transient for it (dialogs, menus, popups) are left
+        out as well. The window stays on the screen and keeps its input.
+
+        A capture of the window itself, such as a window screen cast the
+        user picked, still shows it. A compositor may mark the window in
+        its screen sharing dialogs.
+      </description>
+      <arg name="visibility" type="uint" enum="visibility"/>
+    </request>
+  </interface>
+</protocol>

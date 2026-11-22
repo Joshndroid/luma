@@ -4,7 +4,7 @@
 
 Name:           luma-developer-platform
 Version:        0.1.0
-Release:        1.luma.149%{?dist}
+Release:        1.luma.152%{?dist}
 Summary:        Adaptive and semantic application platform for Project Luma
 License:        Apache-2.0
 URL:            https://projectluma.org/developers
@@ -177,7 +177,7 @@ python3 - <<'PY_CHECK'
 import json
 from pathlib import Path
 rows = [json.loads(line) for line in Path("%{_vpath_builddir}/meson-logs/testlog.json").read_text().splitlines() if line.strip()]
-expected = {"luma-developer-platform:" + name for name in ("semantics", "background-agent", "context", "adopted-context", "media-fader", "scaffold", "application-icon", "window-frame", "welcome", "application-menu", "native-app-updates", "empty-state", "save-sheet", "surface-policy", "surface-backdrop", "window-shape", "reorder-hint", "media-transport-lcd", "timeline", "mobile-identity", "hidden-width-watch", "first-frame-width", "tv-island")}
+expected = {"luma-developer-platform:" + name for name in ("semantics", "background-agent", "context", "adopted-context", "media-fader", "scaffold", "application-icon", "window-frame", "welcome", "application-menu", "native-app-updates", "empty-state", "save-sheet", "surface-policy", "surface-backdrop", "window-shape", "window-capture", "reorder-hint", "media-transport-lcd", "timeline", "mobile-identity", "hidden-width-watch", "first-frame-width", "tv-island")}
 names = {row["name"] for row in rows}
 # Platform checks, plus LumaUI-1's own part tests, token check and C/Python parity.
 lumaui = {name for name in names if name.startswith("luma-developer-platform:lumaui-")}
@@ -382,6 +382,13 @@ done
 %{python3_sitelib}/luma_sdk/
 
 %changelog
+* Sat Nov 21 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.152
+- luma_window_set_hidden_from_capture(), luma_window_get_hidden_from_capture()
+  and luma_window_get_capture_hiding_supported(): a window stays on screen
+  but out of screen shares and screenshots of the screen, through Luma's
+  luma_window_capture_v1 protocol; elsewhere a no-op that returns FALSE.
+  Python AppWindow.set_hidden_from_capture(). C API level 11, Python 14.
+
 * Sat Nov 21 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.149
 - AudioMeter segments (0 continuous, up to 128 LED segments with the zone
   colours, the peak hold a lit segment); LevelMeter is AudioMeter.

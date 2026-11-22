@@ -1,0 +1,1052 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sat, 21 Nov 2026 20:00:00 -0600
+Subject: [PATCH] Let windows hide from screen captures
+
+An app that records or streams the display it is on captures itself: a
+streaming app showing its own monitor fills the stream with copies of its
+preview. A recorder's controls have the same problem. Nothing let a client
+keep a window on the screen but out of what is captured.
+
+clutter_actor_set_hidden_from_capture() makes an actor, with its effects
+and children, skip paints that carry CLUTTER_PAINT_FLAG_CAPTURE, which
+every paint of the stage outside its views has. A ClutterClone of the
+actor, or of one of its descendants, skips them too. An offscreen effect
+draws again for a capture while any actor is hidden, and for the screen
+after it, so an image it cached during a screen paint (a preview holding a
+clone of a hidden window) never reaches a capture. Painting the actor
+alone, which window streams and window screenshots do, is unaffected.
+
+meta_window_set_hidden_from_capture() and MetaWindow:hidden-from-capture
+set it on the window actor. A window transient for a hidden window (a
+dialog, a menu, a popup) is hidden with it. Wayland clients ask through
+luma_window_capture_v1: get_window_capture(wl_surface), then a
+double-buffered set_visibility(visible|hidden) that reaches the window on
+the xdg_toplevel's next commit; destroying the object shows the window
+again. X11 clients set the _LUMA_WINDOW_HIDDEN_FROM_CAPTURE CARDINAL
+property to 1. Hiding only removes content from captures, so no
+permission is involved.
+
+Monitor streams keep copying the screen (the scanout buffer or a blit of
+the view) unless meta_compositor_is_capture_hidden_in() says a hidden
+window is mapped on that monitor or shown through a mapped clone
+anywhere; then they paint the stage, as they do for monitors spanning
+several outputs. Without a hidden window the question is a counter check.
+Area streams and screenshots already paint the stage.
+---
+ clutter/clutter/clutter-actor-private.h       |   4 +
+ clutter/clutter/clutter-actor.c               |  80 +++++++
+ clutter/clutter/clutter-actor.h               |   6 +
+ clutter/clutter/clutter-clone.c               |   7 +
+ clutter/clutter/clutter-context-private.h     |   3 +
+ clutter/clutter/clutter-offscreen-effect.c    |  26 +++
+ .../meta-screen-cast-monitor-stream-src.c     |  20 ++
+ src/compositor/compositor-private.h           |   6 +
+ src/compositor/compositor.c                   |  86 ++++++++
+ src/compositor/meta-window-actor-private.h    |   3 +
+ src/compositor/meta-window-actor.c            |  21 ++
+ src/core/window-private.h                     |   7 +
+ src/core/window.c                             |  86 ++++++++
+ src/meson.build                               |   3 +
+ src/meta/compositor.h                         |   4 +
+ src/meta/window.h                             |   7 +
+ src/wayland/meta-wayland-versions.h           |   1 +
+ src/wayland/meta-wayland-window-capture.c     | 208 ++++++++++++++++++
+ src/wayland/meta-wayland-window-capture.h     |  27 +++
+ src/wayland/meta-wayland-xdg-shell.c          |   2 +
+ src/wayland/meta-wayland.c                    |   2 +
+ src/x11/atomnames.h                           |   1 +
+ src/x11/window-props.c                        |  17 ++
+ 23 files changed, 627 insertions(+)
+ create mode 100644 src/wayland/meta-wayland-window-capture.c
+ create mode 100644 src/wayland/meta-wayland-window-capture.h
+
+diff --git a/clutter/clutter/clutter-actor-private.h b/clutter/clutter/clutter-actor-private.h
+index ea0d40a..04e3dda 100644
+--- a/clutter/clutter/clutter-actor-private.h
++++ b/clutter/clutter/clutter-actor-private.h
+@@ -239,6 +239,10 @@ void                            _clutter_actor_apply_relative_transformation_mat
+                                                                                          ClutterActor      *ancestor,
+                                                                                          graphene_matrix_t *matrix);
+ 
++gboolean _clutter_actor_is_in_hidden_from_capture_branch (ClutterActor *self);
++
++gboolean _clutter_context_has_capture_hidden_actors (ClutterContext *context);
++
+ void                            _clutter_actor_set_in_clone_paint                       (ClutterActor *self,
+                                                                                          gboolean      is_in_clone_paint);
+ 
+diff --git a/clutter/clutter/clutter-actor.c b/clutter/clutter/clutter-actor.c
+index 1e2cada..c4a637b 100644
+--- a/clutter/clutter/clutter-actor.c
++++ b/clutter/clutter/clutter-actor.c
+@@ -753,6 +753,7 @@ struct _ClutterActorPrivate
+   guint needs_redraw : 1;
+   guint needs_finish_layout : 1;
+   guint stage_relative_modelview_valid : 1;
++  guint hidden_from_capture : 1;
+ };
+ 
+ enum
+@@ -3540,6 +3541,13 @@ clutter_actor_paint (ClutterActor        *self,
+   if (!clutter_actor_is_mapped (self))
+     return;
+ 
++  /* Captures of the stage leave out actors hidden from capture, with their
++   * effects and children. */
++  if (G_UNLIKELY (priv->hidden_from_capture) &&
++      (clutter_paint_context_get_paint_flags (paint_context) &
++       CLUTTER_PAINT_FLAG_CAPTURE))
++    return;
++
+ #ifdef HAVE_PROFILER
+   COGL_TRACE_SCOPED_ANCHOR (ClutterActorPaint);
+ 
+@@ -5387,6 +5395,12 @@ clutter_actor_dispose (GObject *object)
+   ClutterContext *context = clutter_actor_get_context (self);
+   ClutterBackend *backend = clutter_context_get_backend (context);
+ 
++  if (priv->hidden_from_capture)
++    {
++      priv->hidden_from_capture = FALSE;
++      context->n_capture_hidden_actors--;
++    }
++
+   CLUTTER_NOTE (MISC, "Dispose actor (name='%s', ref_count:%d) of type '%s'",
+                 _clutter_actor_get_debug_name (self),
+                 object->ref_count,
+@@ -18326,6 +18340,72 @@ clutter_actor_has_mapped_clones (ClutterActor *self)
+   return FALSE;
+ }
+ 
++/**
++ * clutter_actor_set_hidden_from_capture:
++ * @self: a #ClutterActor
++ * @hidden: whether captures of the stage leave the actor out
++ *
++ * An actor hidden from capture, with its children, is painted on the screen
++ * as usual but not in paints carrying %CLUTTER_PAINT_FLAG_CAPTURE (screen
++ * casts and screenshots of the stage), including paints of it through a
++ * #ClutterClone. Painting the actor itself, outside a paint of the stage,
++ * is not affected.
++ */
++void
++clutter_actor_set_hidden_from_capture (ClutterActor *self,
++                                       gboolean      hidden)
++{
++  g_return_if_fail (CLUTTER_IS_ACTOR (self));
++
++  hidden = !!hidden;
++  if (self->priv->hidden_from_capture == hidden)
++    return;
++
++  self->priv->hidden_from_capture = hidden;
++  self->priv->context->n_capture_hidden_actors += hidden ? 1 : -1;
++
++  /* A capture following the screen records a new frame with the paint. */
++  clutter_actor_queue_redraw (self);
++}
++
++/**
++ * clutter_actor_is_hidden_from_capture:
++ * @self: a #ClutterActor
++ *
++ * Returns: %TRUE if clutter_actor_set_hidden_from_capture() hid the actor
++ */
++gboolean
++clutter_actor_is_hidden_from_capture (ClutterActor *self)
++{
++  g_return_val_if_fail (CLUTTER_IS_ACTOR (self), FALSE);
++
++  return self->priv->hidden_from_capture;
++}
++
++/* Whether any actor is hidden from capture: until one is, captures of the
++ * stage paint exactly what the screen shows. */
++gboolean
++_clutter_context_has_capture_hidden_actors (ClutterContext *context)
++{
++  return context->n_capture_hidden_actors > 0;
++}
++
++/* Whether @self or an ancestor is hidden from capture: a clone paints its
++ * source without the source's ancestors. */
++gboolean
++_clutter_actor_is_in_hidden_from_capture_branch (ClutterActor *self)
++{
++  ClutterActor *actor;
++
++  for (actor = self; actor; actor = actor->priv->parent)
++    {
++      if (actor->priv->hidden_from_capture)
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
+ static void
+ push_in_paint_unmapped_branch (ClutterActor *self,
+                                guint         count)
+diff --git a/clutter/clutter/clutter-actor.h b/clutter/clutter/clutter-actor.h
+index 4bf492e..c13691d 100644
+--- a/clutter/clutter/clutter-actor.h
++++ b/clutter/clutter/clutter-actor.h
+@@ -840,6 +840,12 @@ void                            clutter_actor_remove_all_transitions
+ 
+ CLUTTER_EXPORT
+ gboolean                        clutter_actor_has_mapped_clones                 (ClutterActor *self);
++
++CLUTTER_EXPORT
++void                            clutter_actor_set_hidden_from_capture           (ClutterActor *self,
++                                                                                 gboolean      hidden);
++CLUTTER_EXPORT
++gboolean                        clutter_actor_is_hidden_from_capture            (ClutterActor *self);
+ CLUTTER_EXPORT
+ void                            clutter_actor_set_opacity_override              (ClutterActor               *self,
+                                                                                  gint                        opacity);
+diff --git a/clutter/clutter/clutter-clone.c b/clutter/clutter/clutter-clone.c
+index 2f7411c..2cd8e37 100644
+--- a/clutter/clutter/clutter-clone.c
++++ b/clutter/clutter/clutter-clone.c
+@@ -130,6 +130,13 @@ clutter_clone_paint (ClutterActor        *actor,
+   if (priv->clone_source == NULL)
+     return;
+ 
++  /* The source's own check covers the source; its ancestors are not
++   * painted by a clone. */
++  if ((clutter_paint_context_get_paint_flags (paint_context) &
++       CLUTTER_PAINT_FLAG_CAPTURE) &&
++      _clutter_actor_is_in_hidden_from_capture_branch (priv->clone_source))
++    return;
++
+   CLUTTER_NOTE (PAINT, "painting clone actor '%s'",
+                 _clutter_actor_get_debug_name (actor));
+ 
+diff --git a/clutter/clutter/clutter-context-private.h b/clutter/clutter/clutter-context-private.h
+index 3651a77..bf64173 100644
+--- a/clutter/clutter/clutter-context-private.h
++++ b/clutter/clutter/clutter-context-private.h
+@@ -52,6 +52,9 @@ struct _ClutterContext
+   ClutterSettings *settings;
+ 
+   gboolean show_fps;
++
++  /* Actors hidden from capture (clutter_actor_set_hidden_from_capture()). */
++  int n_capture_hidden_actors;
+ };
+ 
+ ClutterStageManager * clutter_context_get_stage_manager (ClutterContext *context);
+diff --git a/clutter/clutter/clutter-offscreen-effect.c b/clutter/clutter/clutter-offscreen-effect.c
+index 8a046e5..6abf7a0 100644
+--- a/clutter/clutter/clutter-offscreen-effect.c
++++ b/clutter/clutter/clutter-offscreen-effect.c
+@@ -123,6 +123,9 @@ typedef struct _ClutterOffscreenEffectPrivate
+   int target_height;
+ 
+   gulong purge_handler_id;
++
++  /* The cached image was last drawn by a capture paint (see paint()). */
++  gboolean painted_for_capture;
+ } ClutterOffscreenEffectPrivate;
+ 
+ G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (ClutterOffscreenEffect,
+@@ -566,6 +569,29 @@ clutter_offscreen_effect_paint (ClutterEffect           *effect,
+       return;
+     }
+ 
++  /* An image cached by a paint of the screen may hold actors hidden from
++   * capture (a clone of a hidden window in a preview): a capture paints the
++   * actor again without them, and the screen's next paint redraws the image
++   * the capture left in the cache. */
++  if (G_UNLIKELY (priv->painted_for_capture))
++    {
++      flags |= CLUTTER_EFFECT_PAINT_ACTOR_DIRTY;
++      priv->painted_for_capture = FALSE;
++    }
++  if (G_UNLIKELY (clutter_paint_context_get_paint_flags (paint_context) &
++                  CLUTTER_PAINT_FLAG_CAPTURE))
++    {
++      ClutterActor *actor =
++        clutter_actor_meta_get_actor (CLUTTER_ACTOR_META (effect));
++
++      if (actor &&
++          _clutter_context_has_capture_hidden_actors (clutter_actor_get_context (actor)))
++        {
++          flags |= CLUTTER_EFFECT_PAINT_ACTOR_DIRTY;
++          priv->painted_for_capture = TRUE;
++        }
++    }
++
+   /* If we've already got a cached image and the actor hasn't been redrawn
+    * then we can just use the cached image in the FBO.
+    */
+diff --git a/src/backends/meta-screen-cast-monitor-stream-src.c b/src/backends/meta-screen-cast-monitor-stream-src.c
+index 65ec1bb..e4d70a1 100644
+--- a/src/backends/meta-screen-cast-monitor-stream-src.c
++++ b/src/backends/meta-screen-cast-monitor-stream-src.c
+@@ -35,6 +35,7 @@
+ #include "backends/meta-stage-private.h"
+ #include "clutter/clutter.h"
+ #include "clutter/clutter-mutter.h"
++#include "compositor/compositor-private.h"
+ #include "core/boxes-private.h"
+ #include "core/meta-debug-control-private.h"
+ 
+@@ -86,6 +87,14 @@ get_backend (MetaScreenCastMonitorStreamSrc *monitor_src)
+   return meta_screen_cast_get_backend (screen_cast);
+ }
+ 
++static MetaCompositor *
++get_compositor (MetaScreenCastMonitorStreamSrc *monitor_src)
++{
++  MetaContext *context = meta_backend_get_context (get_backend (monitor_src));
++
++  return meta_display_get_compositor (meta_context_get_display (context));
++}
++
+ static ClutterStage *
+ get_stage (MetaScreenCastMonitorStreamSrc *monitor_src)
+ {
+@@ -736,6 +745,17 @@ meta_screen_cast_monitor_stream_src_record_to_framebuffer (MetaScreenCastStreamS
+       goto stage_paint;
+     }
+ 
++  /* A window hidden from capture is on this monitor (or cloned): paint the
++   * stage without it. Without one the copies below are kept. */
++  if (meta_compositor_is_capture_hidden_in (get_compositor (monitor_src),
++                                            &logical_monitor_layout))
++    {
++      meta_topic (META_DEBUG_SCREEN_CAST,
++                  "Painting the monitor stream: a window hidden from capture "
++                  "is on the monitor");
++      goto stage_paint;
++    }
++
+   outputs = meta_monitor_get_outputs (monitor);
+   if (outputs->next)
+     goto stage_paint;
+diff --git a/src/compositor/compositor-private.h b/src/compositor/compositor-private.h
+index 4481017..8ba1f00 100644
+--- a/src/compositor/compositor-private.h
++++ b/src/compositor/compositor-private.h
+@@ -118,6 +118,12 @@ void meta_compositor_unmanage (MetaCompositor *compositor);
+ void meta_compositor_window_shape_changed (MetaCompositor *compositor,
+                                            MetaWindow     *window);
+ 
++void meta_compositor_window_hidden_from_capture_changed (MetaCompositor *compositor,
++                                                         MetaWindow     *window);
++
++void meta_compositor_capture_hidden_actors_changed (MetaCompositor *compositor,
++                                                    int             delta);
++
+ void meta_compositor_window_opacity_changed (MetaCompositor *compositor,
+                                              MetaWindow     *window);
+ 
+diff --git a/src/compositor/compositor.c b/src/compositor/compositor.c
+index d1bf807..beb7d89 100644
+--- a/src/compositor/compositor.c
++++ b/src/compositor/compositor.c
+@@ -119,6 +119,9 @@ typedef struct _MetaCompositorPrivate
+ 
+   GList *windows;
+ 
++  /* Window actors hidden from capture (luma_window_capture_v1). */
++  int n_capture_hidden_actors;
++
+   CoglContext *context;
+ 
+   gboolean needs_update_top_window_actors;
+@@ -379,6 +382,9 @@ meta_compositor_real_add_window (MetaCompositor    *compositor,
+ 
+   clutter_actor_add_child (window_group, CLUTTER_ACTOR (window_actor));
+ 
++  if (window->capture_hidden)
++    meta_window_actor_set_hidden_from_capture (window_actor, TRUE);
++
+   /* Initial position in the stack is arbitrary; stacking will be synced
+    * before we first paint.
+    */
+@@ -453,6 +459,86 @@ meta_compositor_window_shape_changed (MetaCompositor *compositor,
+ #endif
+ }
+ 
++void
++meta_compositor_window_hidden_from_capture_changed (MetaCompositor *compositor,
++                                                    MetaWindow     *window)
++{
++  MetaWindowActor *window_actor;
++
++  window_actor = meta_window_actor_from_window (window);
++  if (!window_actor)
++    return;
++
++  meta_window_actor_set_hidden_from_capture (window_actor,
++                                             window->capture_hidden);
++}
++
++void
++meta_compositor_capture_hidden_actors_changed (MetaCompositor *compositor,
++                                               int             delta)
++{
++  MetaCompositorPrivate *priv =
++    meta_compositor_get_instance_private (compositor);
++
++  priv->n_capture_hidden_actors += delta;
++  g_warn_if_fail (priv->n_capture_hidden_actors >= 0);
++}
++
++/**
++ * meta_compositor_is_capture_hidden_in:
++ * @compositor: a #MetaCompositor
++ * @rect: an area of the stage, in stage coordinates
++ *
++ * Whether a capture of @rect must paint the stage rather than copy the
++ * screen, because a window hidden from capture is on screen there or is
++ * shown through a clone anywhere. With no window hidden from capture this
++ * is a counter check.
++ *
++ * Returns: %TRUE if a capture of @rect must leave something on screen out
++ */
++gboolean
++meta_compositor_is_capture_hidden_in (MetaCompositor     *compositor,
++                                      const MtkRectangle *rect)
++{
++  MetaCompositorPrivate *priv =
++    meta_compositor_get_instance_private (compositor);
++  GList *l;
++
++  if (priv->n_capture_hidden_actors == 0)
++    return FALSE;
++
++  for (l = priv->windows; l; l = l->next)
++    {
++      ClutterActor *actor = l->data;
++      MetaSurfaceActor *surface_actor;
++      graphene_rect_t extents;
++      MtkRectangle actor_rect;
++
++      if (!clutter_actor_is_hidden_from_capture (actor))
++        continue;
++
++      /* Clones (the overview, window switchers) of the window or of its
++       * surface show it wherever they are, mapped or not. */
++      surface_actor = meta_window_actor_get_surface (META_WINDOW_ACTOR (actor));
++      if (clutter_actor_has_mapped_clones (surface_actor ?
++                                           CLUTTER_ACTOR (surface_actor) :
++                                           actor))
++        return TRUE;
++
++      if (!clutter_actor_is_mapped (actor))
++        continue;
++
++      clutter_actor_get_transformed_extents (actor, &extents);
++      mtk_rectangle_from_graphene_rect (&extents,
++                                        MTK_ROUNDING_STRATEGY_GROW,
++                                        &actor_rect);
++      if (mtk_rectangle_overlap (&actor_rect, rect))
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
+ void
+ meta_compositor_window_opacity_changed (MetaCompositor *compositor,
+                                         MetaWindow     *window)
+diff --git a/src/compositor/meta-window-actor-private.h b/src/compositor/meta-window-actor-private.h
+index e7f2414..e0bda17 100644
+--- a/src/compositor/meta-window-actor-private.h
++++ b/src/compositor/meta-window-actor-private.h
+@@ -92,6 +92,9 @@ void meta_window_actor_assign_surface_actor (MetaWindowActor  *self,
+ META_EXPORT_TEST
+ MetaWindowActor *meta_window_actor_from_window (MetaWindow *window);
+ 
++void meta_window_actor_set_hidden_from_capture (MetaWindowActor *self,
++                                                gboolean         hidden);
++
+ META_EXPORT_TEST
+ MetaWindowActor *meta_window_actor_from_actor (ClutterActor *actor);
+ 
+diff --git a/src/compositor/meta-window-actor.c b/src/compositor/meta-window-actor.c
+index 87b0f09..5ac6f39 100644
+--- a/src/compositor/meta-window-actor.c
++++ b/src/compositor/meta-window-actor.c
+@@ -670,6 +670,7 @@ meta_window_actor_dispose (GObject *object)
+   g_clear_pointer (&priv->surface_actors, g_ptr_array_unref);
+   g_clear_signal_handler (&priv->stage_views_changed_id, self);
+ 
++  meta_window_actor_set_hidden_from_capture (self, FALSE);
+   meta_compositor_remove_window_actor (compositor, self);
+ 
+   g_clear_object (&priv->window);
+@@ -1281,6 +1282,26 @@ meta_window_actor_sync_updates_frozen (MetaWindowActor *self)
+   meta_window_actor_set_updates_frozen (self, meta_window_updates_are_frozen (window));
+ }
+ 
++/* Hidden from capture: the actor and its clones are left out of capture
++ * paints of the stage, and the compositor counts it so that monitor streams
++ * know when they cannot copy the screen. */
++void
++meta_window_actor_set_hidden_from_capture (MetaWindowActor *self,
++                                           gboolean         hidden)
++{
++  MetaWindowActorPrivate *priv =
++    meta_window_actor_get_instance_private (self);
++  ClutterActor *actor = CLUTTER_ACTOR (self);
++
++  hidden = !!hidden;
++  if (clutter_actor_is_hidden_from_capture (actor) == hidden)
++    return;
++
++  clutter_actor_set_hidden_from_capture (actor, hidden);
++  meta_compositor_capture_hidden_actors_changed (priv->compositor,
++                                                 hidden ? 1 : -1);
++}
++
+ MetaWindowActor *
+ meta_window_actor_from_window (MetaWindow *window)
+ {
+diff --git a/src/core/window-private.h b/src/core/window-private.h
+index fac0668..15ae8df 100644
+--- a/src/core/window-private.h
++++ b/src/core/window-private.h
+@@ -298,6 +298,13 @@ struct _MetaWindow
+     int base_height;
+   } frame_aspect;
+ 
++  /* Luma: hidden from captures of the screen. hidden_from_capture is what
++   * the client (luma_window_capture_v1, _LUMA_WINDOW_HIDDEN_FROM_CAPTURE) or
++   * the shell asked; capture_hidden adds what the window inherits from the
++   * window it is transient for. */
++  gboolean hidden_from_capture;
++  gboolean capture_hidden;
++
+   MetaLogicalMonitorId *preferred_logical_monitor;
+ 
+   /* Area to cover when in fullscreen mode.  If _NET_WM_FULLSCREEN_MONITORS has
+diff --git a/src/core/window.c b/src/core/window.c
+index 6f1e357..717b52e 100644
+--- a/src/core/window.c
++++ b/src/core/window.c
+@@ -230,6 +230,7 @@ enum
+   PROP_TAG,
+   PROP_A11Y_DBUS_NAME,
+   PROP_A11Y_OBJECT_PATH,
++  PROP_HIDDEN_FROM_CAPTURE,
+ 
+   PROP_LAST,
+ };
+@@ -505,6 +506,9 @@ meta_window_get_property (GObject         *object,
+     case PROP_IS_ALIVE:
+       g_value_set_boolean (value, window->is_alive);
+       break;
++    case PROP_HIDDEN_FROM_CAPTURE:
++      g_value_set_boolean (value, window->capture_hidden);
++      break;
+     case PROP_DISPLAY:
+       g_value_set_object (value, window->display);
+       break;
+@@ -677,6 +681,18 @@ meta_window_class_init (MetaWindowClass *klass)
+                           TRUE,
+                           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
+ 
++  /**
++   * MetaWindow:hidden-from-capture:
++   *
++   * Whether captures of the screen leave the window out, because it or the
++   * window it is transient for asked to be hidden from capture.
++   */
++  obj_props[PROP_HIDDEN_FROM_CAPTURE] =
++    g_param_spec_boolean ("hidden-from-capture", NULL, NULL,
++                          FALSE,
++                          G_PARAM_READABLE | G_PARAM_EXPLICIT_NOTIFY |
++                          G_PARAM_STATIC_STRINGS);
++
+   obj_props[PROP_DISPLAY] =
+     g_param_spec_object ("display", NULL, NULL,
+                          META_TYPE_DISPLAY,
+@@ -7656,6 +7672,74 @@ meta_window_has_transient_type (MetaWindow *window)
+           window->type == META_WINDOW_UTILITY);
+ }
+ 
++/* A window is hidden from capture if it asked, or if the window it is
++ * transient for is (a menu, a dialog). */
++static void
++update_capture_hidden (MetaWindow *window)
++{
++  GPtrArray *children;
++  gboolean hidden;
++  unsigned int i;
++
++  hidden = window->hidden_from_capture ||
++           (window->transient_for && window->transient_for->capture_hidden);
++  if (window->capture_hidden == hidden)
++    return;
++
++  meta_topic (META_DEBUG_SCREEN_CAST, "Window %s is %s capture",
++              window->desc, hidden ? "hidden from" : "shown in");
++
++  window->capture_hidden = hidden;
++  meta_compositor_window_hidden_from_capture_changed (window->display->compositor,
++                                                      window);
++  g_object_notify_by_pspec (G_OBJECT (window),
++                            obj_props[PROP_HIDDEN_FROM_CAPTURE]);
++
++  children = meta_window_get_transient_children (window);
++  for (i = 0; children && i < children->len; i++)
++    update_capture_hidden (g_ptr_array_index (children, i));
++}
++
++/**
++ * meta_window_set_hidden_from_capture:
++ * @window: a #MetaWindow
++ * @hidden: whether captures of the screen leave the window out
++ *
++ * A window hidden from capture stays on the screen but is left out of
++ * screen casts of monitors and areas and out of screenshots of the screen,
++ * with the windows transient for it. Recording or capturing the window
++ * itself is not affected. Hiding only removes content from captures, so it
++ * needs no permission.
++ */
++void
++meta_window_set_hidden_from_capture (MetaWindow *window,
++                                     gboolean    hidden)
++{
++  g_return_if_fail (META_IS_WINDOW (window));
++
++  hidden = !!hidden;
++  if (window->hidden_from_capture == hidden)
++    return;
++
++  window->hidden_from_capture = hidden;
++  update_capture_hidden (window);
++}
++
++/**
++ * meta_window_is_hidden_from_capture:
++ * @window: a #MetaWindow
++ *
++ * Returns: %TRUE if captures of the screen leave @window out, because it
++ *   or the window it is transient for is hidden from capture
++ */
++gboolean
++meta_window_is_hidden_from_capture (MetaWindow *window)
++{
++  g_return_val_if_fail (META_IS_WINDOW (window), FALSE);
++
++  return window->capture_hidden;
++}
++
+ void
+ meta_window_set_transient_for (MetaWindow *window,
+                                MetaWindow *parent)
+@@ -7693,6 +7777,8 @@ meta_window_set_transient_for (MetaWindow *window,
+   if (window->transient_for)
+     meta_window_add_transient_child (window->transient_for, window);
+ 
++  update_capture_hidden (window);
++
+   /* update stacking constraints */
+   if (!window->override_redirect)
+     meta_stack_update_transient (window->display->stack);
+diff --git a/src/meson.build b/src/meson.build
+index 8f207d9..cbfd9c5 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -679,6 +679,8 @@ mutter_sources += [
+   'wayland/meta-wayland-xdg-dialog.h',
+   'wayland/meta-wayland-xdg-toplevel-tag.c',
+   'wayland/meta-wayland-xdg-toplevel-tag.h',
++  'wayland/meta-wayland-window-capture.c',
++  'wayland/meta-wayland-window-capture.h',
+   'wayland/meta-wayland-window-shape.c',
+   'wayland/meta-wayland-window-shape.h',
+   'wayland/meta-window-wayland.c',
+@@ -1086,6 +1088,7 @@ wayland_protocols = [
+   ['linux-drm-syncobj', 'staging', 1, ],
+   # Luma: the XML is a package source (src/luma-platform/protocols in the
+   # Luma tree), installed into this private protocol directory in %prep.
++  ['luma-window-capture-v1', 'private', ],
+   ['luma-window-shape-v1', 'private', ],
+   ['pointer-constraints', 'unstable', 1, ],
+   ['pointer-gestures', 'unstable', 1, ],
+diff --git a/src/meta/compositor.h b/src/meta/compositor.h
+index d451ccb..f8ca09c 100644
+--- a/src/meta/compositor.h
++++ b/src/meta/compositor.h
+@@ -87,6 +87,10 @@ GList * meta_compositor_get_window_actors (MetaCompositor *compositor);
+ META_EXPORT
+ ClutterActor * meta_compositor_get_top_window_group (MetaCompositor *compositor);
+ 
++META_EXPORT
++gboolean meta_compositor_is_capture_hidden_in (MetaCompositor     *compositor,
++                                               const MtkRectangle *rect);
++
+ META_EXPORT
+ void meta_compositor_disable_unredirect (MetaCompositor *compositor);
+ 
+diff --git a/src/meta/window.h b/src/meta/window.h
+index d75e9c9..32f3cb2 100644
+--- a/src/meta/window.h
++++ b/src/meta/window.h
+@@ -324,6 +324,13 @@ const char *meta_window_get_title (MetaWindow *window);
+ META_EXPORT
+ MetaWindow *meta_window_get_transient_for (MetaWindow *window);
+ 
++META_EXPORT
++void        meta_window_set_hidden_from_capture (MetaWindow *window,
++                                                 gboolean    hidden);
++
++META_EXPORT
++gboolean    meta_window_is_hidden_from_capture  (MetaWindow *window);
++
+ META_EXPORT
+ void        meta_window_delete             (MetaWindow  *window,
+                                             guint32      timestamp);
+diff --git a/src/wayland/meta-wayland-versions.h b/src/wayland/meta-wayland-versions.h
+index d4d1f96..daf4152 100644
+--- a/src/wayland/meta-wayland-versions.h
++++ b/src/wayland/meta-wayland-versions.h
+@@ -72,3 +72,4 @@
+ #define META_WP_POINTER_WARP_VERSION 1
+ #define META_EXT_BACKGROUND_EFFECT_V1_VERSION 1
+ #define META_LUMA_WINDOW_SHAPE_V1_VERSION 1
++#define META_LUMA_WINDOW_CAPTURE_V1_VERSION 1
+diff --git a/src/wayland/meta-wayland-window-capture.c b/src/wayland/meta-wayland-window-capture.c
+new file mode 100644
+index 0000000..e1d1d06
+--- /dev/null
++++ b/src/wayland/meta-wayland-window-capture.c
+@@ -0,0 +1,208 @@
++/*
++ * Copyright (C) 2026 Project Luma
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++
++/* luma_window_capture_v1: a client keeps its toplevel out of captures of
++ * the screen. The visibility is pending state of the wl_surface; the
++ * xdg_toplevel role hands it to its MetaWindow on commit. */
++
++#include "config.h"
++
++#include "wayland/meta-wayland-window-capture.h"
++
++#include "core/window-private.h"
++#include "wayland/meta-wayland-private.h"
++#include "wayland/meta-wayland-surface-private.h"
++#include "wayland/meta-wayland-versions.h"
++
++#include "luma-window-capture-v1-server-protocol.h"
++
++static GQuark quark_window_capture = 0;
++
++typedef struct _MetaWaylandWindowCapture
++{
++  struct wl_resource *resource;
++  MetaWaylandSurface *surface;
++
++  gboolean has_pending;
++  gboolean pending_hidden;
++  gboolean hidden;
++} MetaWaylandWindowCapture;
++
++static void
++window_capture_surface_destroyed (gpointer data)
++{
++  MetaWaylandWindowCapture *capture = data;
++
++  capture->surface = NULL;
++}
++
++static void
++window_capture_destructor (struct wl_resource *resource)
++{
++  MetaWaylandWindowCapture *capture = wl_resource_get_user_data (resource);
++
++  if (capture->surface)
++    {
++      MetaWindow *window = meta_wayland_surface_get_window (capture->surface);
++
++      if (window && !window->unmanaging)
++        meta_window_set_hidden_from_capture (window, FALSE);
++
++      g_object_steal_qdata (G_OBJECT (capture->surface), quark_window_capture);
++    }
++
++  g_free (capture);
++}
++
++static void
++window_capture_destroy (struct wl_client   *client,
++                        struct wl_resource *resource)
++{
++  wl_resource_destroy (resource);
++}
++
++static void
++window_capture_set_visibility (struct wl_client   *client,
++                               struct wl_resource *resource,
++                               uint32_t            visibility)
++{
++  MetaWaylandWindowCapture *capture = wl_resource_get_user_data (resource);
++
++  switch (visibility)
++    {
++    case LUMA_WINDOW_CAPTURE_V1_VISIBILITY_VISIBLE:
++    case LUMA_WINDOW_CAPTURE_V1_VISIBILITY_HIDDEN:
++      break;
++    default:
++      wl_resource_post_error (resource,
++                              LUMA_WINDOW_CAPTURE_V1_ERROR_INVALID_VISIBILITY,
++                              "invalid visibility %u", visibility);
++      return;
++    }
++
++  capture->has_pending = TRUE;
++  capture->pending_hidden =
++    visibility == LUMA_WINDOW_CAPTURE_V1_VISIBILITY_HIDDEN;
++}
++
++static const struct luma_window_capture_v1_interface window_capture_interface = {
++  window_capture_destroy,
++  window_capture_set_visibility,
++};
++
++/**
++ * meta_wayland_window_capture_apply:
++ * @surface: the surface of an xdg_toplevel
++ * @window: its window
++ *
++ * Called by the xdg_toplevel role after a commit: applies a pending
++ * visibility, and the current one to a window that does not have it yet (a
++ * new window after the role was reset).
++ */
++void
++meta_wayland_window_capture_apply (MetaWaylandSurface *surface,
++                                   MetaWindow         *window)
++{
++  MetaWaylandWindowCapture *capture;
++
++  if (!quark_window_capture)
++    return;
++
++  capture = g_object_get_qdata (G_OBJECT (surface), quark_window_capture);
++  if (!capture)
++    return;
++
++  if (capture->has_pending)
++    {
++      capture->has_pending = FALSE;
++      capture->hidden = capture->pending_hidden;
++    }
++
++  /* Idempotent: nothing changes when the window already has it. */
++  meta_window_set_hidden_from_capture (window, capture->hidden);
++}
++
++static void
++window_capture_manager_destroy (struct wl_client   *client,
++                                struct wl_resource *resource)
++{
++  wl_resource_destroy (resource);
++}
++
++static void
++window_capture_manager_get_window_capture (struct wl_client   *client,
++                                           struct wl_resource *resource,
++                                           uint32_t            id,
++                                           struct wl_resource *surface_resource)
++{
++  MetaWaylandSurface *surface = wl_resource_get_user_data (surface_resource);
++  MetaWaylandWindowCapture *capture;
++
++  if (g_object_get_qdata (G_OBJECT (surface), quark_window_capture))
++    {
++      wl_resource_post_error (resource,
++                              LUMA_WINDOW_CAPTURE_MANAGER_V1_ERROR_ALREADY_CONSTRUCTED,
++                              "the wl_surface already has a luma_window_capture_v1");
++      return;
++    }
++
++  capture = g_new0 (MetaWaylandWindowCapture, 1);
++  capture->surface = surface;
++  capture->resource = wl_resource_create (client,
++                                          &luma_window_capture_v1_interface,
++                                          wl_resource_get_version (resource),
++                                          id);
++  wl_resource_set_implementation (capture->resource,
++                                  &window_capture_interface,
++                                  capture, window_capture_destructor);
++
++  g_object_set_qdata_full (G_OBJECT (surface), quark_window_capture,
++                           capture, window_capture_surface_destroyed);
++}
++
++static const struct luma_window_capture_manager_v1_interface window_capture_manager_interface = {
++  window_capture_manager_destroy,
++  window_capture_manager_get_window_capture,
++};
++
++static void
++bind_window_capture_manager (struct wl_client *client,
++                             void             *data,
++                             uint32_t          version,
++                             uint32_t          id)
++{
++  struct wl_resource *resource;
++
++  resource = wl_resource_create (client, &luma_window_capture_manager_v1_interface,
++                                 version, id);
++  wl_resource_set_implementation (resource, &window_capture_manager_interface,
++                                  data, NULL);
++}
++
++void
++meta_wayland_init_window_capture (MetaWaylandCompositor *compositor)
++{
++  quark_window_capture =
++    g_quark_from_static_string ("-meta-wayland-luma-window-capture");
++
++  if (wl_global_create (compositor->wayland_display,
++                        &luma_window_capture_manager_v1_interface,
++                        META_LUMA_WINDOW_CAPTURE_V1_VERSION,
++                        compositor, bind_window_capture_manager) == NULL)
++    g_error ("Failed to register a global luma_window_capture_manager_v1 object");
++}
+diff --git a/src/wayland/meta-wayland-window-capture.h b/src/wayland/meta-wayland-window-capture.h
+new file mode 100644
+index 0000000..aaca624
+--- /dev/null
++++ b/src/wayland/meta-wayland-window-capture.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2026 Project Luma
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++
++#pragma once
++
++#include "meta/window.h"
++#include "wayland/meta-wayland.h"
++
++void meta_wayland_init_window_capture (MetaWaylandCompositor *compositor);
++
++void meta_wayland_window_capture_apply (MetaWaylandSurface *surface,
++                                        MetaWindow         *window);
+diff --git a/src/wayland/meta-wayland-xdg-shell.c b/src/wayland/meta-wayland-xdg-shell.c
+index e837585..0d58de5 100644
+--- a/src/wayland/meta-wayland-xdg-shell.c
++++ b/src/wayland/meta-wayland-xdg-shell.c
+@@ -37,6 +37,7 @@
+ #include "wayland/meta-wayland-surface-private.h"
+ #include "wayland/meta-wayland-transaction.h"
+ #include "wayland/meta-wayland-versions.h"
++#include "wayland/meta-wayland-window-capture.h"
+ #include "wayland/meta-wayland-window-configuration.h"
+ #include "wayland/meta-wayland-window-shape.h"
+ #include "wayland/meta-wayland.h"
+@@ -1102,6 +1103,7 @@ meta_wayland_xdg_toplevel_post_apply_state (MetaWaylandSurfaceRole  *surface_rol
+     }
+ 
+   meta_wayland_window_shape_apply (surface, window, pending->has_new_geometry);
++  meta_wayland_window_capture_apply (surface, window);
+ 
+   if (update_min_size || update_max_size)
+     meta_window_recalc_features (window);
+diff --git a/src/wayland/meta-wayland.c b/src/wayland/meta-wayland.c
+index 5af12eb..3231993 100644
+--- a/src/wayland/meta-wayland.c
++++ b/src/wayland/meta-wayland.c
+@@ -65,6 +65,7 @@
+ #include "wayland/meta-wayland-system-bell.h"
+ #include "wayland/meta-wayland-tablet-manager.h"
+ #include "wayland/meta-wayland-transaction.h"
++#include "wayland/meta-wayland-window-capture.h"
+ #include "wayland/meta-wayland-window-shape.h"
+ #include "wayland/meta-wayland-xdg-dialog.h"
+ #include "wayland/meta-wayland-xdg-foreign.h"
+@@ -1045,6 +1046,7 @@ meta_wayland_compositor_new (MetaContext *context)
+   meta_wayland_init_system_bell (compositor);
+   meta_wayland_xdg_toplevel_tag_init (compositor);
+   meta_wayland_init_window_shape (compositor);
++  meta_wayland_init_window_capture (compositor);
+ #ifdef HAVE_NATIVE_BACKEND
+   meta_wayland_drm_lease_manager_init (compositor);
+ #endif
+diff --git a/src/x11/atomnames.h b/src/x11/atomnames.h
+index 50b0e37..615de67 100644
+--- a/src/x11/atomnames.h
++++ b/src/x11/atomnames.h
+@@ -176,6 +176,7 @@ item(_NET_WM_STATE_STICKY)
+ item(_NET_WM_FULLSCREEN_MONITORS)
+ item(_NET_WM_STATE_FOCUSED)
+ item(_NET_WM_BYPASS_COMPOSITOR)
++item(_LUMA_WINDOW_HIDDEN_FROM_CAPTURE)
+ item(_NET_WM_OPAQUE_REGION)
+ item(_NET_WM_FRAME_DRAWN)
+ item(_NET_WM_FRAME_TIMINGS)
+diff --git a/src/x11/window-props.c b/src/x11/window-props.c
+index eec3fd5..34632fe 100644
+--- a/src/x11/window-props.c
++++ b/src/x11/window-props.c
+@@ -1609,6 +1609,22 @@ reload_bypass_compositor (MetaWindow    *window,
+   priv->bypass_compositor = requested_value;
+ }
+ 
++/* _LUMA_WINDOW_HIDDEN_FROM_CAPTURE (CARDINAL): 1 hides the window from
++ * captures of the screen, like luma_window_capture_v1 for Wayland clients;
++ * 0 or no property shows it. */
++static void
++reload_hidden_from_capture (MetaWindow    *window,
++                            MetaPropValue *value,
++                            gboolean       initial)
++{
++  gboolean hidden = FALSE;
++
++  if (value->type != META_PROP_VALUE_INVALID)
++    hidden = value->v.cardinal != 0;
++
++  meta_window_set_hidden_from_capture (window, hidden);
++}
++
+ static void
+ reload_window_opacity (MetaWindow    *window,
+                        MetaPropValue *value,
+@@ -1758,6 +1774,7 @@ meta_x11_display_init_window_prop_hooks (MetaX11Display *x11_display)
+     { x11_display->atom__NET_WM_STRUT,         META_PROP_VALUE_INVALID, reload_struts, NONE },
+     { x11_display->atom__NET_WM_STRUT_PARTIAL, META_PROP_VALUE_INVALID, reload_struts, NONE },
+     { x11_display->atom__NET_WM_BYPASS_COMPOSITOR, META_PROP_VALUE_CARDINAL,  reload_bypass_compositor, LOAD_INIT | INCLUDE_OR },
++    { x11_display->atom__LUMA_WINDOW_HIDDEN_FROM_CAPTURE, META_PROP_VALUE_CARDINAL, reload_hidden_from_capture, LOAD_INIT },
+     { x11_display->atom__NET_WM_WINDOW_OPACITY, META_PROP_VALUE_CARDINAL, reload_window_opacity, LOAD_INIT | INCLUDE_OR },
+     { x11_display->atom__NET_WM_WINDOW_TAG,    META_PROP_VALUE_STRING, reload_toplevel_tag, LOAD_INIT },
+     { x11_display->atom__NET_WM_FULLSCREEN_MONITORS, META_PROP_VALUE_CARDINAL_LIST, reload_fullscreen_monitors, LOAD_INIT | INIT_ONLY },
+-- 
+2.54.0 (Apple Git-157)
+

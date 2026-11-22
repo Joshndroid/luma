@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sat, 21 Nov 2026 20:00:00 -0600
+Subject: [PATCH] Share picker: mark windows hidden from screen capture
+
+A window that keeps itself out of screen captures
+(Meta.Window:hidden-from-capture) is still shareable as a window, but it
+is not in a screen share. Its window tile now carries an eye-off chip,
+"Hidden from screen sharing", which follows the property live and joins
+the tile's accessible name. Screen tiles no longer clone such windows, so
+a screen preview shows what the screen share will.
+---
+ data/theme/luma-share.css | 11 ++++++++
+ js/ui/lumaShare.js        | 53 +++++++++++++++++++++++++++++++++++----
+ 2 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/data/theme/luma-share.css b/data/theme/luma-share.css
+index 08ff7e3..0a92ebf 100644
+--- a/data/theme/luma-share.css
++++ b/data/theme/luma-share.css
+@@ -153,6 +153,17 @@
+ .luma-share-check-glyph { width: 11px; height: 11px; }
+ .luma-surface-dark .luma-share-check { border-color: #21252b; }
+ 
++.luma-share-hidden {
++  padding: 3px 8px 3px 6px;
++  spacing: 5px;
++  border-radius: 999px;
++  background-color: rgba(23, 26, 30, 0.72);
++  color: #ffffff; }
++.luma-share-hidden-glyph { width: 12px; height: 12px; }
++.luma-share-hidden-label {
++  font-size: 11px;
++  font-weight: 600; }
++
+ .luma-share-caption {
+   margin-top: 8px;
+   spacing: 6px; }
+diff --git a/js/ui/lumaShare.js b/js/ui/lumaShare.js
+index 0a0ff23..193023a 100644
+--- a/js/ui/lumaShare.js
++++ b/js/ui/lumaShare.js
+@@ -266,6 +266,29 @@ const PreviewTile = GObject.registerClass({
+         });
+         this._frame.add_child(this._check);
+ 
++        // A window that keeps itself out of screen captures (Meta.Window
++        // hidden-from-capture): sharing it still shows it, sharing a screen
++        // does not.
++        if (source.kind === 'window') {
++            this._hidden = new St.BoxLayout({
++                style_class: 'luma-share-hidden',
++                visible: false,
++                reactive: false,
++            });
++            this._hidden.add_child(new Glyph('eye-off', {
++                style_class: 'luma-share-hidden-glyph',
++                y_align: Clutter.ActorAlign.CENTER,
++            }));
++            this._hidden.add_child(new St.Label({
++                style_class: 'luma-share-hidden-label',
++                text: _('Hidden from screen sharing'),
++                y_align: Clutter.ActorAlign.CENTER,
++            }));
++            this._frame.add_child(this._hidden);
++            source.window.connectObject('notify::hidden-from-capture',
++                () => this._syncHidden(), this);
++        }
++
+         const caption = new St.BoxLayout({
+             style_class: 'luma-share-caption',
+             x_expand: true,
+@@ -304,10 +327,7 @@ const PreviewTile = GObject.registerClass({
+         });
+         caption.add_child(this._detail);
+ 
+-        // "Tide, Library" — the application, then what of it is shared.
+-        this.accessible_name = source.detail
+-            ? `${source.detail}, ${source.title}`
+-            : source.title;
++        this._syncHidden();
+ 
+         this.connect('clicked', () => this.emit('chosen'));
+         this.connect('notify::hover', () => this._syncStyle());
+@@ -316,6 +336,19 @@ const PreviewTile = GObject.registerClass({
+         this._syncStyle();
+     }
+ 
++    // "Tide, Library" — the application, then what of it is shared.
++    _syncHidden() {
++        const hidden = this._hidden && this.source.window.hidden_from_capture;
++        if (this._hidden)
++            this._hidden.visible = hidden;
++        const name = this.source.detail
++            ? `${this.source.detail}, ${this.source.title}`
++            : this.source.title;
++        this.accessible_name = hidden
++            ? `${name}, ${_('Hidden from screen sharing')}`
++            : name;
++    }
++
+     setChosen(chosen) {
+         if (this.chosen === chosen)
+             return;
+@@ -362,6 +395,12 @@ const PreviewTile = GObject.registerClass({
+         const scale = stageScale();
+         const [, , badge] = this._check.get_preferred_size();
+         this._check.set_position(Math.round(width - badge - 6 * scale), Math.round(6 * scale));
++        if (this._hidden) {
++            // Bottom left of the frame, clear of the check badge.
++            const [, , , chipHeight] = this._hidden.get_preferred_size();
++            this._hidden.set_position(Math.round(6 * scale),
++                Math.round(height - chipHeight - 6 * scale));
++        }
+         this._title.width = -1;
+     }
+ });
+@@ -372,7 +411,8 @@ const PreviewTile = GObject.registerClass({
+ // the tile at the monitor's own aspect. Only what is on the monitor is
+ // cloned, so a tile repaints that monitor and nothing else. The picker and
+ // every other dialog, the lock screen, the overview and anything held back
+-// from captures (the pill, the sharing edges) are never cloned.
++// from captures (the pill, the sharing edges, windows hidden from capture)
++// are never cloned.
+ //
+ // One clone of global.window_group used to stand for the monitor, allocated
+ // at the stage's origin: the offset it was given never applied, so every
+@@ -428,6 +468,9 @@ class ScreenPreview extends St.Widget {
+             layers.push(background);
+         for (const actor of global.get_window_actors()) {
+             const window = actor.meta_window;
++            // A window hidden from capture is not in what the screen shares.
++            if (window.hidden_from_capture)
++                continue;
+             if (window.minimized || !window.showing_on_its_workspace() ||
+                 !window.located_on_workspace(global.workspace_manager.get_active_workspace()))
+                 continue;
+-- 
+2.54.0 (Apple Git-157)
+

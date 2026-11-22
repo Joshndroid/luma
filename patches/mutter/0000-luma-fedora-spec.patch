@@ -1,11 +1,11 @@
 --- a/mutter.spec
 +++ b/mutter.spec
-@@ -29,13 +29,53 @@
+@@ -29,13 +29,55 @@
  
  Name:          mutter
  Version:       50.4
 -Release:       %autorelease
-+Release:       1.luma.26%{?dist}
++Release:       1.luma.29%{?dist}
  Summary:       Window and compositing manager based on Clutter
  
  # Automatically converted from old format: GPLv2+ - review is highly recommended.
@@ -15,6 +15,7 @@
 +Source1:       ext-background-effect-v1.xml
 +Source2:       default-monitor-scale.py
 +Source3:       luma-window-shape-v1.xml
++Source4:       luma-window-capture-v1.xml
 +Patch1000:     0001-luma-handheld-scales.patch
 +Patch1001:     0002-clutter-Add-blur-node-support-for-framebuffer-region.patch
 +Patch1002:     0003-compositor-Add-background-blur-support.patch
@@ -52,10 +53,11 @@
 +Patch1034:     0035-screen-cast-Pause-screen-casts-while-the-session-is-locked.patch
 +Patch1035:     0036-clutter-stage-Mark-capture-paints-let-captures-be-made-to-paint.patch
 +Patch1036:     0037-clutter-Update-only-the-views-a-redraw-lands-on.patch
++Patch1041:     0042-Let-windows-hide-from-screen-captures.patch
  
  
  BuildRequires: cvt
-@@ -169,6 +204,10 @@
+@@ -169,6 +211,12 @@
  
  %prep
  %autosetup -S git -n %{name}-%{tarball_version}
@@ -63,10 +65,12 @@
 +  src/wayland/protocol/ext-background-effect-v1.xml
 +install -D -m 0644 %{SOURCE3} \
 +  src/wayland/protocol/luma-window-shape-v1.xml
++install -D -m 0644 %{SOURCE4} \
++  src/wayland/protocol/luma-window-capture-v1.xml
  
  %build
  %meson -Degl_device=true
-@@ -179,6 +217,29 @@
+@@ -179,6 +227,29 @@
  
  %find_lang %{name}
  
@@ -96,7 +100,7 @@
  %files -f %{name}.lang
  %license COPYING
  %doc NEWS
-@@ -200,6 +260,7 @@
+@@ -200,6 +271,7 @@
  %{_datadir}/GConf/gsettings/mutter-schemas.convert
  %{_datadir}/glib-2.0/schemas/org.gnome.mutter.gschema.xml
  %{_datadir}/glib-2.0/schemas/org.gnome.mutter.wayland.gschema.xml
