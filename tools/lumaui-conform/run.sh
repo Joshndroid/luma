@@ -66,7 +66,7 @@ else
   fi
   [ -n "$spec_only" ] && { echo "spec only: $out"; exit 0; }
   # Pixel mode: the caller's PNGs stand in for the GTK capture; no element matching.
-  [ -n "$pixel" ] && exec node "$here/pixel_compare.js" --scenario "$scenario" --dir "$out" --pngs "$pixel"
+  [ -n "$pixel" ] && exec node "$here/pixel_compare.js" --scenario "$scenario" --dir "$out" --pngs "$pixel" --deviations "$here/accepted-deviations.json"
   sh "$here/gtk_capture.sh" "$scenario" "$out" "$theme" "$repo" || { echo "lumaui-conform: the GTK capture failed" >&2; exit 3; }
 fi
 node "$here/compare.js" --scenario "$scenario" --dir "$out" --deviations "$here/accepted-deviations.json"

@@ -3,6 +3,7 @@
 const { shortcutIssueMatches } = require('./linux-shortcut-equivalence');
 
 function matchesDeviation(deviation, issue, state, app, used = 0, shortcutPairs = null) {
+  if (deviation.mode === 'pixel') return false;  // pixel mode only (pixel_compare.js)
   if (deviation.apps && !deviation.apps.includes(app)) return false;
   if (deviation.states && !deviation.states.includes(state)) return false;
   if (deviation.state_pattern && !new RegExp(deviation.state_pattern).test(state)) return false;

@@ -112,7 +112,7 @@ run unpack -i --network=none -v "$work:/w" -v "$root/tools/lumaui-conform:/srv-t
   for t in /w/src/kit/tools/lumaui-conform /w/src/wt/tools/lumaui-conform; do
     [ -d "$t/scenarios" ] && cp -R "$t/scenarios/." /w/tools/scenarios/
     [ -f "$t/compare.js" ] || continue
-    for f in spec_capture.js compare.js lib accepted-deviations.json harness/lumaui_conform_harness.py harness/sitecustomize.py; do
+    for f in spec_capture.js compare.js pixel_compare.js run.sh lib accepted-deviations.json harness/lumaui_conform_harness.py harness/sitecustomize.py; do
       [ -e "$t/$f" ] && rm -rf "/w/tools/$f" && cp -R "$t/$f" "/w/tools/$f"
     done
     from=${t#/w/src/}
