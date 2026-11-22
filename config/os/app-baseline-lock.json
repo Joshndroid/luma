@@ -95,7 +95,12 @@
         "x86_64": "dc623400dec6c6b0b8f5cbbd364b30000914c0a36f4311f678b88ffe1a502827"
       },
       "source_sha256": "0f0817a00a5587bd3889a145ce1b44cf7c940bde7f016e7ed4e5e524690be12d",
-      "version": "0.1.7"
+      "version": "0.1.7",
+      "pending": {
+        "reason": "installer 1.luma.108 (#537); combined reseal to Depot 0.1.8 after #562",
+        "expires": "2026-11-24",
+        "source_sha256": "8238cf45dd8f0d9cad9ce0f24f4ea589aa2ab0e78b0c4e10d24cb0208737d840"
+      }
     },
     "org.projectluma.Imager": {
       "commits": {
