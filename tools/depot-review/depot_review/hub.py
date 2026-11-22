@@ -81,6 +81,8 @@ class Hub:
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as error:
             raise HubError(f"upload {name}: HTTP {error.code} {error.read()[:300]!r}") from None
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise HubError(f"upload {name}: {error}") from None
 
     def download(self, url: str, target: Path, *, limit: int, sha256: str | None = None) -> str:
         if not url.startswith("https://") and not url.startswith(self.base):
@@ -101,6 +103,9 @@ class Hub:
         except urllib.error.HTTPError as error:
             partial.unlink(missing_ok=True)
             raise HubError(f"download {url}: HTTP {error.code}") from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            partial.unlink(missing_ok=True)
+            raise HubError(f"download {url}: {error}") from None
         except BaseException:
             partial.unlink(missing_ok=True)
             raise

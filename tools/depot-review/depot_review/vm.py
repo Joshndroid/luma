@@ -33,6 +33,38 @@ def log(message: str) -> None:
     print(time.strftime("%H:%M:%S"), message, file=sys.stderr, flush=True)
 
 
+# The review desktop never idles, dims, locks or blanks: a screen that goes off
+# mid-check can't be watched. Locked, so a session setting can't undo it.
+REVIEW_DCONF = """[org/gnome/desktop/session]
+idle-delay=uint32 0
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+idle-activation-enabled=false
+[org/gnome/desktop/lockdown]
+disable-lock-screen=true
+[org/gnome/desktop/notifications]
+show-banners=false
+[org/gnome/settings-daemon/plugins/power]
+idle-dim=false
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-type='nothing'
+"""
+REVIEW_DCONF_LOCKS = """/org/gnome/desktop/session/idle-delay
+/org/gnome/desktop/screensaver/lock-enabled
+/org/gnome/desktop/screensaver/idle-activation-enabled
+/org/gnome/settings-daemon/plugins/power/idle-dim
+/org/gnome/settings-daemon/plugins/power/sleep-inactive-ac-type
+"""
+
+
+def write_review_dconf() -> str:
+    """Shell that installs the review dconf policy (kickstart %post and prepare-base)."""
+    return ("mkdir -p /etc/dconf/db/local.d/locks\n"
+            f"cat > /etc/dconf/db/local.d/90-depot-review <<'EOF'\n{REVIEW_DCONF}EOF\n"
+            f"cat > /etc/dconf/db/local.d/locks/90-depot-review <<'EOF'\n{REVIEW_DCONF_LOCKS}EOF\n"
+            "dconf update || true\n")
+
+
 def kickstart(public_key: str, console: str) -> str:
     if not re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/]+={0,3}( \S+)?", public_key):
         raise ValueError("invalid review SSH key")
@@ -45,7 +77,7 @@ ignoredisk --only-use=vda
 zerombr
 clearpart --all --initlabel --disklabel=gpt --drives=vda
 autopart --type=btrfs --noswap
-bootloader --timeout=1 --append="rhgb quiet console=tty0 console={console}"
+bootloader --timeout=1 --append="rhgb quiet consoleblank=0 systemd.default_device_timeout_sec=600 console=tty0 console={console}"
 firstboot --disable
 user --name={USER} --gecos="Depot Review" --lock
 rootpw --lock
@@ -63,19 +95,7 @@ install -d -o {USER} -g {USER} /home/{USER}/.config /home/{USER}/.local /home/{U
 printf 'yes\\n' > /home/{USER}/.config/gnome-initial-setup-done
 : > /home/{USER}/.local/state/luma-setup/welcome-done
 chown {USER}:{USER} /home/{USER}/.config/gnome-initial-setup-done /home/{USER}/.local/state/luma-setup/welcome-done
-cat > /etc/dconf/db/local.d/90-depot-review <<'EOF'
-[org/gnome/desktop/session]
-idle-delay=uint32 0
-[org/gnome/desktop/screensaver]
-lock-enabled=false
-idle-activation-enabled=false
-[org/gnome/desktop/lockdown]
-disable-lock-screen=true
-[org/gnome/desktop/notifications]
-show-banners=false
-EOF
-dconf update || true
-systemctl set-default graphical.target
+{write_review_dconf()}systemctl set-default graphical.target
 restorecon -RF /etc/gdm /var/lib/AccountsService/users /home/{USER} /etc/dconf || true
 %end
 %post --nochroot
@@ -151,6 +171,15 @@ REVIEW_MASKS = ("luma-update-check.service", "luma-update-check.timer",
                 "snapd.socket", "NetworkManager-wait-online.service")
 
 
+def qmp_path(work: Path) -> Path:
+    """The run's QMP socket. AF_UNIX paths stop at 108 bytes, and job folders
+    can be deeper than that; then the socket lives in the temp folder."""
+    path = work / "qmp.sock"
+    if len(os.fsencode(path)) < 100:
+        return path
+    return Path(tempfile.gettempdir()) / f"depot-qmp-{zlib.crc32(os.fsencode(work)):08x}-{os.getpid()}.sock"
+
+
 def boot(disk: Path, arch: str, work: Path, port: int, memory: str = "4096", cpus: str = "2"):
     display = (["-device", f"virtio-vga,xres={WIDTH},yres={HEIGHT}"] if arch == "x86_64"
                else ["-device", f"virtio-gpu-pci,xres={WIDTH},yres={HEIGHT}"])
@@ -158,7 +187,7 @@ def boot(disk: Path, arch: str, work: Path, port: int, memory: str = "4096", cpu
         "-m", memory, "-smp", cpus, "-display", "none", *display,
         "-drive", f"file={disk},if=virtio,format=qcow2,cache=unsafe,discard=unmap",
         "-nic", f"user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{port}-:22",
-        "-qmp", f"unix:{work / 'qmp.sock'},server=on,wait=off", "-serial", f"file:{work / 'serial.log'}",
+        "-qmp", f"unix:{qmp_path(work)},server=on,wait=off", "-serial", f"file:{work / 'serial.log'}",
         "-monitor", "none",
         "-object", "rng-random,filename=/dev/urandom,id=rng0", "-device", "virtio-rng-pci,rng=rng0",
     ]
@@ -166,10 +195,24 @@ def boot(disk: Path, arch: str, work: Path, port: int, memory: str = "4096", cpu
                             stderr=open(work / "qemu.log", "w"))
 
 
-def wait_ssh(guest: "Guest", process, timeout: int) -> bool:
+EMERGENCY = "You are in emergency mode"
+
+
+def in_emergency(serial: Path) -> bool:
+    """The guest gave up booting (on a loaded host, usually device units that
+    timed out); it never comes back from there."""
+    try:
+        return EMERGENCY in serial.read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def wait_ssh(guest: "Guest", process, timeout: int, serial: Path | None = None) -> bool:
     started = time.time()
     while time.time() - started < timeout:
         if process.poll() is not None:
+            return False
+        if serial is not None and in_emergency(serial):
             return False
         if guest.run("true", timeout=30).returncode == 0:
             return True
@@ -206,7 +249,10 @@ def prepare_base(disk: Path, arch: str = "x86_64") -> None:
                 log(f"{attempt}: SSH after {int(time.time() - started)} s")
                 if attempt == "configure":
                     guest.run("systemctl mask " + " ".join(REVIEW_MASKS), timeout=60, check=True)
+                    guest.run(write_review_dconf(), timeout=60, check=True)
                     guest.run("rpm-ostree kargs --append-if-missing=plymouth.enable=0 "
+                              "--append-if-missing=consoleblank=0 "
+                              "--append-if-missing=systemd.default_device_timeout_sec=600 "
                               "--delete-if-present=rhgb --delete-if-present=quiet", timeout=600, check=True)
                     jobs = guest.run("systemctl list-jobs --no-legend | head -20", timeout=30).stdout
                     log("pending jobs at configure:\n" + jobs)
@@ -220,7 +266,7 @@ def prepare_base(disk: Path, arch: str = "x86_64") -> None:
                     again = wait_session(guest, 10)
                     if again != uid:
                         raise RuntimeError("verify: the desktop session did not stay logged in")
-                    qmp = QMP(work / "qmp.sock")
+                    qmp = QMP(qmp_path(work))
                     qmp.command("screendump", filename=str(work / "desktop.ppm"))
                     width, height, rgb = read_ppm(work / "desktop.ppm")
                     write_png(disk.parent / f"base-{arch}-desktop.png", width, height, rgb)
@@ -232,6 +278,7 @@ def prepare_base(disk: Path, arch: str = "x86_64") -> None:
                     process.kill()
                     process.wait()
                 shutil.copy(work / "serial.log", disk.parent / f"prepare-{attempt}-serial.log")
+                qmp_path(work).unlink(missing_ok=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -363,11 +410,41 @@ def session_env(uid: str) -> str:
             f"WAYLAND_DISPLAY=wayland-0")
 
 
+def keep_awake(guest: "Guest", uid: str) -> None:
+    """Keep the session's screen on for the whole run: no idle, dim, lock or
+    DPMS-off, and an idle inhibitor held until the VM stops."""
+    env = session_env(uid)
+    guest.run(f"runuser -u {USER} -- env {env} sh -c '"
+              "gsettings set org.gnome.desktop.session idle-delay 0; "
+              "gsettings set org.gnome.desktop.screensaver lock-enabled false; "
+              "gsettings set org.gnome.desktop.screensaver idle-activation-enabled false; "
+              "gsettings set org.gnome.settings-daemon.plugins.power idle-dim false; "
+              "gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type nothing' 2>/dev/null; "
+              f"runuser -u {USER} -- env {env} systemd-run --user --quiet --collect --unit=depot-review-awake "
+              "gnome-session-inhibit --inhibit idle --inhibit-only --reason 'Depot review' >/dev/null 2>&1; "
+              "loginctl unlock-sessions 2>/dev/null; true", timeout=60)
+    wake(guest, uid)
+
+
+def wake(guest: "Guest", uid: str) -> None:
+    """Turn the display back on if it went into power saving."""
+    guest.run(f"runuser -u {USER} -- env {session_env(uid)} gdbus call --session --dest org.gnome.Mutter.DisplayConfig "
+              "--object-path /org/gnome/Mutter/DisplayConfig --method org.freedesktop.DBus.Properties.Set "
+              "org.gnome.Mutter.DisplayConfig PowerSaveMode '<int32 0>' >/dev/null 2>&1; true", timeout=30)
+
+
+SCREEN_TRIES = 4
+
+
 def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, out: Path, arch: str = "x86_64",
-            boot_timeout: int = 420, remote_ref: str | None = None) -> dict:
+            boot_timeout: int = 420, remote_ref: str | None = None, memory: str = "6144", cpus: str = "4") -> dict:
     """With remote_ref (e.g. luma app/ID/ARCH/stable), install from the VM's own
-    configured remote instead of a bundle: the published-release check."""
-    """Returns {"steps": [{step, ok, message}], "screenshot": path|None, "ok": bool}."""
+    configured remote instead of a bundle: the published-release check.
+
+    Returns {"steps": [{step, ok, message}], "screenshot": path|None, "ok": bool}.
+    A step Depot itself couldn't run carries infrastructure=True and a reason;
+    it says nothing about the app. The boot timeout counts from qemu's start, so
+    take host capacity (capacity.slot) before calling this."""
     out.mkdir(parents=True, exist_ok=True)
     steps: list[dict] = []
     result = {"steps": steps, "screenshot": None, "ok": False, "arch": arch}
@@ -376,6 +453,9 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
         steps.append({"step": name, "ok": ok, "message": message, **extra})
         log(f"{name}: {'ok' if ok else 'FAIL'} {message}")
         return ok
+
+    def couldnt_run(name: str, reason: str, message: str, detail: str = "") -> None:
+        step(name, False, message, internal=True, infrastructure=True, reason=reason, detail=detail)
 
     if fmt != "flatpak":
         step("install", False, "The VM run covers Flatpak bundles tonight; Luma checks universal packages by hand.",
@@ -386,17 +466,28 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
     subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", "-b", str(base), "-F", "qcow2", str(overlay)],
                    check=True)
     port = free_port()
-    process = boot(overlay, arch, work, port, memory="6144", cpus="4")
+    started = time.time()
+    process = boot(overlay, arch, work, port, memory=memory, cpus=cpus)
     guest = Guest(port, key)
     try:
-        qmp = QMP(work / "qmp.sock")
-        started = time.time()
-        if not wait_ssh(guest, process, boot_timeout):
-            step("boot", False, "The test VM didn't start in time.", internal=True)
+        qmp = QMP(qmp_path(work))
+        if not wait_ssh(guest, process, boot_timeout, work / "serial.log"):
+            if in_emergency(work / "serial.log"):
+                couldnt_run("boot", "guest_emergency", "The test VM didn't start in time.",
+                            detail=f"guest in emergency mode after {int(time.time() - started)} s")
+            elif process.poll() is not None:
+                couldnt_run("boot", "vm_exited", "The test VM stopped while it was starting.",
+                            detail=f"qemu exited with {process.returncode}")
+            else:
+                couldnt_run("boot", "boot_timeout", "The test VM didn't start in time.",
+                            detail=f"no SSH after {int(time.time() - started)} s")
             return result
+        # The policy is in the base; this also covers bases built before it was.
+        guest.run(write_review_dconf(), timeout=60)
         uid = wait_session(guest, max(60, boot_timeout - int(time.time() - started)))
         if not uid:
-            step("boot", False, "The test VM's desktop didn't start.", internal=True)
+            couldnt_run("boot", "desktop_timeout", "The test VM's desktop didn't start.",
+                        detail=f"no desktop session after {int(time.time() - started)} s")
             return result
         step("boot", True, f"Luma started ({int(time.time() - started)} s).")
         # Android starts in the background after sign-in. Its window and memory
@@ -406,16 +497,21 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
                   f"runuser -u {USER} -- env {session_env(uid)} waydroid session stop >/dev/null 2>&1; true",
                   timeout=60)
         # A slow boot can outlast the idle delay: the screen blanks, and a blank
-        # screen waking up looks like a window. Keep it on and wake it.
-        guest.run(f"runuser -u {USER} -- env {session_env(uid)} sh -c 'gsettings set org.gnome.desktop.session "
-                  "idle-delay 0; gsettings set org.gnome.desktop.screensaver lock-enabled false' 2>/dev/null; "
-                  "loginctl unlock-sessions 2>/dev/null; true", timeout=30)
-        qmp.command("send-key", keys=[{"type": "qcode", "data": "shift"}])
-        time.sleep(8)  # let the shell settle
+        # screen waking up looks like a window. Keep it on for the whole run and
+        # wake it; a busy host can also take a while to draw the first frame.
+        keep_awake(guest, uid)
         before = work / "before.ppm"
-        qmp.command("screendump", filename=str(before))
-        if is_blank(read_ppm(before)[2]):
-            step("launch", False, "The test VM's screen was off, so the launch couldn't be watched.", internal=True)
+        for attempt in range(SCREEN_TRIES):
+            qmp.command("send-key", keys=[{"type": "qcode", "data": "shift"}])
+            time.sleep(8 if attempt == 0 else 10)  # let the shell settle
+            qmp.command("screendump", filename=str(before))
+            if not is_blank(read_ppm(before)[2]):
+                break
+            log(f"screen: blank after wake {attempt + 1}/{SCREEN_TRIES}")
+            wake(guest, uid)
+        else:
+            couldnt_run("launch", "screen_off", "The test VM's screen was off, so the launch couldn't be watched.",
+                        detail=f"blank after {SCREEN_TRIES} wakes")
             return result
         if remote_ref:
             install = guest.run(f"flatpak install --system --noninteractive -y {remote_ref} 2>&1", timeout=1200)
@@ -500,7 +596,7 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
         result["ok"] = all(s["ok"] for s in steps)
         return result
     except (RuntimeError, OSError, subprocess.SubprocessError, ValueError) as error:
-        step("vm", False, "The test VM had a problem; Luma will look at it.", internal=True, detail=str(error))
+        couldnt_run("vm", "vm_error", "The test VM had a problem; Luma will look at it.", detail=str(error))
         return result
     finally:
         try:
@@ -511,6 +607,7 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
         for name in ("serial.log", "qemu.log"):
             if (work / name).exists():
                 shutil.copy(work / name, out / name)
+        qmp_path(work).unlink(missing_ok=True)
         shutil.rmtree(work, ignore_errors=True)
 
 

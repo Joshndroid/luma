@@ -17,7 +17,13 @@ It runs on the build host as `luma-depot-review.service`. Configuration is `/etc
 | Metadata | Summary of 60 characters or fewer. Icon is an SVG or a square PNG of at least 512 px. Desktop screenshots are at least 1180 × 698; phone screenshots are 1170 × 2532. An app needs at least one desktop screenshot. |
 | VM run | Install, launch, screenshot and uninstall in a copy-on-write overlay of a Luma base disk (`depot_review/vm.py`). The launch screenshot goes to the Hub. |
 
-Results are `passed` (to Review), `needs_changes` (back to the developer, with the failed checks' messages), or `attention` (only internal problems; Luma looks at it).
+Results are `passed` (to Review), `needs_changes` (back to the developer, with the failed checks' messages), `attention` (only internal problems; Luma looks at it), or `couldnt_run`.
+
+`couldnt_run` means Depot's own checks didn't run: the VM didn't boot or its desktop didn't start, its screen was off, the host had no room, or the Hub or a container timed out. Those checks carry `infrastructure: true` and a `reason`, and are never findings against the app. The service retries the whole check after each of `infra_retry_delays` (5, 15 and 45 min), and only then reports `couldnt_run`, with an `ALERT depot-review:` line at error priority in the service journal. A developer finding in the same run still wins (`needs_changes`).
+
+The review VM boots only with headroom: it takes the review lane `vm_lock` (`/var/lock/luma-heavy-review.lock`, one review VM beside one luma-heavy job, like the conform lane), then waits up to `vm_slot_wait_seconds` until `vm_memory_mib + vm_reserve_mib` is available, the 1-minute load is under 0.75 per CPU and `luma-heavy.slice` isn't frozen by the thermal guard. The boot timeout starts when qemu does. The review desktop's dconf policy (in the base, and re-applied each run) turns off idle, dim, lock and blanking, and each run holds an idle inhibitor and wakes the display before it watches the screen.
+
+`depot-review recheck JOB/submission.json ...` re-runs the checks of submissions that were already reported and prints each verdict. It reports nothing to the Hub.
 
 AppImages are opened and scanned, then answered "coming soon". `.rpm`/`.deb` are fully checked but don't publish yet.
 

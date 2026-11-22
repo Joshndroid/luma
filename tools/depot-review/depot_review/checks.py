@@ -200,11 +200,29 @@ def media_checks(media: dict, listing: dict, kind: str) -> list[dict]:
     return out
 
 
+# A check Depot itself couldn't run (the VM didn't boot, its screen was off, the
+# host had no room). It says nothing about the app: never a finding against it.
+COULDNT_RUN = "couldnt_run"
+INFRA_MESSAGE = "Depot couldn't run this check on its side. Luma runs it again; you don't need to do anything."
+
+
+def infrastructure(key: str, reason: str, detail: str = "", message: str = INFRA_MESSAGE) -> dict:
+    return check(key, False, message, detail=detail, internal=True, infrastructure=True, reason=reason)
+
+
+def infrastructure_failures(checks: list[dict]) -> list[dict]:
+    return [c for c in checks if not c["ok"] and c.get("infrastructure")]
+
+
 def outcome(checks: list[dict]) -> str:
-    """passed, needs_changes, or attention (only internal problems: Luma looks at it)."""
+    """passed; needs_changes (a finding the developer fixes); couldnt_run (Depot's
+    own checks didn't run: retried, never shown as a finding); or attention (only
+    internal problems: Luma looks at it)."""
     failed = [c for c in checks if not c["ok"]]
     if not failed:
         return "passed"
-    if all(c.get("internal") for c in failed):
-        return "attention"
-    return "needs_changes"
+    if not all(c.get("internal") for c in failed):
+        return "needs_changes"
+    if any(c.get("infrastructure") for c in failed):
+        return COULDNT_RUN
+    return "attention"

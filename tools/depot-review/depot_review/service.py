@@ -10,7 +10,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import catalog4, catalogue, checks, images, publish, vm
+from . import capacity, catalog4, catalogue, checks, images, publish, vm
 from .config import Config
 from .hub import Hub, HubError
 
@@ -19,6 +19,11 @@ EXTENSIONS = {"flatpak": ".flatpak", "rpm": ".rpm", "deb": ".deb", "appimage": "
 
 def log(message: str) -> None:
     print(time.strftime("%H:%M:%S"), message, flush=True)
+
+
+def alert(message: str) -> None:
+    """An error-priority journal line (sd-daemon prefix) for Depot's own failures."""
+    print(f"<3>ALERT depot-review: {message}", flush=True)
 
 
 def unwrap(reply, *keys):
@@ -162,14 +167,11 @@ def review(config: Config, hub: Hub | None, submission: dict, job: Path, package
                                                   f"Launch test on {arch} runs on ARM hardware; it's coming soon.",
                                                   skipped=True))
                 continue
-            run = vm.run_app(config.vm_base, config.vm_key, Path(package["path"]), facts["app_id"],
-                             facts["format"], job / f"vm-{arch}", arch)
+            run = run_vm(config, package, facts, job / f"vm-{arch}", arch)
             vm_runs[arch] = run
             if run.get("screenshot"):
                 screenshots[arch] = run["screenshot"]
-            for step in run["steps"]:
-                report_checks.append(checks.check(f"vm:{step['step']} ({arch})", step["ok"], step["message"],
-                                                  detail=step.get("detail", ""), internal=step.get("internal", False)))
+            report_checks += vm_checks(run, arch)
     status = checks.outcome(report_checks)
     report = {
         "status": status,
@@ -182,6 +184,92 @@ def review(config: Config, hub: Hub | None, submission: dict, job: Path, package
     }
     (job / "report.json").write_text(json.dumps(report, indent=1))
     report["_screenshots"] = screenshots
+    return report
+
+
+def run_vm(config: Config, package: dict, facts: dict, out: Path, arch: str) -> dict:
+    """One VM run, booted only once the host has room for it."""
+    try:
+        with capacity.slot(config.vm_lock, config.vm_memory_mib + config.vm_reserve_mib,
+                           config.vm_slot_wait_seconds, note=log):
+            return vm.run_app(config.vm_base, config.vm_key, Path(package["path"]), facts["app_id"],
+                              facts["format"], out, arch, memory=str(config.vm_memory_mib), cpus=str(config.vm_cpus))
+    except capacity.NoCapacity as error:
+        log(f"capacity: {error}")
+        return {"steps": [{"step": "boot", "ok": False, "message": "The test VM couldn't start: the build server "
+                           "had no room for it.", "internal": True, "infrastructure": True,
+                           "reason": error.reason, "detail": str(error)}], "screenshot": None, "ok": False}
+
+
+def vm_checks(run: dict, arch: str) -> list[dict]:
+    out = []
+    for step in run["steps"]:
+        extra = {"internal": step.get("internal", False)}
+        if step.get("infrastructure"):
+            extra.update(infrastructure=True, reason=step.get("reason", ""))
+        out.append(checks.check(f"vm:{step['step']} ({arch})", step["ok"], step["message"],
+                                detail=step.get("detail", ""), **extra))
+    return out
+
+
+# Failures of Depot's own plumbing, not of the package: retried like a VM that didn't boot.
+INFRA_ERRORS = (HubError, subprocess.TimeoutExpired, MemoryError, capacity.NoCapacity)
+
+
+def failure_report(error: BaseException) -> dict:
+    detail = str(error)[-1500:]
+    if isinstance(error, INFRA_ERRORS):
+        reason = getattr(error, "reason", "") or type(error).__name__
+        item = checks.infrastructure("pipeline", reason, detail=detail)
+    else:
+        item = checks.check("pipeline", False, "Depot couldn't finish checking this. Luma will look at it; "
+                            "you don't need to do anything.", detail=detail, internal=True)
+    return {"status": checks.outcome([item]), "checks": [item], "_screenshots": {}}
+
+
+def reasons(report: dict) -> str:
+    failed = checks.infrastructure_failures(report.get("checks") or [])
+    return "; ".join(f"{c['key']}: {c.get('reason') or c['message']}" for c in failed) or "unknown"
+
+
+def with_retries(attempt, delays, *, sleep=time.sleep, note=log) -> tuple[dict, int]:
+    """Run attempt() until its report isn't couldnt_run, waiting delays[i]
+    between tries. Returns (last report, attempts made)."""
+    tries = 0
+    for delay in [*delays, None]:
+        tries += 1
+        report = attempt()
+        if report.get("status") != checks.COULDNT_RUN or delay is None:
+            return report, tries
+        note(f"checks couldn't run (attempt {tries}/{len(delays) + 1}: {reasons(report)}); retrying in {delay} s")
+        sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def check_with_retries(config: Config, hub: Hub, submission: dict, job: Path) -> dict:
+    """The full check of one submission, retried while Depot's own checks couldn't run."""
+    sid = str(submission["id"])
+    packages: list[dict] = []
+    counter = [0]
+
+    def attempt() -> dict:
+        counter[0] += 1
+        run = job / f"attempt-{counter[0]}"
+        run.mkdir(parents=True, exist_ok=True)
+        try:
+            if not packages:
+                packages.extend(download_packages(config, hub, submission, job))
+            if not packages and not submission.get("listing_only"):
+                raise RuntimeError("the submission has no uploads")
+            return review(config, hub, submission, run, packages)
+        except Exception as error:  # report every failure; never leave a submission claimed
+            traceback.print_exc()
+            return failure_report(error)
+
+    report, tries = with_retries(attempt, config.infra_retry_delays)
+    report["attempts"] = tries
+    if report["status"] == checks.COULDNT_RUN:
+        alert(f"checks couldn't run for {sid} ({submission.get('app_id')}) after {tries} attempts: {reasons(report)}")
     return report
 
 
@@ -204,16 +292,7 @@ def handle_check(config: Config, hub: Hub, submission: dict) -> None:
     job.mkdir(parents=True)
     (job / "submission.json").write_text(json.dumps(submission, indent=1))
     log(f"checking submission {sid} ({submission.get('app_id')})")
-    try:
-        packages = download_packages(config, hub, submission, job)
-        if not packages and not submission.get("listing_only"):
-            raise RuntimeError("the submission has no uploads")
-        report = review(config, hub, submission, job, packages)
-    except Exception as error:  # report every failure; never leave a submission claimed
-        traceback.print_exc()
-        report = {"status": "attention", "checks": [checks.check("pipeline", False,
-                  "Depot couldn't finish checking this. Luma will look at it; you don't need to do anything.",
-                  detail=str(error)[-1500:], internal=True)], "_screenshots": {}}
+    report = check_with_retries(config, hub, submission, job)
     shots = report.pop("_screenshots", {})
     urls = {}
     for arch, path in shots.items():

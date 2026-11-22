@@ -4,6 +4,8 @@
   depot-review serve                       claim work from the Hub until stopped
   depot-review check FILE [--arch A] [--format F] [--app-id ID] [--declare WORD ...] [--no-vm]
                                            check one package locally and print the report
+  depot-review recheck SUBMISSION_JSON ...  re-run the checks of submissions already reported (from their
+                                           job's submission.json) and print each verdict; reports nothing
   depot-review publish --id ID --app-id ID BUNDLE:ARCH ...
                                            publish reviewed bundles to the live remote
   depot-review withdraw --id ID --app-id ID --arch A [--target COMMIT] [--reason TEXT]
@@ -37,6 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--app-id", default="")
     c.add_argument("--declare", nargs="*", default=[])
     c.add_argument("--no-vm", action="store_true")
+    rc = sub.add_parser("recheck")
+    rc.add_argument("submissions", nargs="+", type=Path)
     p = sub.add_parser("publish")
     p.add_argument("--id", required=True)
     p.add_argument("--app-id", required=True)
@@ -70,6 +74,25 @@ def main(argv: list[str] | None = None) -> int:
                                   "sha256": sha}])
         print(json.dumps(report, indent=1))
         return 0 if report["status"] == "passed" else 1
+    if args.command == "recheck":
+        from .hub import Hub
+        hub = Hub(config.hub, config.token_file, config.paths)
+        verdicts = []
+        for path in args.submissions:
+            submission = json.loads(path.read_text())
+            sid = str(submission["id"])
+            job = config.work / "jobs" / f"recheck-{sid}-{time.strftime('%Y%m%dT%H%M%S')}"
+            job.mkdir(parents=True)
+            (job / "submission.json").write_text(json.dumps(submission, indent=1))
+            report = service.check_with_retries(config, hub, submission, job)
+            report.pop("_screenshots", None)
+            (job / "report.json").write_text(json.dumps(report, indent=1))
+            verdicts.append({"id": sid, "app_id": submission.get("app_id"), "version": submission.get("version"),
+                             "status": report["status"], "attempts": report.get("attempts"), "job": str(job),
+                             "failed": [{k: c.get(k) for k in ("key", "message", "reason") if c.get(k)}
+                                        for c in report["checks"] if not c["ok"]]})
+            print(json.dumps(verdicts[-1]), flush=True)
+        return 0
     if args.command == "publish":
         bundles = []
         for spec in args.bundles:

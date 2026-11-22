@@ -40,6 +40,22 @@ class Launch(unittest.TestCase):
         self.assertFalse(vm.window_verdict(0.35, 0.34))  # something else changed the screen
         self.assertFalse(vm.window_verdict(0.01, 0.0))   # nothing really appeared
 
+    def test_emergency_mode_is_seen(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            serial = Path(folder) / "serial.log"
+            self.assertFalse(vm.in_emergency(serial))
+            serial.write_text("[ TIME ] Timed out waiting for device\nYou are in emergency mode. After")
+            self.assertTrue(vm.in_emergency(serial))
+
+    def test_qmp_socket_fits_af_unix(self):
+        short = Path("/srv/jobs/run-x")
+        self.assertEqual(vm.qmp_path(short), short / "qmp.sock")
+        deep = Path("/srv/dev-storage/depot-review/work/jobs/recheck-sub_va4DOdlqJIxg-20261122T123356/attempt-1/"
+                    "vm-x86_64/run-_zghsieq")
+        self.assertLess(len(str(vm.qmp_path(deep))), 108)
+        self.assertNotEqual(vm.qmp_path(deep), vm.qmp_path(deep.with_name("run-other")))
+
 
 if __name__ == "__main__":
     unittest.main()
