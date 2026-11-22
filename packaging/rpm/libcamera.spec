@@ -2,7 +2,7 @@
 # README). Rebase on Fedora's spec when Fedora updates the package.
 Name:    libcamera
 Version: 0.7.2
-Release: 2.luma.1%{?dist}
+Release: 2.luma.2%{?dist}
 Summary: A library to support complex camera ISPs
 # see .reuse/dep5 and COPYING for details
 License: LGPL-2.1-or-later
@@ -16,6 +16,7 @@ Source3: 70-libcamera.rules
 Patch01: 0001-disable-rpi-pisp.patch
 Patch02: 0002-fix-ov01a10-flickering.patch
 Patch03: 0003-software-isp-bound-luminance-histogram-index.patch
+Patch04: 0004-software-isp-bound-cpu-debayer-lookup-index.patch
 
 # libcamera does not currently build on these architectures
 ExcludeArch: s390x ppc64le
@@ -166,7 +167,7 @@ mkdir -p %{buildroot}/%{_udevrulesdir}/
 install -D -m 644 %SOURCE3 %{buildroot}/%{_udevrulesdir}/
 
 %check
-%{__meson} test -C %{_vpath_builddir} --print-errorlogs swstats-cpu
+%{__meson} test -C %{_vpath_builddir} --print-errorlogs swstats-cpu debayer-cpu
 
 %files
 %license COPYING.rst LICENSES/LGPL-2.1-or-later.txt
@@ -208,6 +209,9 @@ install -D -m 644 %SOURCE3 %{buildroot}/%{_udevrulesdir}/
 %{python3_sitearch}/*
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.7.2-2.luma.2
+- Bound the software ISP CPU debayer lookup index
+
 * Fri Nov 20 2026 Project Luma <maintainers@projectluma.org> - 0.7.2-2.luma.1
 - Bound the software ISP luminance histogram index
 

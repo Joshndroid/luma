@@ -1,0 +1,283 @@
+From: Project Luma <maintainers@projectluma.org>
+Subject: [PATCH] libcamera: software_isp: Bound the CPU debayer lookup index
+
+DebayerCpu indexes its 256-entry colour lookup tables with the sample
+value divided down to 8 bits, assuming the sample fits the bit depth of
+the format. Unpacked 10- and 12-bit formats store samples in 16-bit
+containers, so a frame holding larger values produces indices up to
+16383. With _GLIBCXX_ASSERTIONS, as in distribution builds, the
+std::array bounds check aborts the process; without it the read runs
+off the table.
+
+This happens with the Intel IPU7 ISYS, which returns buffers the
+firmware rejected as completed, filled with 0xffff, and affects every
+unpacked 10/12-bit sensor when the software ISP runs on the CPU. The
+statistics have the same problem and are bounded separately.
+
+Saturate the index at the last table entry, so out-of-range samples
+produce the same output as the largest in-range sample.
+
+Add a test that debayers 0xffff frames in unpacked 10- and 12-bit
+formats, with and without the colour correction matrix, and compares
+the output with a frame of the largest valid sample.
+---
+ src/libcamera/software_isp/debayer_cpu.cpp |  38 +++--
+ test/debayer-cpu.cpp                       | 183 +++++++++++++++++++++
+ test/meson.build                           |   5 +-
+ 3 files changed, 210 insertions(+), 16 deletions(-)
+ create mode 100644 test/debayer-cpu.cpp
+
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index 49382b4c..e9d39ab9 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -131,21 +131,29 @@ DebayerCpu::~DebayerCpu() = default;
+ #define GAMMA(value) \
+ 	*dst++ = gammaLut_[std::clamp(value, 0, static_cast<int>(gammaLut_.size()) - 1)]
+ 
+-#define STORE_PIXEL(b_, g_, r_)                         \
+-	if constexpr (ccmEnabled) {                     \
+-		const CcmColumn &blue = blueCcm_[b_];   \
+-		const CcmColumn &green = greenCcm_[g_]; \
+-		const CcmColumn &red = redCcm_[r_];     \
+-		GAMMA(blue.b + green.b + red.b);        \
+-		GAMMA(blue.g + green.g + red.g);        \
+-		GAMMA(blue.r + green.r + red.r);        \
+-	} else {                                        \
+-		*dst++ = blue_[b_];                     \
+-		*dst++ = green_[g_];                    \
+-		*dst++ = red_[r_];                      \
+-	}                                               \
+-	if constexpr (addAlphaByte)                     \
+-		*dst++ = 255;                           \
++/*
++ * Samples are not guaranteed to fit the bit depth of the format: unpacked
++ * formats store them in wider containers, and a receiver may hand over a frame
++ * it failed to capture. Saturate out-of-range values instead of indexing past
++ * the end of the lookup tables.
++ */
++#define LUT_INDEX(value) std::min<unsigned int>(value, kRGBLookupSize - 1)
++
++#define STORE_PIXEL(b_, g_, r_)                                    \
++	if constexpr (ccmEnabled) {                                \
++		const CcmColumn &blue = blueCcm_[LUT_INDEX(b_)];   \
++		const CcmColumn &green = greenCcm_[LUT_INDEX(g_)]; \
++		const CcmColumn &red = redCcm_[LUT_INDEX(r_)];     \
++		GAMMA(blue.b + green.b + red.b);                   \
++		GAMMA(blue.g + green.g + red.g);                   \
++		GAMMA(blue.r + green.r + red.r);                   \
++	} else {                                                   \
++		*dst++ = blue_[LUT_INDEX(b_)];                     \
++		*dst++ = green_[LUT_INDEX(g_)];                    \
++		*dst++ = red_[LUT_INDEX(r_)];                      \
++	}                                                          \
++	if constexpr (addAlphaByte)                                \
++		*dst++ = 255;                                      \
+ 	x++;
+ 
+ /*
+diff --git a/test/debayer-cpu.cpp b/test/debayer-cpu.cpp
+new file mode 100644
+index 00000000..be91fccb
+--- /dev/null
++++ b/test/debayer-cpu.cpp
+@@ -0,0 +1,183 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * DebayerCpu out-of-range sample test
++ */
++
++#include <algorithm>
++#include <iostream>
++#include <memory>
++#include <stdint.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <vector>
++
++#include <libcamera/base/shared_fd.h>
++#include <libcamera/base/unique_fd.h>
++
++#include <libcamera/camera_manager.h>
++#include <libcamera/formats.h>
++#include <libcamera/framebuffer.h>
++#include <libcamera/geometry.h>
++#include <libcamera/stream.h>
++
++#include "libcamera/internal/software_isp/debayer_params.h"
++#include "libcamera/internal/software_isp/swstats_cpu.h"
++
++#include "../src/libcamera/software_isp/debayer_cpu.h"
++
++#include "test.h"
++
++using namespace std;
++using namespace libcamera;
++
++namespace {
++
++class MemBuffer
++{
++public:
++	MemBuffer(size_t size)
++		: size_(size)
++	{
++		UniqueFD fd(memfd_create("debayer-cpu-test", MFD_CLOEXEC));
++		if (!fd.isValid() || ftruncate(fd.get(), size) < 0)
++			return;
++
++		fd_ = SharedFD(std::move(fd));
++		FrameBuffer::Plane plane;
++		plane.fd = fd_;
++		plane.offset = 0;
++		plane.length = size;
++		buffer_ = std::make_unique<FrameBuffer>(std::vector<FrameBuffer::Plane>{ plane });
++	}
++
++	bool isValid() const { return !!buffer_; }
++	FrameBuffer *buffer() { return buffer_.get(); }
++
++	bool write(const void *data, size_t size)
++	{
++		void *mem = mmap(nullptr, size_, PROT_WRITE, MAP_SHARED, fd_.get(), 0);
++		if (mem == MAP_FAILED)
++			return false;
++		memcpy(mem, data, std::min(size, size_));
++		munmap(mem, size_);
++		return true;
++	}
++
++	vector<uint8_t> read()
++	{
++		vector<uint8_t> data(size_);
++		void *mem = mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_.get(), 0);
++		if (mem == MAP_FAILED)
++			return {};
++		memcpy(data.data(), mem, size_);
++		munmap(mem, size_);
++		return data;
++	}
++
++private:
++	size_t size_;
++	SharedFD fd_;
++	unique_ptr<FrameBuffer> buffer_;
++};
++
++} /* namespace */
++
++class DebayerCpuTest : public Test
++{
++protected:
++	/*
++	 * Debayer a frame filled with \a sample and return the output, or an
++	 * empty vector on failure.
++	 */
++	vector<uint8_t> debayer(CameraManager &cm, const PixelFormat &format,
++				bool ccm, uint16_t sample)
++	{
++		constexpr unsigned int kWidth = 64;
++		constexpr unsigned int kHeight = 16;
++
++		DebayerCpu debayer(make_unique<SwStatsCpu>(cm), cm);
++
++		StreamConfiguration inCfg;
++		inCfg.pixelFormat = format;
++		inCfg.size = { kWidth, kHeight };
++		inCfg.stride = kWidth * sizeof(uint16_t);
++
++		vector<PixelFormat> outFormats = debayer.formats(format);
++		if (outFormats.empty()) {
++			cerr << "No output format for " << format << endl;
++			return {};
++		}
++
++		StreamConfiguration outCfg;
++		outCfg.pixelFormat = outFormats[0];
++		outCfg.size = debayer.sizes(format, inCfg.size).max;
++		unsigned int frameSize;
++		std::tie(outCfg.stride, frameSize) =
++			debayer.strideAndFrameSize(outCfg.pixelFormat, outCfg.size);
++
++		if (debayer.configure(inCfg, { outCfg }, ccm)) {
++			cerr << "Failed to configure " << format << endl;
++			return {};
++		}
++
++		MemBuffer in(inCfg.stride * kHeight);
++		MemBuffer out(frameSize);
++		if (!in.isValid() || !out.isValid()) {
++			cerr << "Failed to allocate buffers" << endl;
++			return {};
++		}
++
++		vector<uint16_t> frame(kWidth * kHeight, sample);
++		in.write(frame.data(), frame.size() * sizeof(uint16_t));
++
++		if (debayer.start()) {
++			cerr << "Failed to start the debayer" << endl;
++			return {};
++		}
++		debayer.process(0, in.buffer(), out.buffer(), DebayerParams{});
++		debayer.stop();
++
++		return out.read();
++	}
++
++	int run()
++	{
++		CameraManager cm;
++
++		/*
++		 * Unpacked 10- and 12-bit samples live in 16-bit containers. A
++		 * frame the receiver failed to capture may hold any value
++		 * there: it must come out as saturated, like the largest
++		 * in-range sample.
++		 */
++		const struct {
++			PixelFormat format;
++			uint16_t max;
++		} cases[] = {
++			{ formats::SGRBG10, 0x3ff },
++			{ formats::SBGGR10, 0x3ff },
++			{ formats::SGRBG12, 0xfff },
++			{ formats::SRGGB12, 0xfff },
++		};
++
++		for (const auto &c : cases) {
++			for (bool ccm : { false, true }) {
++				vector<uint8_t> expected = debayer(cm, c.format, ccm, c.max);
++				vector<uint8_t> result = debayer(cm, c.format, ccm, 0xffff);
++				if (expected.empty() || result.empty())
++					return TestFail;
++
++				if (result != expected) {
++					cerr << c.format << (ccm ? " (CCM)" : "")
++					     << ": out-of-range samples not saturated" << endl;
++					return TestFail;
++				}
++			}
++		}
++
++		return TestPass;
++	}
++};
++
++TEST_REGISTER(DebayerCpuTest)
+diff --git a/test/meson.build b/test/meson.build
+index 6b2b2e8a..9879f969 100644
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -80,7 +80,10 @@ internal_tests = [
+ ]
+ 
+ if softisp_enabled
+-    internal_tests += {'name': 'swstats-cpu', 'sources': ['swstats-cpu.cpp']}
++    internal_tests += [
++        {'name': 'debayer-cpu', 'sources': ['debayer-cpu.cpp']},
++        {'name': 'swstats-cpu', 'sources': ['swstats-cpu.cpp']},
++    ]
+ endif
+ 
+ internal_non_parallel_tests = [

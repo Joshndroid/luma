@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 Name:           luma-fp6-platform
 Version:        0.1.0
-Release:        1.luma.22%{?dist}
+Release:        1.luma.23%{?dist}
 Summary:        Fairphone 6 platform services for Luma
 License:        Apache-2.0
 URL:            https://github.com/SimplyLuma/luma
@@ -70,6 +70,9 @@ grep -Fxq 'ConditionFirmware=device-tree-compatible(fairphone,fp6)' %{buildroot}
 grep -Fxq 'ConditionPathExists=!/var/lib/luma-device-boot/pending.json' %{buildroot}%{_unitdir}/luma-fp6-boot-success.service
 test ! -s %{buildroot}%{_unitdir}/boot.automount
 grep -Fxq 'wifi.powersave=2' %{buildroot}%{_prefix}/lib/NetworkManager/conf.d/50-luma-fp6-wifi.conf
+for unit in wireplumber.service wireplumber@video-capture.service; do
+  grep -Fxq 'Environment=LIBCAMERA_SOFTISP_MODE=cpu' %{buildroot}%{_sysconfdir}/systemd/user/$unit.d/50-luma-fp6-camera.conf
+done
 grep -Fxq 'MemorySleepMode=s2idle' %{buildroot}%{_prefix}/lib/systemd/sleep.conf.d/50-luma-fp6.conf
 grep -Fq 'ACTION=="add|bind", SUBSYSTEM=="platform", KERNEL=="890000.serial", ATTR{power/wakeup}="disabled"' %{buildroot}%{_prefix}/lib/udev/rules.d/60-luma-fp6-wakeup.rules
 # The login screen keeps the signed-in session's power defaults.
@@ -94,6 +97,7 @@ dconf update || :
 %config(noreplace) %{_sysconfdir}/dconf/db/luma.d/10-luma-handheld
 %config(noreplace) %{_sysconfdir}/dconf/db/gdm.d/10-luma-handheld
 %config(noreplace) %{_sysconfdir}/systemd/user/wireplumber.service.d/50-luma-fp6-camera.conf
+%config(noreplace) %{_sysconfdir}/systemd/user/wireplumber@video-capture.service.d/50-luma-fp6-camera.conf
 %config(noreplace) %{_sysconfdir}/wireplumber/wireplumber.conf.d/51-luma-fp6-audio.conf
 %{_prefix}/lib/environment.d/90-luma-handheld.conf
 %{_prefix}/lib/NetworkManager/conf.d/50-luma-fp6-wifi.conf
@@ -117,6 +121,12 @@ dconf update || :
 %{_datadir}/dbus-1/system.d/org.projectluma.AudioRoute1.conf
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.23
+- Apply the camera settings (CPU software ISP, no core dump on stop) to
+  wireplumber@video-capture.service, which hosts the camera monitors on images
+  that run cameras in their own WirePlumber instance. The wireplumber.service
+  copy stays for images that still run them in the main instance.
+
 * Thu Nov 19 2026 Malak Sedarous <18029995+malaksedarous@users.noreply.github.com> - 0.1.0-1.luma.22
 - luma-clock-save also records the offset between the wall clock and the
   PMIC RTC, which keeps counting while the phone is off but can't be set,
