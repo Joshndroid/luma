@@ -892,3 +892,20 @@ surface's border (a 1 px rim at each side on the phone), 2 px narrower. A
 body that fit one line at the measured width wrapped in the card, the lip
 kept the one-line height, and its clipped surface cut off the actions. The
 card is measured at the surface's content box. Shell .199.
+
+`0387-icon-mask-cuts-in-actor-pixels.patch`: LumaIconMask measured its
+corner in the offscreen texture's coordinates, and that texture is the
+actor's enlarged paint volume (37 px for a 34 px notification tile), so
+the corner was cut 1.5 px outside the icon around a larger circle and
+the art's own corner showed instead. The mask maps texture coordinates
+back to the actor's pixels, the mapping LumaRoundedClip already used
+(now shared), with the radius a fraction of the actor's shorter side.
+Notification tiles, dock icons and the shelf's media and status icons
+take the corner they ask for. Shell .200.
+
+`0388-notification-lip-card-keeps-the-rim-pixel.patch`: the lip was as
+tall as its card, and the surface's 1 px bottom rim sat inside that
+height, so the card was laid out a pixel short and the clip took the
+pixel from its actions (a 120 px card in 119, 30 px buttons in 29). The
+card and tray take the surface's own measure, rim included; the pill
+keeps its height. Shell .200.

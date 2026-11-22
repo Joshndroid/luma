@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sun, 22 Nov 2026 14:40:00 -0600
+Subject: [PATCH] Notification lip: the card and tray get the rim's pixel back
+
+The lip was as tall as its card, but the surface draws a 1 px rim along
+its bottom edge inside that height, so the card was laid out a pixel
+short and the clip took the pixel from its actions (a 120 px card in 119,
+30 px buttons in 29). The card and tray now take the surface's own
+measure at the lip's width, rim included. The pill keeps its height.
+---
+ js/ui/lumaNotificationBeacon.js | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/js/ui/lumaNotificationBeacon.js b/js/ui/lumaNotificationBeacon.js
+index 4356b14..af42f49 100644
+--- a/js/ui/lumaNotificationBeacon.js
++++ b/js/ui/lumaNotificationBeacon.js
+@@ -500,10 +500,18 @@ export const NotificationLip = GObject.registerClass(class NotificationLip exten
+             // The card gets the surface's content box, not the lip's width:
+             // the phone's surface has a 1 px rim at each side, and a body
+             // measured 2 px too wide stays on one line, then wraps in the
+-            // card and pushes its actions out of the clipped surface.
+-            const inner = this._surface.get_theme_node().get_content_box(
+-                new Clutter.ActorBox({x1: 0, y1: 0, x2: width, y2: monitor.height}));
+-            [, height] = this._surface.child.get_preferred_height(inner.get_width());
++            // card and pushes its actions out of the clipped surface. The
++            // card and tray then get the surface's own measure, rim
++            // included: the child's height alone left the bottom rim inside
++            // it, a pixel short, and the clip took that pixel from the
++            // actions. The pill keeps its 22 px chip, rim inside.
++            if (this._state === 'pill') {
++                const inner = this._surface.get_theme_node().get_content_box(
++                    new Clutter.ActorBox({x1: 0, y1: 0, x2: width, y2: monitor.height}));
++                [, height] = this._surface.child.get_preferred_height(inner.get_width());
++            } else {
++                [, height] = this._surface.get_preferred_height(width);
++            }
+             height = Math.min(height, monitor.height - (top - monitor.y) - 24 * scale);
+         }
+         const wasFullPage = this._fullPage;

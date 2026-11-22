@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sun, 22 Nov 2026 13:30:00 -0600
+Subject: [PATCH] Icon mask: cut the corner at the actor's corner, in its
+ pixels
+
+LumaIconMask measured its corner radius in the offscreen texture's
+coordinates, but that texture is the actor's paint volume, which Clutter
+enlarges beyond the actor (a 34 px notification tile draws into 37 px). A
+radius of 10/34 was then cut 1.5 px outside the tile around a larger
+circle, and art with its own rounder corner showed instead: the
+notification tile, the dock and the shelf's media and status icons never
+got the corner they asked for. The mask now maps texture coordinates back
+to the actor's pixels, as LumaRoundedClip already did (the same mapping,
+now shared), and takes its radius as a fraction of the actor's shorter
+side with a one-pixel antialiased edge.
+---
+ js/ui/iconMask.js | 60 +++++++++++++++++++++++++++++++----------------
+ 1 file changed, 40 insertions(+), 20 deletions(-)
+
+diff --git a/js/ui/iconMask.js b/js/ui/iconMask.js
+index 69573f2..8ea1c07 100644
+--- a/js/ui/iconMask.js
++++ b/js/ui/iconMask.js
+@@ -1,22 +1,30 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+-// Shared shelf artwork mask, extracted unchanged from the existing dock.
++// Shared shelf artwork mask (the dock's, the shelf's and the notification tile's).
+ import Cogl from 'gi://Cogl';
+ import GObject from 'gi://GObject';
+ import Shell from 'gi://Shell';
+ import St from 'gi://St';
+ 
++// radius is a fraction of the actor's shorter side. The offscreen texture is
++// the actor's paint volume, enlarged beyond the actor on every side, so the
++// texture coordinates are mapped back to actor pixels (as LumaRoundedClip
++// does) and the corner is cut at the actor's corner, not the texture's.
+ const ICON_MASK_DECLARATIONS = `
+ uniform float radius;
++uniform vec2 mask_extent;
++uniform vec2 mask_size;
++uniform vec2 mask_origin;
+ `;
+ 
+ // Runs after the default fragment stage, so cogl_color_out already holds the
+ // sampled texel and the mask only has to attenuate it. Colour is premultiplied,
+ // so scaling the whole vector is the correct way to fade a corner out.
+ const ICON_MASK_CODE = `
+-vec2 uv = cogl_tex_coord_in[0].st;
+-vec2 edge = min(uv, vec2(1.0) - uv);
+-float corner = length(max(vec2(radius) - edge, vec2(0.0)));
+-cogl_color_out *= 1.0 - smoothstep(radius - 0.02, radius + 0.02, corner);
++vec2 point = cogl_tex_coord_in[0].st * mask_extent + mask_origin;
++float r = radius * min(mask_size.x, mask_size.y);
++vec2 edge = min(point, mask_size - point);
++float corner = length(max(vec2(r) - edge, vec2(0.0)));
++cogl_color_out *= 1.0 - smoothstep(r - 0.5, r + 0.5, corner);
+ `;
+ 
+ // Clutter draws an offscreen effect with nearest-texel sampling at whole
+@@ -32,6 +40,29 @@ export function smoothOffscreenSampling(effect) {
+ // they read as one family. Stated as a fraction so it holds at every size.
+ export const ICON_CORNER_RATIO = 10 / 36;
+ 
++// Maps an offscreen effect's texture coordinates to its actor's pixels: the
++// texture is the paint volume, which Clutter enlarges beyond the actor.
++// Sets <prefix>_extent (the texture in logical pixels), <prefix>_size (the
++// actor) and <prefix>_origin (the texture's corner in actor pixels).
++function setActorMapping(effect, prefix) {
++    const actor = effect.actor;
++    const texture = effect.get_texture();
++    if (!actor || !texture)
++        return false;
++    const scale = Math.max(1, Math.ceil(actor.get_resource_scale()));
++    const volume = actor.get_paint_volume();
++    const origin = volume?.get_origin() ?? {x: 0, y: 0};
++    // The offscreen enlargement rule of the native window mask.
++    const enlarge = (start, size) => Math.trunc(Math.ceil(start + size + 0.75) - Math.round(size) - 3);
++    const width = volume?.get_width() ?? actor.width;
++    const height = volume?.get_height() ?? actor.height;
++    const set = (name, values) => effect.set_uniform_float(effect.get_uniform_location(`${prefix}_${name}`), values.length, values);
++    set('extent', [texture.get_width() / scale, texture.get_height() / scale]);
++    set('size', [actor.width, actor.height]);
++    set('origin', [enlarge(origin.x, width), enlarge(origin.y, height)]);
++    return true;
++}
++
+ export const LumaIconMask = GObject.registerClass(
+ class LumaIconMask extends Shell.GLSLEffect {
+     vfunc_build_pipeline() {
+@@ -41,6 +72,7 @@ class LumaIconMask extends Shell.GLSLEffect {
+     }
+ 
+     vfunc_paint_target(node, paintContext) {
++        setActorMapping(this, 'mask');
+         smoothOffscreenSampling(this);
+         super.vfunc_paint_target(node, paintContext);
+     }
+@@ -71,21 +103,9 @@ class LumaRoundedClip extends Shell.GLSLEffect {
+     }
+ 
+     vfunc_paint_target(node, paintContext) {
+-        const actor = this.actor;
+-        const texture = this.get_texture();
+-        if (actor && texture) {
+-            const scale = Math.max(1, Math.ceil(actor.get_resource_scale()));
+-            const volume = actor.get_paint_volume();
+-            const origin = volume?.get_origin() ?? {x: 0, y: 0};
+-            // Same offscreen enlargement rule as the native window mask.
+-            const enlarge = (start, size) => Math.trunc(Math.ceil(start + size + 0.75) - Math.round(size) - 3);
+-            const width = volume?.get_width() ?? actor.width;
+-            const height = volume?.get_height() ?? actor.height;
+-            const set = (name, values) => this.set_uniform_float(this.get_uniform_location(name), values.length, values);
+-            set('clip_extent', [texture.get_width() / scale, texture.get_height() / scale]);
+-            set('clip_size', [actor.width, actor.height]);
+-            set('clip_origin', [enlarge(origin.x, width), enlarge(origin.y, height)]);
+-            set('clip_radius', [this._radius * St.ThemeContext.get_for_stage(actor.get_stage()).scale_factor]);
++        if (setActorMapping(this, 'clip')) {
++            this.set_uniform_float(this.get_uniform_location('clip_radius'), 1,
++                [this._radius * St.ThemeContext.get_for_stage(this.actor.get_stage()).scale_factor]);
+         }
+         smoothOffscreenSampling(this);
+         super.vfunc_paint_target(node, paintContext);
