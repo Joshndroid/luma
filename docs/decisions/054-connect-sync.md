@@ -131,6 +131,23 @@ store.put(recipe.id, {"title": recipe.title, "steps": recipe.steps}, assets={"ph
 store.connect("changed", lambda s, ids: reload(ids))   # fires for edits from other devices
 ```
 
+### 5a. Apps that sync across every device (game saves, libraries)
+
+Amended 2026-11-22 for apps such as emulators and games.
+
+1. **App zones are not bound to a device class.** The Computer, Handheld and TV boundary in section 3 applies only to whole-device sync of settings and layout. A zone created through the Connect Sync API reaches every approved device on the account by default. An app may limit a zone to classes it names.
+2. **Large assets on demand.** Besides inline assets, a zone may hold *on-demand assets*:
+   - **Storage.** Assets are chunked, deduplicated by content hash, encrypted per chunk with the zone key, and counted against the account's storage, not the per-app 1 GB.
+   - **Limits.** Each asset may be up to 16 GB.
+   - **What every device gets.** Metadata syncs to every device. The bytes download only when the app asks on that device, or when the person pins the item.
+   - **Storage pressure.** A device that is short of space keeps metadata and evicts unpinned bytes, oldest first.
+3. **Exclusive sessions.** An app can take a lease on a record (`Lease(zone, id, ttl)`), for example "playing this game". Another device that opens the same record sees who holds it and can take it over. The lease is advisory and never blocks.
+4. **Conflicts that can't merge** (binary save files) keep both versions. The newer one becomes current, and the other stays as a labelled sibling ("from Living room TV, 21:04"), which the app shows the person until one is chosen. Nothing is silently overwritten.
+5. **Worked example: an emulator.**
+   - Zone `saves`, all devices, on by default: save files and save states as records with inline assets, using leases while playing.
+   - Zone `library`, opt-in in the app: game entries, artwork and play history sync everywhere. The game files are on-demand assets; each device downloads only what is opened or pinned there.
+   - The app's install sheet shows the "Syncs with your devices" chip. Settings shows both zones with their usage, and the person can turn the library off while keeping saves.
+
 ### 6. Server (Hub)
 
 1. **Placement.** A Hub module, `server/local-hub/sync/`, with its own `sync.sqlite` and the path prefix `/api/sync/v1/`. It is shaped like ADR-051's delivery module, so it can move to its own host by changing one nginx upstream. It authenticates with the existing device tokens and `devices` table.
