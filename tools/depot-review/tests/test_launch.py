@@ -40,6 +40,20 @@ class Launch(unittest.TestCase):
         self.assertFalse(vm.window_verdict(0.35, 0.34))  # something else changed the screen
         self.assertFalse(vm.window_verdict(0.01, 0.0))   # nothing really appeared
 
+    def test_unit_state_probe(self):
+        self.assertEqual(vm.parse_unit_state(0, "active\n"), "active")
+        self.assertEqual(vm.parse_unit_state(3, "inactive\n"), "inactive")
+        self.assertEqual(vm.parse_unit_state(3, "failed"), "failed")
+        # A probe that timed out or lost SSH is not the app closing.
+        self.assertEqual(vm.parse_unit_state(124, ""), "unknown")
+        self.assertEqual(vm.parse_unit_state(255, ""), "unknown")
+        self.assertEqual(vm.parse_unit_state(1, "Failed to connect to bus: No medium found"), "unknown")
+
+    def test_control_app_decides_who_a_failed_launch_is_about(self):
+        self.assertEqual(vm.judge_launch(False), "infrastructure")  # the control failed too: the VM
+        self.assertEqual(vm.judge_launch(True), "app")              # the control opened a window
+        self.assertEqual(vm.judge_launch(None), "app")              # no control: the finding stands
+
     def test_emergency_mode_is_seen(self):
         import tempfile
         with tempfile.TemporaryDirectory() as folder:

@@ -193,7 +193,9 @@ def run_vm(config: Config, package: dict, facts: dict, out: Path, arch: str) -> 
         with capacity.slot(config.vm_lock, config.vm_memory_mib + config.vm_reserve_mib,
                            config.vm_slot_wait_seconds, note=log):
             return vm.run_app(config.vm_base, config.vm_key, Path(package["path"]), facts["app_id"],
-                              facts["format"], out, arch, memory=str(config.vm_memory_mib), cpus=str(config.vm_cpus))
+                              facts["format"], out, arch, memory=str(config.vm_memory_mib), cpus=str(config.vm_cpus),
+                              control_bundle=config.control_bundle if arch == "x86_64" else None,
+                              control_app_id=config.control_app_id)
     except capacity.NoCapacity as error:
         log(f"capacity: {error}")
         return {"steps": [{"step": "boot", "ok": False, "message": "The test VM couldn't start: the build server "

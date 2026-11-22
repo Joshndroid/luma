@@ -434,17 +434,40 @@ def wake(guest: "Guest", uid: str) -> None:
 
 
 SCREEN_TRIES = 4
+UNIT_STATES = ("active", "activating", "deactivating", "inactive", "failed")
+
+
+def parse_unit_state(returncode: int, stdout: str) -> str:
+    """systemctl is-active's answer, or "unknown" when SSH or the user manager
+    didn't answer (a probe timeout is not the app closing)."""
+    lines = stdout.strip().splitlines()
+    state = lines[-1].strip() if lines else ""
+    if returncode in (124, 255) or state not in UNIT_STATES:
+        return "unknown"
+    return state
+
+
+def judge_launch(control: bool | None) -> str:
+    """Who a failed launch is about. A known-good control app that also fails on
+    the same VM means the VM couldn't run apps: "infrastructure". Otherwise (it
+    opened a window, or there was no control to run) the finding stands: "app"."""
+    return "infrastructure" if control is False else "app"
 
 
 def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, out: Path, arch: str = "x86_64",
-            boot_timeout: int = 420, remote_ref: str | None = None, memory: str = "6144", cpus: str = "4") -> dict:
+            boot_timeout: int = 420, remote_ref: str | None = None, memory: str = "6144", cpus: str = "4",
+            control_bundle: Path | None = None, control_app_id: str = "") -> dict:
     """With remote_ref (e.g. luma app/ID/ARCH/stable), install from the VM's own
     configured remote instead of a bundle: the published-release check.
 
     Returns {"steps": [{step, ok, message}], "screenshot": path|None, "ok": bool}.
     A step Depot itself couldn't run carries infrastructure=True and a reason;
     it says nothing about the app. The boot timeout counts from qemu's start, so
-    take host capacity (capacity.slot) before calling this."""
+    take host capacity (capacity.slot) before calling this.
+
+    When the app doesn't launch, control_bundle (a known-good app on the same
+    runtime) is launched on the same VM. If it fails too, the launch step is
+    infrastructure (control_failed), not a finding against the app."""
     out.mkdir(parents=True, exist_ok=True)
     steps: list[dict] = []
     result = {"steps": steps, "screenshot": None, "ok": False, "arch": arch}
@@ -530,49 +553,107 @@ def run_app(base: Path, key: Path, package: Path | None, app_id: str, fmt: str, 
              "Your app didn't install.")
         if installed.returncode != 0:
             return result
-        launch = guest.run(f"runuser -u {USER} -- env {session_env(uid)} systemd-run --user --collect "
-                           f"--unit=depot-review-app --property=TimeoutStopSec=10 flatpak run {app_id}", timeout=60)
-        if launch.returncode != 0:
-            step("launch", False, "Your app couldn't be started.", detail=launch.stderr[-800:])
-            return result
-        alive, fraction, seen = False, 0.0, 0
+        env = session_env(uid)
         shot = work / "after.ppm"
-        launched = time.time()
-        base_rgb = read_ppm(before)[2]
-        # A first start builds Flatpak's library cache for the runtime, which
-        # on the VM's cold disk can take over a minute; allow three. The window
-        # has to show in two samples in a row, so a flash elsewhere doesn't count.
-        for _ in range(36):
-            time.sleep(5)
-            state = guest.run(f"runuser -u {USER} -- env {session_env(uid)} systemctl --user is-active "
-                              f"depot-review-app", timeout=20).stdout.strip()
-            alive = state in ("active", "activating")
+
+        def start(unit: str, ident: str) -> subprocess.CompletedProcess:
+            return guest.run(f"runuser -u {USER} -- env {env} systemd-run --user --collect "
+                             f"--unit={unit} --property=TimeoutStopSec=10 flatpak run {ident}", timeout=60)
+
+        def watch(unit: str, base_rgb: bytes) -> dict:
+            """Sample the unit and the screen until a window shows twice in a row,
+            the unit stops, or three minutes pass (a first start builds Flatpak's
+            library cache for the runtime, which on the VM's cold disk can take
+            over a minute)."""
+            alive, seen, unknown, probes = False, 0, 0, 0
+            launched = time.time()
+            for _ in range(36):
+                time.sleep(5)
+                probe = guest.run(f"runuser -u {USER} -- env {env} systemctl --user is-active {unit}", timeout=20)
+                state = parse_unit_state(probe.returncode, probe.stdout)
+                probes += 1
+                if state == "unknown":
+                    unknown += 1
+                else:
+                    alive = state in ("active", "activating")
+                qmp.command("screendump", filename=str(shot))
+                fraction = changed_fraction(base_rgb, read_ppm(shot)[2], WIDTH, HEIGHT)
+                seen = seen + 1 if fraction > WINDOW_FRACTION else 0
+                if (state != "unknown" and not alive) or seen >= 2:
+                    break
+            seconds = int(time.time() - launched)
+            time.sleep(3)
             qmp.command("screendump", filename=str(shot))
-            fraction = changed_fraction(base_rgb, read_ppm(shot)[2], WIDTH, HEIGHT)
-            seen = seen + 1 if fraction > WINDOW_FRACTION else 0
-            if not alive or seen >= 2:
-                break
-        seconds = int(time.time() - launched)
-        time.sleep(3)
-        qmp.command("screendump", filename=str(shot))
-        width, height, rgb = read_ppm(shot)
-        shown = changed_fraction(base_rgb, rgb, width, height)
+            width, height, rgb = read_ppm(shot)
+            return {"alive": alive, "seen": seen, "seconds": seconds, "rgb": rgb, "width": width, "height": height,
+                    "shown": changed_fraction(base_rgb, rgb, width, height), "blind": unknown == probes}
+
+        def stop(unit: str, ident: str) -> None:
+            guest.run(f"runuser -u {USER} -- env {env} systemctl --user stop {unit}", timeout=30)
+            guest.run(f"runuser -u {USER} -- env {env} flatpak kill {ident}", timeout=20)
+
+        def control() -> tuple[bool | None, str]:
+            """Launch the known-good control app on this VM: did it open a window?"""
+            if not control_bundle or not control_app_id or control_app_id == app_id:
+                return None, "no control app"
+            if not Path(control_bundle).is_file():
+                log(f"control: {control_bundle} is missing")
+                return None, f"control bundle {control_bundle} is missing"
+            stop("depot-review-app", app_id)
+            guest.copy(Path(control_bundle), "/var/tmp/control.flatpak")
+            added = guest.run("flatpak install --system --noninteractive -y /var/tmp/control.flatpak 2>&1",
+                              timeout=900)
+            if added.returncode != 0:
+                return False, "control app didn't install: " + added.stdout[-600:]
+            time.sleep(3)
+            qmp.command("screendump", filename=str(work / "control-before.ppm"))
+            control_rgb = read_ppm(work / "control-before.ppm")[2]
+            if start("depot-review-control", control_app_id).returncode != 0:
+                return False, "control app couldn't be started"
+            seen = watch("depot-review-control", control_rgb)
+            stop("depot-review-control", control_app_id)
+            time.sleep(3)
+            qmp.command("screendump", filename=str(shot))
+            gone = changed_fraction(control_rgb, read_ppm(shot)[2], WIDTH, HEIGHT)
+            ok = seen["seen"] >= 2 and window_verdict(seen["shown"], gone)
+            log(f"control: {control_app_id} {'opened a window' if ok else 'failed'} ({seen['seconds']} s)")
+            return ok, f"control app {control_app_id} {'opened a window' if ok else 'did not open a window'} " \
+                       f"on the same VM ({seen['seconds']} s, alive={seen['alive']})"
+
+        def failed_launch(message: str, detail: str) -> dict:
+            verdict, note = control()
+            if judge_launch(verdict) == "infrastructure":
+                couldnt_run("launch", "control_failed", "The test VM couldn't run apps, so your app's launch "
+                            "couldn't be judged.", detail=f"{note}\napp: {message}\n{detail}"[-1500:])
+            else:
+                step("launch", False, message, detail=f"{detail}\n({note})"[-1500:])
+            return result
+
+        launch = start("depot-review-app", app_id)
+        if launch.returncode != 0:
+            return failed_launch("Your app couldn't be started.", launch.stderr[-800:])
+        base_rgb = read_ppm(before)[2]
+        watched = watch("depot-review-app", base_rgb)
+        alive, seen, seconds, shown = watched["alive"], watched["seen"], watched["seconds"], watched["shown"]
         png = out / f"launch-{arch}.png"
-        write_png(png, width, height, rgb)
+        write_png(png, watched["width"], watched["height"], watched["rgb"])
         result["screenshot"] = str(png)
         journal = guest.run(f"journalctl -q --no-pager -o cat _UID={uid} --since=-3min | tail -n 200", timeout=30)
-        (out / "app-journal.log").write_text(journal.stdout)
+        status = guest.run(f"runuser -u {USER} -- env {env} systemctl --user status --no-pager -l -n 30 "
+                           "depot-review-app 2>&1", timeout=30)
+        (out / "app-journal.log").write_text(journal.stdout + "\n--- unit\n" + status.stdout)
+        if watched["blind"]:
+            couldnt_run("launch", "probe_failed", "The test VM stopped answering, so the launch couldn't be watched.",
+                        detail="systemctl --user is-active never answered")
+            return result
         if not alive:
-            step("launch", False, "Your app closed right after it started. Its log is attached for you.",
-                 detail=journal.stdout[-1500:])
-            return result
+            return failed_launch("Your app closed right after it started. Its log is attached for you.",
+                                 (journal.stdout[-1000:] + "\n" + status.stdout[-500:]))
         if seen < 2:
-            step("launch", False, "Your app started but no window appeared within three minutes.",
-                 detail=journal.stdout[-1500:])
-            return result
+            return failed_launch("Your app started but no window appeared within three minutes.",
+                                 journal.stdout[-1500:])
         # Stop the app and look again: the change must leave with it.
-        guest.run(f"runuser -u {USER} -- env {session_env(uid)} systemctl --user stop depot-review-app", timeout=30)
-        guest.run(f"runuser -u {USER} -- env {session_env(uid)} flatpak kill {app_id}", timeout=20)
+        stop("depot-review-app", app_id)
         after_stop = 1.0
         for _ in range(4):
             time.sleep(3)
