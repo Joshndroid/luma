@@ -47,6 +47,12 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  # A newer push to the same pull request supersedes this run. Pushes to main and
+  # manual dispatches are never cancelled.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   select:
     if: inputs.runtime_probe != true && inputs.public_readback != true && inputs.media_readback != true
