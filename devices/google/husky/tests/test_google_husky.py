@@ -40,6 +40,23 @@ class HuskyProfile(unittest.TestCase):
         self.assertIn("luma/config/luma.fragment", build)
         self.assertIn("scripts/kconfig/merge_config.sh", build)
 
+    def test_kernel_package_carries_this_kernels_modules_only(self):
+        kernel = load("device.toml")["kernel"]
+        self.assertEqual(kernel["package"], "kernel-modules-luma-husky")
+        self.assertNotIn("build", kernel)
+        spec = (ROOT / "packaging/rpm/kernel-modules-luma-husky.spec").read_text()
+        self.assertIn(f"%global kver {kernel['release']}\n", spec)
+        self.assertIn(f"Version:        {kernel['release'].split('-')[0]}\n", spec)
+        # No boot image (Google's firmware) and nothing for luma-device-boot.
+        self.assertNotIn("device-boot", spec.split("%files", 1)[1])
+        self.assertNotIn("Requires:", spec.replace("BuildRequires:", ""))
+        # The spec checks every module the boot image loads.
+        build = (ROOT / "scripts/mobile/husky/build-boot.sh").read_text()
+        loaded = re.search(r'^modules="(.*?)"', build, re.S | re.M).group(1).split()
+        checked = re.search(r"for k in (.*?); do", spec, re.S).group(1).replace("\\", " ").split()
+        self.assertEqual(checked, loaded)
+        self.assertIn('INSTALL_MOD_PATH="$out/modules" INSTALL_MOD_STRIP=1 modules_install', build)
+
     def test_identity_partitions_are_preserved(self):
         preserve = set(load("device.toml")["install"]["preserve"])
         self.assertTrue(IDENTITY <= preserve)

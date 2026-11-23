@@ -171,6 +171,10 @@ for m in $modules; do
 done
 # Debug info is most of each module's size (as INSTALL_MOD_STRIP=1 does).
 llvm-strip --strip-debug "$work"/root/luma/modules/*.ko
+# Every module of this build, stripped and signed, for kernel-modules-luma-husky
+# (scripts/packages/build-kernel-modules-luma-husky.sh --build "$out").
+rm -rf "$out/modules"
+k INSTALL_MOD_PATH="$out/modules" INSTALL_MOD_STRIP=1 modules_install
 k -j"$(nproc)" Image
 
 # --- boot image (devices/google/husky/boot.toml) ------------------------------
