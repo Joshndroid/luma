@@ -909,3 +909,17 @@ height, so the card was laid out a pixel short and the clip took the
 pixel from its actions (a 120 px card in 119, 30 px buttons in 29). The
 card and tray take the surface's own measure, rim included; the pill
 keeps its height. Shell .200.
+
+`0389-app-icon-plate-fills-the-tile.patch`: the LumaUI app-icon plate.
+A v4 app icon draws its plate as a rounded square, 860 on its 1024
+canvas; at a tile's size that plate was 84% of the tile. `js/ui/lumaAppIconPlate.js`
+reads an icon's SVG once per path and modification time: when its first
+drawn element is a rounded square centred on a square canvas, the icon's
+texture is rendered at least that large and the icon is scaled about its
+centre so the square meets the tile's edges exactly; the tile's clip takes
+the margin. A raster, legacy,
+third-party or unreadable icon is drawn at the tile's size on a plate the
+Shell draws behind it (`.luma-app-icon-plate`), never cropped. Used through
+`iconMask.js` `syncAppIconPlate` by the notification tile (its art now one
+clipped, masked actor) and the app badge (a ring around a 16 px clip).
+Test: `tests/gnome-shell/app-icon-plate.js` (in `%check`). Shell .201.

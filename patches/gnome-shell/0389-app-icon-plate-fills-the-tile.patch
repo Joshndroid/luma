@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sun, 22 Nov 2026 15:10:00 -0600
+Subject: [PATCH] App icons: the plate fills the tile; icons without one get a
+ drawn plate
+
+A v4 Luma app icon draws its plate as a rounded square, 860 on its 1024
+canvas, inside a transparent margin, so at a tile's size its plate was 84%
+as large as the tile and the tile's corner mask never reached it. The
+LumaUI app-icon helper (lumaAppIconPlate.js, used through iconMask.js
+syncAppIconPlate) reads an icon's SVG once per file and modification time;
+an icon whose first drawn element is a rounded square centred on a square
+canvas has its texture rendered at least that large and is scaled about
+its centre so the square meets the tile's edges exactly, and the tile
+clips the margin. Any other icon, a raster, a legacy or third-party icon, or a file
+that cannot be read, is drawn at the tile's size on a plate the Shell
+draws behind it, never cropped.
+
+The notification tile clips and masks its art as one actor so the icon can
+be larger than the tile, and the app badge is a ring around a 16 px clip so
+its icon never paints over the ring.
+---
+ data/theme/luma-shelf.css     |  8 ++-
+ js/js-resources.gresource.xml |  1 +
+ js/ui/iconMask.js             | 69 ++++++++++++++++++++++++++
+ js/ui/lumaAppIconPlate.js     | 92 +++++++++++++++++++++++++++++++++++
+ js/ui/messageList.js          | 59 +++++++++++++++++-----
+ 5 files changed, 216 insertions(+), 13 deletions(-)
+ create mode 100644 js/ui/lumaAppIconPlate.js
+
+diff --git a/data/theme/luma-shelf.css b/data/theme/luma-shelf.css
+index 889936a..73ebd59 100644
+--- a/data/theme/luma-shelf.css
++++ b/data/theme/luma-shelf.css
+@@ -2913,7 +2913,13 @@ StBoxLayout.luma-notification-tray.luma-surface-dark .luma-notification-tray-cou
+ .quick-settings.luma-studio-options .luma-options-system { border-top: none; box-shadow: inset 0 1px 0 rgba(255,255,255,.09); }
+ .quick-settings.luma-studio-options .luma-options-toggle-row > .luma-options-utility { width: 140px; }
+ 
+-.luma-notification-lip .luma-lip-app-badge { margin: 0; }
++.luma-notification-lip .luma-lip-app-badge { margin: 0; border-radius: 10px; background-color: #21252b; }
++.luma-notification-lip.luma-surface-light .luma-lip-app-badge { background-color: #eceef1; }
++.luma-notification-lip .luma-lip-app-badge-clip { width: 16px; height: 16px; }
++
++/* The plate the Shell draws behind an app icon that has none of its own
++ * (iconMask.js syncAppIconPlate); the clip's mask gives it the tile's corner. */
++.luma-app-icon-plate { background-color: #eef0f4; }
+ 
+ .quick-settings.luma-studio-options .luma-options-radio .quick-toggle-menu-button { margin: 0; }
+ .quick-settings.luma-studio-options .luma-options-radio .quick-toggle > StBoxLayout { padding: 0; }
+diff --git a/js/js-resources.gresource.xml b/js/js-resources.gresource.xml
+index 03e1a30..a21d539 100644
+--- a/js/js-resources.gresource.xml
++++ b/js/js-resources.gresource.xml
+@@ -128,6 +128,7 @@
+     <file>ui/lumaWindowPath.js</file>
+     <file>ui/mediaArtwork.js</file>
+     <file>ui/iconMask.js</file>
++    <file>ui/lumaAppIconPlate.js</file>
+     <file>ui/lumaMediaIslandGuard.js</file>
+     <file>ui/shelfMedia.js</file>
+     <file>ui/lumaAndroidActivation.js</file>
+diff --git a/js/ui/iconMask.js b/js/ui/iconMask.js
+index 8ea1c07..bdf60d0 100644
+--- a/js/ui/iconMask.js
++++ b/js/ui/iconMask.js
+@@ -1,10 +1,13 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ // Shared shelf artwork mask (the dock's, the shelf's and the notification tile's).
+ import Cogl from 'gi://Cogl';
++import Gio from 'gi://Gio';
+ import GObject from 'gi://GObject';
+ import Shell from 'gi://Shell';
+ import St from 'gi://St';
+ 
++import {plateScaleForFile, platedIconSize} from './lumaAppIconPlate.js';
++
+ // radius is a fraction of the actor's shorter side. The offscreen texture is
+ // the actor's paint volume, enlarged beyond the actor on every side, so the
+ // texture coordinates are mapped back to actor pixels (as LumaRoundedClip
+@@ -40,6 +43,72 @@ export function smoothOffscreenSampling(effect) {
+ // they read as one family. Stated as a fraction so it holds at every size.
+ export const ICON_CORNER_RATIO = 10 / 36;
+ 
++let iconTheme = null;
++
++function iconFile(gicon) {
++    if (gicon instanceof Gio.FileIcon)
++        return gicon.get_file().get_path();
++    if (!gicon)
++        return null;
++    iconTheme ??= new St.IconTheme();
++    return iconTheme.lookup_by_gicon(gicon, 1024, 0)?.get_filename() ?? null;
++}
++
++// The scale at which an app icon's plate covers its tile (lumaAppIconPlate.js),
++// or null for an icon without one.
++export function appIconPlateScale(gicon) {
++    try {
++        return plateScaleForFile(iconFile(gicon));
++    } catch {
++        return null;
++    }
++}
++
++// A layout gives the icon no more than its clip, so St draws the larger
++// texture into the clip's size; scaling the icon about its centre by the
++// plate's scale shows the plate exactly as large as the clip, for the clip
++// to crop the margin.
++function setOverhang(icon, ratio) {
++    icon.set_pivot_point(0.5, 0.5);
++    if (icon.scale_x !== ratio || icon.scale_y !== ratio)
++        icon.set_scale(ratio, ratio);
++}
++
++// Draws an app icon so a plate fills its clip, the masked tile it sits in:
++// an icon with a plate at the plate's scale (the clip takes the margin
++// around it), any other at the clip's size on the plate the clip draws
++// (luma-app-icon-plate). size is the tile's in logical pixels; without it the
++// icon's own CSS icon-size is the tile's.
++export function syncAppIconPlate(icon, clip, size = null) {
++    let base = size;
++    if (base === null) {
++        if (!icon.get_stage())
++            return;
++        const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
++        base = Math.round(icon.get_theme_node().get_length('icon-size') / scale);
++    }
++    const plate = icon.gicon ? appIconPlateScale(icon.gicon) : null;
++    const want = plate === null ? base : platedIconSize(base, plate);
++    if (icon.icon_size !== want)
++        icon.icon_size = want;
++    // A layout gives a child no more than the clip; negative margins let the
++    // icon take its full size, centred, for the clip to crop.
++    setOverhang(icon, plate ?? 1);
++    if (plate === null && icon.gicon)
++        clip.add_style_class_name('luma-app-icon-plate');
++    else
++        clip.remove_style_class_name('luma-app-icon-plate');
++}
++
++// Lets an icon take its CSS size and its clip no plate again (a glyph or a
++// picture in the same tile).
++export function clearAppIconPlate(icon, clip) {
++    if (icon.icon_size !== -1)
++        icon.icon_size = -1;
++    setOverhang(icon, 1);
++    clip.remove_style_class_name('luma-app-icon-plate');
++}
++
+ // Maps an offscreen effect's texture coordinates to its actor's pixels: the
+ // texture is the paint volume, which Clutter enlarges beyond the actor.
+ // Sets <prefix>_extent (the texture in logical pixels), <prefix>_size (the
+diff --git a/js/ui/lumaAppIconPlate.js b/js/ui/lumaAppIconPlate.js
+new file mode 100644
+index 0000000..114890d
+--- /dev/null
++++ b/js/ui/lumaAppIconPlate.js
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// The LumaUI app-icon plate. A v4 Luma app icon draws its plate as a
++// rounded square centred on its canvas, 860 on 1024: an icon drawn at a
++// tile's size shows its plate 84% as large, inside a transparent margin.
++// The Shell draws such an icon at the plate's scale, so the plate fills the
++// tile and the tile's clip takes the margin. An icon without a plate (a
++// raster, an older or third-party icon, anything this cannot read) is drawn
++// at the tile's size on a plate the Shell draws behind it, never cropped.
++//
++// Pure: Gio only, so the build's %check runs it without a display.
++import Gio from 'gi://Gio';
++
++// A plate smaller than this share of the canvas is art, not a plate.
++const MIN_PLATE_SHARE = 0.6;
++const DRAWN = /<(rect|path|circle|ellipse|polygon|polyline|line|image|use|text)\b[^>]*>/;
++
++function attr(tag, name) {
++    const match = tag.match(new RegExp(`\\s${name}\\s*=\\s*["']\\s*(-?[\\d.]+)(px)?\\s*["']`));
++    return match ? Number(match[1]) : NaN;
++}
++
++// The scale at which the SVG's plate covers its canvas (1024/860 for a v4
++// icon on its full canvas, 1 for one already cropped to its plate), or null
++// when the first thing it draws is not a rounded square centred on a square
++// canvas.
++export function plateScaleFromSvg(text) {
++    const svg = text.match(/<svg\b[^>]*>/)?.[0];
++    if (!svg)
++        return null;
++    let box = svg.match(/\sviewBox\s*=\s*["']([^"']+)["']/)?.[1]?.trim().split(/[\s,]+/).map(Number);
++    if (!box || box.length !== 4 || box.some(Number.isNaN))
++        box = [0, 0, attr(svg, 'width'), attr(svg, 'height')];
++    const [bx, by, bw, bh] = box;
++    if (!(bw > 0) || Math.abs(bw - bh) > 0.5)
++        return null;
++    const body = text.slice(text.indexOf(svg) + svg.length)
++        .replace(/<defs\b[\s\S]*?<\/defs>/g, '')
++        .replace(/<(clipPath|mask|pattern|symbol)\b[\s\S]*?<\/\1>/g, '');
++    const first = body.match(DRAWN);
++    if (!first || first[1] !== 'rect')
++        return null;
++    const rect = first[0];
++    const x = attr(rect, 'x') || 0, y = attr(rect, 'y') || 0;
++    const w = attr(rect, 'width'), h = attr(rect, 'height'), rx = attr(rect, 'rx');
++    if (!(w > 0) || Math.abs(w - h) > 0.5 || !(rx > 0))
++        return null;
++    if (w < MIN_PLATE_SHARE * bw || w > bw + 0.5)
++        return null;
++    if (Math.abs(x + w / 2 - (bx + bw / 2)) > 0.5 || Math.abs(y + h / 2 - (by + bh / 2)) > 0.5)
++        return null;
++    return bw / w;
++}
++
++const cache = new Map();
++
++// plateScaleFromSvg for an icon file, read once per path and modification
++// time. Anything but a readable .svg has no plate.
++export function plateScaleForFile(path) {
++    if (!path)
++        return null;
++    const file = Gio.File.new_for_path(path);
++    let stamp;
++    try {
++        const info = file.query_info('time::modified,time::modified-usec',
++            Gio.FileQueryInfoFlags.NONE, null);
++        stamp = `${info.get_attribute_uint64('time::modified')}.${info.get_attribute_uint32('time::modified-usec')}`;
++    } catch {
++        return null;
++    }
++    const hit = cache.get(path);
++    if (hit?.stamp === stamp)
++        return hit.scale;
++    let scale = null;
++    if (/\.svg$/i.test(path)) {
++        try {
++            const [, bytes] = file.load_contents(null);
++            scale = plateScaleFromSvg(new TextDecoder().decode(bytes));
++        } catch {
++            scale = null;
++        }
++    }
++    cache.set(path, {stamp, scale});
++    return scale;
++}
++
++// The size to render an icon's texture at so its plate is at least `size`
++// pixels across (size x scale, rounded up to size's parity).
++export function platedIconSize(size, scale) {
++    if (!(scale > 1))
++        return size;
++    return size + 2 * Math.ceil((size * scale - size) / 2 - 1e-9);
++}
+diff --git a/js/ui/messageList.js b/js/ui/messageList.js
+index a9c30e6..9922cf5 100644
+--- a/js/ui/messageList.js
++++ b/js/ui/messageList.js
+@@ -15,7 +15,7 @@ import * as Mpris from './mpris.js';
+ 
+ import * as Util from '../misc/util.js';
+ import {formatTime, formatTimeSpan} from '../misc/dateUtils.js';
+-import {LumaIconMask} from './iconMask.js';
++import {LumaIconMask, clearAppIconPlate, syncAppIconPlate} from './iconMask.js';
+ import {logErrorUnlessCancelled} from '../misc/errorUtils.js';
+ 
+ const MAX_NOTIFICATION_BUTTONS = 3;
+@@ -694,15 +694,33 @@ export const Message = GObject.registerClass({
+         // claim a share of the card's width.
+         sourceIcon.set({x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER,
+             x_expand: false, y_expand: false});
+-        this._tile.add_child(sourceIcon);
++        // The art is clipped and masked as one tile: an app icon is drawn at
++        // its plate's scale (iconMask.js syncAppIconPlate), larger than the
++        // tile, and the badge sits outside the clip.
++        this._tileArt = new St.Widget({
++            style_class: 'luma-notification-tile-art-clip',
++            layout_manager: new Clutter.BinLayout(),
++            x_expand: true,
++            y_expand: true,
++            clip_to_allocation: true,
++        });
++        this._tileArt.add_child(sourceIcon);
+         this._tileImage = new St.Icon({
+             style_class: 'luma-notification-tile-image',
+             x_align: Clutter.ActorAlign.CENTER,
+             y_align: Clutter.ActorAlign.CENTER,
+             visible: false,
+         });
+-        this._tile.add_child(this._tileImage);
+-        this._appBadge = new St.Icon({style_class: 'luma-lip-app-badge', icon_size: 16,
++        this._tileArt.add_child(this._tileImage);
++        this._tile.add_child(this._tileArt);
++        // The badge is a ring (the frame's border) around a 16 px clip that
++        // holds the icon, so an icon drawn at its plate's scale never paints
++        // over the ring.
++        this._appBadgeIcon = new St.Icon({icon_size: 16,
++            x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER});
++        this._appBadgeClip = new St.Bin({style_class: 'luma-lip-app-badge-clip',
++            clip_to_allocation: true, x_expand: true, y_expand: true, child: this._appBadgeIcon});
++        this._appBadge = new St.Bin({style_class: 'luma-lip-app-badge', child: this._appBadgeClip,
+             x_align: Clutter.ActorAlign.END, y_align: Clutter.ActorAlign.END, visible: false});
+         this._appBadge.translation_x = this._appBadge.translation_y = 6;
+         this._tile.add_child(this._appBadge);
+@@ -738,18 +756,19 @@ export const Message = GObject.registerClass({
+         this._header.sourceTitle.connectObject('notify::text', upper, this);
+         upper();
+ 
+-        for (const icon of [sourceIcon, this._tileImage, this._appBadge]) {
++        for (const clip of [this._tileArt, this._appBadgeClip]) {
+             try {
+                 const mask = new LumaIconMask();
+                 mask.set_uniform_float(mask.get_uniform_location('radius'), 1,
+-                    [icon === this._appBadge ? 0.5 : CARD_TILE_RADIUS / CARD_TILE_SIZE]);
+-                icon.add_effect_with_name('luma-tile-mask', mask);
++                    [clip === this._appBadgeClip ? 0.5 : CARD_TILE_RADIUS / CARD_TILE_SIZE]);
++                clip.add_effect_with_name('luma-tile-mask', mask);
+             } catch (error) {
+                 // Without a shader path the tile still clips its own fill.
+                 logError(error, 'Luma notification tile mask unavailable');
+             }
+         }
+-        sourceIcon.connectObject('notify::gicon', () => this._syncTile(), this);
++        sourceIcon.connectObject('notify::gicon', () => this._syncTile(),
++            'style-changed', () => this._syncTilePlate(), this);
+         this._icon.visible = false;
+         this._syncTile();
+ 
+@@ -820,16 +839,32 @@ export const Message = GObject.registerClass({
+         this._tileImage.gicon = showImage ? image : null;
+         this._tileImage.visible = showImage;
+         sourceIcon.visible = !showImage;
+-        this._appBadge.gicon = sourceIcon.gicon;
++        this._appBadgeIcon.gicon = sourceIcon.gicon;
+         this._appBadge.visible = showImage;
+-        this._tileImage.get_effect('luma-tile-mask')?.set_uniform_float(
+-            this._tileImage.get_effect('luma-tile-mask').get_uniform_location('radius'), 1, [0.5]);
++        syncAppIconPlate(this._appBadgeIcon, this._appBadgeClip, 16);
++        // A picture is round; an app's art takes the tile's corner.
++        this._tileArt.get_effect('luma-tile-mask')?.set_uniform_float(
++            this._tileArt.get_effect('luma-tile-mask').get_uniform_location('radius'), 1,
++            [showImage ? 0.5 : CARD_TILE_RADIUS / CARD_TILE_SIZE]);
+         const glyph = !showImage && isGlyphIcon(sourceIcon.gicon);
++        this._tileGlyph = glyph;
++        this._tileShowsImage = showImage;
+         this._tile.remove_style_class_name(glyph
+             ? 'luma-notification-tile-art' : 'luma-notification-tile-glyph');
+         this._tile.add_style_class_name(glyph
+             ? 'luma-notification-tile-glyph' : 'luma-notification-tile-art');
+-        sourceIcon.get_effect('luma-tile-mask')?.set_enabled(!glyph);
++        this._tileArt.get_effect('luma-tile-mask')?.set_enabled(!glyph);
++        this._syncTilePlate();
++    }
++
++    // An app's art fills the tile with its plate; a glyph keeps its CSS size
++    // on the tile's own fill.
++    _syncTilePlate() {
++        const sourceIcon = this._header.sourceIcon;
++        if (this._tileGlyph || this._tileShowsImage)
++            clearAppIconPlate(sourceIcon, this._tileArt);
++        else
++            syncAppIconPlate(sourceIcon, this._tileArt);
+     }
+ 
+     set icon(icon) {
