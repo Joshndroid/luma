@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Mon, 23 Nov 2026 04:00:00 -0600
+Subject: [PATCH] Let a configure handler restore a window in any state
+
+A compositor that restores a session places each window in its first
+configure (MetaWindow::configure), before Mutter places or shows it.
+The configuration could carry a position, a size and fullscreen; a
+handler could not open a window maximized or tiled, and a window opened
+in such a state had no floating rectangle to return to (on Wayland the
+first move is asynchronous, so the saved rectangle stayed 0x0).
+
+meta_window_config_set_is_maximized() and
+meta_window_config_set_tile_side() are exported. An initial
+configuration with a position and a maximized, tiled or fullscreen state
+takes its monitor from that rectangle, and the rectangle becomes the
+one the window returns to on leaving the state.
+
+meta_window_get_floating_rect() gives that rectangle for any window, so
+a session snapshot keeps it. meta_window_is_restored_from_session() is
+true for a window its client restored through xx_session_manager_v1,
+which is now on unless MUTTER_DEBUG_SESSION_MANAGEMENT_PROTOCOL=0.
+---
+ src/core/meta-debug-control.c                 |  2 +-
+ src/core/meta-window-config.c                 | 87 +++++++++++++++++++
+ src/core/window-private.h                     |  3 +
+ src/core/window.c                             | 87 +++++++++++++++++++
+ src/meta/meta-window-config.h                 | 16 ++++
+ src/meta/window.h                             |  7 ++
+ .../meta-wayland-xdg-session-manager.c        |  1 +
+ 7 files changed, 202 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/meta-debug-control.c b/src/core/meta-debug-control.c
+index bdf59d0..ad521c9 100644
+--- a/src/core/meta-debug-control.c
++++ b/src/core/meta-debug-control.c
+@@ -182,7 +182,7 @@ meta_debug_control_init (MetaDebugControl *debug_control)
+                                                      force_linear_blending);
+ 
+   session_management_protocol =
+-    g_strcmp0 (getenv ("MUTTER_DEBUG_SESSION_MANAGEMENT_PROTOCOL"), "1") == 0;
++    g_strcmp0 (getenv ("MUTTER_DEBUG_SESSION_MANAGEMENT_PROTOCOL"), "0") != 0;
+   meta_dbus_debug_control_set_session_management_protocol (dbus_debug_control,
+                                                            session_management_protocol);
+ 
+diff --git a/src/core/meta-window-config.c b/src/core/meta-window-config.c
+index ac97112..8e8a586 100644
+--- a/src/core/meta-window-config.c
++++ b/src/core/meta-window-config.c
+@@ -234,6 +234,93 @@ meta_window_config_get_is_fullscreen (MetaWindowConfig *window_config)
+   return window_config->is_fullscreen;
+ }
+ 
++/**
++ * meta_window_config_set_is_maximized:
++ * @window_config: a #MetaWindowConfig
++ * @is_maximized: whether the window is maximized in both directions
++ *
++ * Lets a #MetaWindow::configure handler open a window maximized. A position
++ * set on the same initial configuration becomes the window's floating
++ * rectangle, the one it returns to when it is unmaximized.
++ */
++void
++meta_window_config_set_is_maximized (MetaWindowConfig *window_config,
++                                     gboolean          is_maximized)
++{
++  g_return_if_fail (META_IS_WINDOW_CONFIG (window_config));
++
++  window_config->maximized_horizontally = is_maximized;
++  window_config->maximized_vertically = is_maximized;
++}
++
++/**
++ * meta_window_config_get_is_maximized:
++ * @window_config: a #MetaWindowConfig
++ *
++ * Returns: whether the configuration is maximized in both directions
++ */
++gboolean
++meta_window_config_get_is_maximized (MetaWindowConfig *window_config)
++{
++  return meta_window_config_is_maximized (window_config);
++}
++
++/**
++ * meta_window_config_set_tile_side:
++ * @window_config: a #MetaWindowConfig
++ * @side: %META_SIDE_LEFT or %META_SIDE_RIGHT to tile, any other value to untile
++ * @monitor: the monitor to tile on, or -1 for the window's own
++ * @hfraction: the share of the monitor's width, or 0 for half
++ *
++ * Lets a #MetaWindow::configure handler open a window tiled to one side.
++ */
++void
++meta_window_config_set_tile_side (MetaWindowConfig *window_config,
++                                  MetaSide          side,
++                                  int               monitor,
++                                  double            hfraction)
++{
++  g_return_if_fail (META_IS_WINDOW_CONFIG (window_config));
++
++  switch (side)
++    {
++    case META_SIDE_LEFT:
++      window_config->tile_mode = META_TILE_LEFT;
++      break;
++    case META_SIDE_RIGHT:
++      window_config->tile_mode = META_TILE_RIGHT;
++      break;
++    default:
++      window_config->tile_mode = META_TILE_NONE;
++      return;
++    }
++
++  window_config->tile_monitor_number = monitor;
++  window_config->tile_hfraction = hfraction > 0.0 && hfraction < 1.0 ? hfraction : 0.5;
++}
++
++/**
++ * meta_window_config_get_tile_side:
++ * @window_config: a #MetaWindowConfig
++ *
++ * Returns: %META_SIDE_LEFT or %META_SIDE_RIGHT for a window tiled to a side, 0 otherwise
++ */
++MetaSide
++meta_window_config_get_tile_side (MetaWindowConfig *window_config)
++{
++  g_return_val_if_fail (META_IS_WINDOW_CONFIG (window_config), 0);
++
++  switch (window_config->tile_mode)
++    {
++    case META_TILE_LEFT:
++      return META_SIDE_LEFT;
++    case META_TILE_RIGHT:
++      return META_SIDE_RIGHT;
++    default:
++      return 0;
++    }
++}
++
+ gboolean
+ meta_window_config_is_maximized (MetaWindowConfig *config)
+ {
+diff --git a/src/core/window-private.h b/src/core/window-private.h
+index 15ae8df..847e882 100644
+--- a/src/core/window-private.h
++++ b/src/core/window-private.h
+@@ -551,6 +551,9 @@ struct _MetaWindow
+    * algorithm? */
+   guint placed : 1;
+ 
++  /* Restored by its client through the session management protocol */
++  guint restored_from_session : 1;
++
+   /* Have this window been positioned? */
+   uint unconstrained_rect_valid : 1;
+ 
+diff --git a/src/core/window.c b/src/core/window.c
+index 5c4ee36..53c0a08 100644
+--- a/src/core/window.c
++++ b/src/core/window.c
+@@ -127,6 +127,9 @@ static void     meta_window_show          (MetaWindow     *window);
+ static void     meta_window_hide          (MetaWindow     *window);
+ 
+ static void     meta_window_save_rect         (MetaWindow    *window);
++static void     meta_window_apply_config_state (MetaWindow           *window,
++                                                MetaWindowConfig     *config,
++                                                MetaWindowApplyFlags  flags);
+ 
+ static void     ensure_mru_position_after (MetaWindow *window,
+                                            MetaWindow *after_this_one);
+@@ -8797,6 +8800,47 @@ void
+ meta_window_apply_config (MetaWindow           *window,
+                           MetaWindowConfig     *config,
+                           MetaWindowApplyFlags  flags)
++{
++  gboolean restore_floating = FALSE;
++  MtkRectangle floating_rect = MTK_RECTANGLE_INIT (0, 0, 0, 0);
++
++  if (meta_window_config_get_is_initial (config) &&
++      meta_window_config_has_position (config) &&
++      !meta_window_config_is_floating (config))
++    {
++      MetaBackend *backend =
++        meta_context_get_backend (meta_display_get_context (window->display));
++      MetaMonitorManager *monitor_manager =
++        meta_backend_get_monitor_manager (backend);
++      MetaLogicalMonitor *monitor;
++
++      /* A handler that opens the window maximized, tiled or fullscreen and
++       * also gives a position gives the rectangle the window leaves those
++       * states for, and so the monitor they apply on. */
++      floating_rect = meta_window_config_get_rect (config);
++      restore_floating = TRUE;
++      monitor = meta_monitor_manager_get_logical_monitor_from_rect (monitor_manager,
++                                                                    &floating_rect);
++      if (monitor)
++        g_set_object (&window->target_monitor, monitor);
++      window->placed = TRUE;
++      window->unconstrained_rect = floating_rect;
++      window->unconstrained_rect_valid = TRUE;
++    }
++
++  meta_window_apply_config_state (window, config, flags);
++
++  if (restore_floating)
++    {
++      window->saved_rect = floating_rect;
++      window->saved_rect_fullscreen = floating_rect;
++    }
++}
++
++static void
++meta_window_apply_config_state (MetaWindow           *window,
++                                MetaWindowConfig     *config,
++                                MetaWindowApplyFlags  flags)
+ {
+   if (meta_window_config_get_is_fullscreen (config))
+     {
+@@ -8874,6 +8918,49 @@ meta_window_set_tag (MetaWindow *window,
+  *
+  * Returns: (nullable): An associated toplevel tag
+  */
++/**
++ * meta_window_is_restored_from_session:
++ * @window: A #MetaWindow
++ *
++ * Whether the window's client restored it from a saved session through the
++ * session management protocol, so its geometry, state and workspace are
++ * the ones the compositor saved for it.
++ *
++ * Returns: %TRUE for a window restored from its client's session
++ */
++gboolean
++meta_window_is_restored_from_session (MetaWindow *window)
++{
++  g_return_val_if_fail (META_IS_WINDOW (window), FALSE);
++
++  return window->restored_from_session;
++}
++
++/**
++ * meta_window_get_floating_rect:
++ * @window: A #MetaWindow
++ * @rect: (out caller-allocates): the frame rectangle
++ *
++ * Gets the frame rectangle the window has when it is neither maximized,
++ * tiled nor fullscreen: its current one for a floating window, otherwise
++ * the one it returns to on leaving those states.
++ */
++void
++meta_window_get_floating_rect (MetaWindow   *window,
++                               MtkRectangle *rect)
++{
++  g_return_if_fail (META_IS_WINDOW (window));
++
++  if (meta_window_config_get_is_fullscreen (window->config) &&
++      !meta_window_config_is_any_maximized (window->config) &&
++      meta_window_config_get_tile_mode (window->config) == META_TILE_NONE)
++    *rect = window->saved_rect_fullscreen;
++  else if (!meta_window_config_is_floating (window->config))
++    *rect = window->saved_rect;
++  else
++    meta_window_get_frame_rect (window, rect);
++}
++
+ const char *
+ meta_window_get_tag (MetaWindow *window)
+ {
+diff --git a/src/meta/meta-window-config.h b/src/meta/meta-window-config.h
+index 4e9d8ad..3ce528b 100644
+--- a/src/meta/meta-window-config.h
++++ b/src/meta/meta-window-config.h
+@@ -70,3 +70,19 @@ void meta_window_config_set_is_fullscreen (MetaWindowConfig *window_config,
+ 
+ META_EXPORT
+ gboolean meta_window_config_get_is_fullscreen (MetaWindowConfig *window_config);
++
++META_EXPORT
++void meta_window_config_set_is_maximized (MetaWindowConfig *window_config,
++                                          gboolean          is_maximized);
++
++META_EXPORT
++gboolean meta_window_config_get_is_maximized (MetaWindowConfig *window_config);
++
++META_EXPORT
++void meta_window_config_set_tile_side (MetaWindowConfig *window_config,
++                                       MetaSide          side,
++                                       int               monitor,
++                                       double            hfraction);
++
++META_EXPORT
++MetaSide meta_window_config_get_tile_side (MetaWindowConfig *window_config);
+diff --git a/src/meta/window.h b/src/meta/window.h
+index 22d121b..b93308a 100644
+--- a/src/meta/window.h
++++ b/src/meta/window.h
+@@ -459,6 +459,13 @@ void meta_window_protocol_to_stage_rect (MetaWindow *window,
+ META_EXPORT
+ const char * meta_window_get_tag (MetaWindow *window);
+ 
++META_EXPORT
++gboolean meta_window_is_restored_from_session (MetaWindow *window);
++
++META_EXPORT
++void meta_window_get_floating_rect (MetaWindow   *window,
++                                    MtkRectangle *rect);
++
+ META_EXPORT
+ void meta_window_set_type (MetaWindow     *window,
+                            MetaWindowType  type);
+diff --git a/src/wayland/meta-wayland-xdg-session-manager.c b/src/wayland/meta-wayland-xdg-session-manager.c
+index e88bf47..48018ba 100644
+--- a/src/wayland/meta-wayland-xdg-session-manager.c
++++ b/src/wayland/meta-wayland-xdg-session-manager.c
+@@ -84,6 +84,7 @@ on_restore_toplevel (MetaWaylandXdgSession        *session,
+     return FALSE;
+ 
+   meta_wayland_xdg_toplevel_set_hint_restored (xdg_toplevel);
++  window->restored_from_session = TRUE;
+ 
+   return TRUE;
+ }

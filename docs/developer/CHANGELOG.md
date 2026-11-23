@@ -10,6 +10,18 @@ section: Overview
 Changes to these docs that affect what you build, newest first. Platform API
 changes name the platform version they apply to.
 
+## November 23, 2026: windows and documents that come back
+
+**Added**
+
+- [LumaUI in C](kit/lumaui-c.md#windows-and-documents-that-come-back):
+  `LumaRestore` and `luma_window_set_restore_key()` give an app its
+  documents, views and unsaved text back when its windows are restored after
+  a restart or continued on another device; Python `luma_appkit.restore`
+  with `AppWindow.restore_key`, `save_state()`, `restore_state()` and
+  `documents()` (platform 0.1.0-1.luma.153, C `LUMA_UI_API_LEVEL` 12,
+  `LUMAUI_API_LEVEL` 15).
+
 ## November 21, 2026: windows hidden from screen capture
 
 **Added**

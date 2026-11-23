@@ -2129,6 +2129,33 @@ class AppWindow(Adw.ApplicationWindow):
         return bool(LumaUI.window_set_hidden_from_capture(self, bool(hidden)))
 
     @property
+    def restore_key(self) -> str | None:
+        """The key the app finds this window by again after a restart or on
+        another device (API level 15; `luma_appkit.restore`). Set it before
+        the window is first shown (C: luma_window_set_restore_key)."""
+        getter = getattr(LumaUI, "window_get_restore_key", None)
+        return getter(self) if getter else None
+
+    @restore_key.setter
+    def restore_key(self, key: str | None) -> None:
+        setter = getattr(LumaUI, "window_set_restore_key", None)
+        if setter:
+            setter(self, key)
+
+    def save_state(self) -> dict:
+        """What this window needs to be the same again, as JSON values. The
+        default keeps nothing beyond the place the shell restores."""
+        return {}
+
+    def restore_state(self, state: dict) -> None:
+        """Takes back what `save_state` returned. The default does nothing."""
+
+    def documents(self) -> list[dict]:
+        """The documents this window has open: dicts with uri, title, dirty
+        and unsaved (text not saved yet). The default lists none."""
+        return []
+
+    @property
     def hidden_from_capture(self) -> bool:
         """What `set_hidden_from_capture` last asked for this window."""
         return bool(LumaUI.window_get_hidden_from_capture(self))

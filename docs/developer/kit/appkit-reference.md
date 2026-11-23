@@ -206,6 +206,7 @@ moved and resized.
 | `recall(key, default=None)` | Returns a remembered value |
 | `set_geometry_scope(scope, *, default_width, default_height)` | Switches to a separately remembered size, for example a welcome surface. `scope` must be ASCII letters, digits, `-` or `_`. |
 | `set_hidden_from_capture(hidden=True)` | Keeps the window, with its dialogs and menus, out of screen shares of a display or an area and out of screenshots of the screen; it stays on screen, and sharing the window itself still shows it. Returns whether the compositor hides it. `hidden_from_capture` is the last value asked. API level 14. |
+| `restore_key`, `save_state()`, `restore_state(state)`, `documents()` | The window's key and state for restoring after a restart and continuing on another device: set `restore_key` before the window is first shown; `save_state()` returns JSON values that `restore_state()` gets back; `documents()` lists open documents as dicts (uri, title, dirty, unsaved). With `luma_appkit.restore.enable(app, open_window)` and `restore.restore(app)` in `activate`. API level 15. |
 
 State lives in `$XDG_STATE_HOME/luma/windows/<app_id>.json` (and
 `<app_id>.<scope>.json` for a scope), written with mode `0600` when the window

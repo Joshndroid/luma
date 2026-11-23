@@ -76,6 +76,10 @@ jobs:
       # that package's release.
       - name: Check device kernel packages
         run: python3 -B scripts/devices/device-kernels.py check --base HEAD^1 --head HEAD
+      # A source change that leaves its package's Release alone never ships:
+      # the pinned RPM stays in the image (829ce7b7, luma-developer-platform).
+      - name: Check package releases move with their sources
+        run: python3 -B scripts/os/source-release-bump.py check --base HEAD^1 --head HEAD
       # Images ship the offline app baseline pinned in config/os/app-baseline-lock.json;
       # an app whose source changed needs a rebuilt bundle in a resealed baseline.
       - name: Check first-party apps against their baseline bundles
