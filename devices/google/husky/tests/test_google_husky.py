@@ -102,6 +102,15 @@ class HuskyProfile(unittest.TestCase):
         self.assertIn("/etc/dconf/db/gdm.d/10-luma-handheld", init)
         self.assertNotIn("power-button-action=", init)
 
+    def test_suspend_is_s2idle_only(self):
+        init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
+        conf = init.split("/run/systemd/sleep.conf.d/50-luma-husky-sleep.conf <<'EOF'")[1]
+        conf = conf.split("\nEOF")[0].split()
+        self.assertEqual(conf, ["[Sleep]", "AllowSuspend=yes", "MemorySleepMode=s2idle",
+                                "AllowHibernation=no", "AllowSuspendThenHibernate=no",
+                                "AllowHybridSleep=no"])
+        self.assertNotIn("no-sleep", init)
+
     def test_unused_vendor_module_requests_are_masked(self):
         init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
         self.assertIn("for name in fuse-overlayfs open-vm-tools fwupd-i2c i2c-tools", init)

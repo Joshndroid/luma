@@ -196,12 +196,14 @@ cat /run/luma/prepare-root.log > /dev/kmsg
 mkdir -p /run/systemd/system/multi-user.target.wants /run/systemd/logind.conf.d \
 	/run/environment.d /run/systemd/sleep.conf.d /run/systemd/user-environment-generators
 cp /luma/handheld/logind-handheld.conf /run/systemd/logind.conf.d/50-luma-handheld.conf
-# The kernel cannot resume from suspend yet: a suspend leaves the phone dark
-# until a forced restart. Refuse every sleep state, so logind reports none and
-# no session, greeter or timeout can start one.
-cat > /run/systemd/sleep.conf.d/50-luma-husky-no-sleep.conf <<'EOF'
+# Suspend to idle (s2idle) resumes: on the RTC alarm and on the power key,
+# with Wi-Fi, Bluetooth, audio, the sensors and the USB gadget all back.
+# Deep sleep is not proven, so pin suspend to s2idle, and allow nothing that
+# writes a hibernation image.
+cat > /run/systemd/sleep.conf.d/50-luma-husky-sleep.conf <<'EOF'
 [Sleep]
-AllowSuspend=no
+AllowSuspend=yes
+MemorySleepMode=s2idle
 AllowHibernation=no
 AllowSuspendThenHibernate=no
 AllowHybridSleep=no
