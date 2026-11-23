@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.20%{?dist}
+Release:        1.luma.21%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -144,6 +144,9 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 120 python3 -B tests/engine_re
 # A recording and a stream row (FLV) carry the program's sound, also from an encoder that moves its
 # timestamps (vah264enc); skipped where no H.264 and AAC encoder is installed (no OpenH264 here).
 PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 300 python3 -B tests/engine_stream_sound.py
+# Every scene's sources stay open: a switch reopens nothing, a cut shows on the first output frame,
+# a fade reaches full alpha in its time and a picture in both scenes glides; a parked camera shows.
+PYTHONPATH=%{buildroot}%{python3_sitelib} STREAMY_FAKE_SOURCES=1 timeout 180 python3 -B tests/engine_scenes.py
 # The installed app opens on drawn stand-in sources and renders its window
 # at phone and desktop widths. The first try waits 15 s: on a loaded builder
 # the window can take that long to map while llvmpipe composites the scene.
@@ -186,6 +189,14 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.21
+- A widget added to a running canvas (a scene, the other canvas turned on)
+  never stops its source: its layer is fed only once it runs, and a redrawn
+  picture reaches it only after its stream's caps.
+- Scene changes keep time with the compositor when it runs late: a switch
+  starts once every picture of the new scene is in the compositor, and fades
+  and glides follow the frames it actually makes.
+
 * Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.20
 - Streams carry sound again: vah264enc puts its output 1000 hours above
   its input, and every stream row dropped all of the encode's sound as

@@ -45,8 +45,8 @@ FADE_MS = 300
 #: picture in the mixer by then: the switch is frame-accurate on every canvas, the outputs' too.
 LEAD_NS = 2 * Gst.SECOND // 60
 LEAD_MS = 34
-#: A parked camera has this long to send its next picture before a change of scene starts without it.
-PARKED_WAIT_MS = 250
+#: A change of scene waits at most this long for its pictures (a parked camera's next one, a late GL).
+SWITCH_WAIT_MS = 250
 #: Mixer pad stacking: each scene's widgets in their order, the shown scene above the one it replaces.
 ZSTEP = 10_000
 
@@ -454,11 +454,16 @@ class Animation:
         self.source.set(0, float(value))
 
     def ramp(self, start: int, points: list[tuple[int, float]]) -> None:
-        """From the value it has at ``start`` through ``points`` (stream time, value); the last stays."""
+        """From the value it has at ``start`` through ``points`` (stream time, value); the last stays.
+        What it was set to do before ``start`` stays (a late mixer may not have drawn it yet)."""
+        start = max(0, start)
         begin = self.value_at(start)
-        self.source.unset_all()
-        self.points = [(max(0, start), begin)] + [(max(0, when), float(value)) for when, value in points]
-        for when, value in self.points:
+        before = [p for p in self.points if p[0] < start][-1:]
+        for when, _value in self.points:
+            if (when, _value) not in before:
+                self.source.unset(when)
+        self.points = before + [(start, begin)] + [(max(start + 1, when), float(value)) for when, value in points]
+        for when, value in self.points[len(before):]:
             self.source.set(when, value)
 
     def remove(self) -> None:
@@ -640,6 +645,11 @@ class Layer:
     glide: list = field(default_factory=list)
     path: tuple | None = None
     fmt: str = "landscape"
+    #: The tee feeds it only once its elements are PLAYING (Engine._add_layer); taken out before that,
+    #: it never is. Guarded by ``lock`` (the link is made on GStreamer's pool, the removal on the main loop).
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    linked: bool = False
+    gone: bool = False
 
     @property
     def valve(self) -> Gst.Element:
@@ -1278,7 +1288,6 @@ class Engine(GObject.Object):
             log(f"widget {branch.widget_id}: its layer does not link to {fmt}'s mixer")
         self._frames[elements[-1]] = branch.widget_id
         self._place(elements[-1], pad, view, chain.pad, True)
-        tee_pad.link(elements[0].get_static_pad("sink"))
         branch.layers[fmt] = layer
         feed = branch.feed
         if feed.crop is not None and feed.crop[2] is not None:
@@ -1289,6 +1298,22 @@ class Engine(GObject.Object):
         def started(_p, items) -> None:
             for element in reversed(items):
                 element.sync_state_with_parent()
+            # Only now does the tee feed it. Linked while still NULL, it answered the tee FLUSHING, and a
+            # picture that reached it before its stream's events stopped the source (not negotiated).
+            # The tee's new pad sends the stream's sticky events (stream-start, caps, segment) ahead of
+            # the first picture it pushes.
+            with layer.lock:
+                if layer.gone:
+                    return
+                if tee_pad.link(items[0].get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                    log(f"widget {branch.widget_id}: its layer does not link to its source on {fmt}")
+                    return
+                layer.linked = True
+                queue = items[1].get_static_pad("sink")
+                if not self._negotiated(queue):
+                    # Drawn once as soon as its stream's events are in (the first picture through the tee
+                    # brings them, also past a closed valve): its shaders are built before it is shown.
+                    queue.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._primed, (branch, layer))
             # Its source's newest picture at once: a layer of the shown scene draws it on the next frame,
             # one of another scene is ready (negotiated, its shaders built) for when that scene shows.
             GLib.idle_add(lambda: self._push_last(branch, layer) and False)
@@ -1305,18 +1330,49 @@ class Engine(GObject.Object):
         if clock is None:
             return
         sink = layer.elements[1].get_static_pad("sink")
-        if sink.get_current_caps() is None:
-            return  # not negotiated yet: its first picture comes from the source itself
+        if not self._negotiated(sink):
+            return  # its stream's events haven't reached it yet: its first picture comes from the source
         picture = feed.last.copy()  # the same GPU memory, its own timestamps
-        picture.pts = clock.get_time() - self.pipeline.get_base_time()
+        picture.pts = self._stamp(layer.fmt)
         picture.dts = Gst.CLOCK_TIME_NONE
         # Pushed on this thread: the pad's stream lock keeps it in turn with the source's own pictures.
         sink.chain(picture)
+
+    def _stamp(self, fmt: str) -> int:
+        """The time a picture pushed now is due on canvas ``fmt``: now, or the frame a late mixer makes next
+        (stamped by the clock, it would wait for the mixer to catch up and miss the frame it was for)."""
+        running = self.pipeline.get_clock().get_time() - self.pipeline.get_base_time()
+        program = self.programs.get(fmt)
+        made = self._made(program) if program is not None else None
+        # A late mixer's next frames start at ``made``: due a lead after it, the picture lands on the frame
+        # a switch starts on (_times), and the source's own, stamped by the clock, follow it in order.
+        return made + LEAD_NS if made is not None and made + LEAD_NS < running else running
+
+    def _primed(self, _pad: Gst.Pad, info: Gst.PadProbeInfo, data) -> Gst.PadProbeReturn:
+        event = info.get_event()
+        if event is None or event.type != Gst.EventType.SEGMENT:
+            return Gst.PadProbeReturn.OK
+        branch, layer = data
+        GLib.idle_add(lambda: self._push_last(branch, layer) and False)
+        return Gst.PadProbeReturn.REMOVE
+
+    @staticmethod
+    def _negotiated(pad: Gst.Pad) -> bool:
+        """``pad`` has had its stream's caps and segment: a picture may be pushed into it."""
+        return pad.get_current_caps() is not None and pad.get_sticky_event(Gst.EventType.SEGMENT, 0) is not None
 
     def _remove_layer(self, branch: Branch, fmt: str) -> None:
         layer = branch.layers.pop(fmt, None)
         if layer is None or self.pipeline is None:
             return
+        with layer.lock:
+            layer.gone = True
+            linked = layer.linked
+        if not linked and layer.tee_pad is not None:
+            # Never fed: its tee pad goes now (the pool's link, if it runs later, sees it gone).
+            tee = layer.tee_pad.get_parent_element()
+            if tee is not None:
+                tee.release_request_pad(layer.tee_pad)
         self._end_glide(layer)
         self._frames.pop(layer.frame, None)
         if layer.alpha is not None:
@@ -1580,6 +1636,8 @@ class Engine(GObject.Object):
         branch = self.branches.get(self._frames.get(frame, ""))
         if queue is None or branch is None or branch.feed.last is None or branch.still or self.pipeline is None:
             return
+        if not self._negotiated(queue.get_static_pad("sink")):
+            return  # a layer not fed yet: its first picture (with this revision) comes from the source
         clock = self.pipeline.get_clock()
         if clock is None:
             return
@@ -2070,7 +2128,11 @@ class Engine(GObject.Object):
 
 
     def _times(self, fmt: str, lead: int = LEAD_NS) -> tuple[int | None, int | None]:
-        """(stream time ``lead`` ns from now on canvas ``fmt``'s mixer, running time now), or Nones."""
+        """(stream time ``lead`` ns past canvas ``fmt``'s next frame, running time now), or Nones.
+
+        The next frame is the mixer's, not the clock's: a mixer running late (a loaded machine on
+        software GL) composites frames stamped behind the clock, and keyframes placed by the clock would
+        land on frames it hasn't made yet, or be replaced before it gets to them."""
         program = self.programs.get(fmt)
         if program is None or self.pipeline is None:
             return None, None
@@ -2078,7 +2140,17 @@ class Engine(GObject.Object):
         if clock is None:
             return None, None
         running = clock.get_time() - self.pipeline.get_base_time()
-        return self._stream_time(program.mixer.get_static_pad("src"), running + lead), running
+        now = self._stream_time(program.mixer.get_static_pad("src"), running)
+        made = self._made(program)
+        if made is not None and made < now:
+            now = made
+        return now + lead, running
+
+    @staticmethod
+    def _made(program: Program) -> int | None:
+        """How far canvas ``program``'s mixer has composited (stream time), or None."""
+        ok, position = program.mixer.query_position(Gst.Format.TIME)
+        return position if ok and position not in (-1, Gst.CLOCK_TIME_NONE) else None
 
 
     @staticmethod
@@ -2113,11 +2185,11 @@ class Engine(GObject.Object):
             on = self._on(branch)
             for layer in branch.layers.values():
                 if layer.valve.get_property("drop") == on:
+                    if on:
+                        self._push_last(branch, layer)
                     layer.valve.set_property("drop", not on)
                     if layer.alpha is not None:
                         layer.alpha.hold(1.0 if on and branch.fade >= FADE_MS else 0.0)
-                    if on:
-                        self._push_last(branch, layer)
         self._sync_gates(0)
         self._sync_parking()
 
@@ -2152,17 +2224,17 @@ class Engine(GObject.Object):
         return Gst.PadProbeReturn.DROP
 
     def _begin_switch(self, previous: str, active: str | None) -> None:
-        """Change scene now, or, when a camera the new scene shows is parked, as soon as it has sent its
-        next picture (at most PARKED_WAIT_MS): the change starts on a frame that has every picture in it."""
-        incoming = [f for f in self.feeds.values() if f.parked and any(b.scene_id == active for b in self._branches_of(f))]
-        for feed in incoming:
-            if not feed.waits:
-                self._set_parked(feed, False)  # a screen: its picture of the last second shows at once
-        parked = [f for f in incoming if f.waits]
-        if not parked:
-            self._switch(previous, active)
-            return
-        waiting = {f.key for f in parked}
+        """Change scene once every picture the new scene shows is in its mixer pads: each layer's newest
+        picture is drawn through it first (a parked camera's next one, which it is woken for), and the
+        change starts when each has come out of its lumaframe, at most SWITCH_WAIT_MS later. So the first
+        frame of the change has every picture in it, also on a mixer that runs late."""
+        woken = set()
+        for feed in self.feeds.values():
+            if feed.parked and any(b.scene_id == active for b in self._branches_of(feed)):
+                if feed.waits:
+                    woken.add(feed.key)  # a parked camera's last picture is old: its next one is waited for
+                self._set_parked(feed, False)
+        waiting: set = set()
         probes, told = [], set()
 
         def arrived(_pad, _info, key):
@@ -2182,11 +2254,25 @@ class Engine(GObject.Object):
                 self._switch(previous, active)
             return False
 
-        for feed in parked:
-            sink = feed.elements[-1].get_static_pad("sink")
-            probes.append((sink, sink.add_probe(Gst.PadProbeType.BUFFER, arrived, feed.key)))
-            self._set_parked(feed, False)
-        self._pending = (previous, active, GLib.timeout_add(PARKED_WAIT_MS, ready), probes)
+        for branch in [b for b in self.branches.values() if b.scene_id == active and b.picture]:
+            if not branch.feed.shown or branch.fade < FADE_MS:
+                continue  # no picture yet: it fades in when it has one (_fade_in)
+            for fmt, layer in branch.layers.items():
+                if layer.alpha is None or not layer.linked:
+                    continue
+                key = (branch.widget_id, fmt)
+                waiting.add(key)
+                out = layer.frame.get_static_pad("src")
+                probes.append((out, out.add_probe(Gst.PadProbeType.BUFFER, arrived, key)))
+                if branch.feed.key not in woken:
+                    self._push_last(branch, layer)
+                layer.valve.set_property("drop", False)
+        if not waiting:
+            for pad, probe in probes:
+                pad.remove_probe(probe)
+            self._switch(previous, active)
+            return
+        self._pending = (previous, active, GLib.timeout_add(SWITCH_WAIT_MS, ready), probes)
 
     def _cancel_pending(self) -> None:
         pending, self._pending = self._pending, None
@@ -2225,13 +2311,21 @@ class Engine(GObject.Object):
             if start is None:
                 continue
             self.switched_at[fmt] = start
+            if os.environ.get("STREAMY_TRACE_SWITCH"):
+                event = self.programs[fmt].mixer.get_static_pad("src").get_sticky_event(Gst.EventType.SEGMENT, 0)
+                seg = event.parse_segment() if event is not None else None
+                log(f"switch {previous} -> {active} on {fmt}: start {start / 1e6:.0f} ms, running {_running / 1e6:.0f} ms"
+                    + (f", segment start {seg.start / 1e6:.0f} time {seg.time / 1e6:.0f} base {seg.base / 1e6:.0f}"
+                       f" position {seg.position / 1e6:.0f}" if seg is not None else ", no segment"))
             end = start + duration
             for branch in incoming:
                 layer = branch.layers.get(fmt)
                 if layer is None:
                     continue
-                layer.valve.set_property("drop", False)
-                self._push_last(branch, layer)
+                if layer.valve.get_property("drop"):
+                    # Its newest picture first, then the source's next ones: never one older after a newer.
+                    self._push_last(branch, layer)
+                    layer.valve.set_property("drop", False)
                 if layer.alpha is None or branch.fade < FADE_MS:
                     continue  # no picture yet: it fades in when it has one (_fade_in)
                 if duration:
@@ -2263,7 +2357,15 @@ class Engine(GObject.Object):
         self._sync_gates(duration)
         self._watch()
 
+        ends = {fmt: at + duration for fmt, at in self.switched_at.items()}
+
         def done() -> bool:
+            # Over once every canvas has composited its last step (a late mixer gets there after the clock).
+            late = [fmt for fmt, end in ends.items() if fmt in self.programs and
+                    (self._made(self.programs[fmt]) or 0) < end + 2 * LEAD_NS]
+            if late and time.monotonic() < given:
+                self._switch_timer = GLib.timeout_add(LEAD_MS, done)
+                return False
             self._switch_timer = 0
             for branch in list(self.branches.values()):
                 for layer in branch.layers.values():
@@ -2275,6 +2377,7 @@ class Engine(GObject.Object):
             self._sync_parking()
             return False
 
+        given = time.monotonic() + (int(ms) if duration else 0) / 1000 + 5.0  # a mixer stalled for good
         self._switch_timer = GLib.timeout_add(int(ms if duration else 0) + 2 * LEAD_MS, done)
 
 
