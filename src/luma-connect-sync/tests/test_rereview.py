@@ -133,6 +133,7 @@ class S2NoOldWordsIntoTheNextEpoch(Members):
     def test_late_recovery_join_is_dropped(self) -> None:
         self.b.account.members()                          # b last counted the members before the removal
         self.b.hub.revoke(self.a.hub.device)              # the device that kept the words is removed
+        self.fake.verify = False                          # a Hub that lets it in meanwhile (the real one refuses: see below)
         m = self.device("Attacker")
         m.account.join_with_recovery(self.pending.words)  # someone with the old words gets in before b rekeys
         self.b.account.refresh()
@@ -175,3 +176,33 @@ class S5TokenAloneDeletesNothing(Members):
         self.assertIn(zone, self.hub["zones"])
         self.a.engine.delete_zone("apps")                 # the device itself still can
         self.assertNotIn(zone, self.hub["zones"])
+
+
+class S2ChainNoOldWordsIntoTheNextEpoch(Members):
+    """S2 chain: a device let in with the old words during a pending removal approves another; neither gets the new key."""
+
+    def test_recovery_joiner_and_the_device_it_approved_are_dropped(self) -> None:
+        self.b.account.members()                          # b last counted the members before the removal
+        self.b.hub.revoke(self.a.hub.device)              # the device that kept the words is removed; the new key waits
+        self.fake.verify = False                          # a Hub that lets new members in meanwhile
+        r2 = self.device("Attacker")
+        r2.account.join_with_recovery(self.pending.words)
+        r3 = self.device("Attacker 2")
+        r3.account.request_join()
+        r2.account.join_requests()
+        code = r3.account.join_view().code
+        r2.account.approve(next(c for c in r2.account.join_requests() if c["code"])["id"], code)
+        self.assertEqual(r3.account.confirm_join(True).state, "approved")
+        self.b.account.refresh()
+        new = self.b.account.bundle()
+        self.assertEqual(new.epoch, 2)
+        self.assertNotIn(r2.hub.device, new.members)
+        self.assertNotIn(r3.hub.device, new.members, "a device approved by the late recovery joiner doesn't get the new key either")
+        self.assertEqual(set(self.hub["envelopes"]), {self.b.hub.device})
+
+    def test_the_hub_refuses_new_members_while_the_key_change_waits(self) -> None:
+        self.b.hub.revoke(self.a.hub.device)
+        r2 = self.device("Attacker")
+        with self.assertRaises(HubError) as refused:
+            r2.account.join_with_recovery(self.pending.words)
+        self.assertEqual(refused.exception.code, "rekey_pending")
