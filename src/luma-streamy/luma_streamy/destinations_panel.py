@@ -159,12 +159,11 @@ class DestinationsPanel(Gtk.Box):
         trail = Gtk.Box(spacing=8, valign=Gtk.Align.CENTER)
         choice = self._canvas_choice(row)
         trail.append(choice)
-        switch = None
-        if row.is_stream:
-            # On: this destination goes live with Go live.
-            switch = Switch(active=row.enabled, on_toggle=lambda on, r=row: self._toggle(r, on),
-                            label=f"{row.label} goes live with Go live")
-            trail.append(switch)
+        # On: this row goes with Go live (a stream goes live; Recording records whenever you go live).
+        # Every row has one, so the switches line up; Record in the bar records on its own either way.
+        switch = Switch(active=row.enabled, on_toggle=lambda on, r=row: self._toggle(r, on),
+                        label=f"{row.label} goes live with Go live" if row.is_stream else "Record whenever I go live")
+        trail.append(switch)
         title = row.account or row.label
         widget = SidebarRow(title, lead=lead_for(row), subtitle=self.status(row), trail=trail,
                             muted=row.is_stream and not row.enabled)
@@ -205,11 +204,6 @@ class DestinationsPanel(Gtk.Box):
     def record_with_live(self) -> bool:
         """The Recording row's "Record whenever I go live"."""
         return any(r.enabled for r in self.store.rows if not r.is_stream)
-
-    def _set_record_with_live(self, row: Destination) -> None:
-        row.enabled = not row.enabled
-        self.store.update(row)
-        self._changed()
 
     def _live(self, row_id: str) -> bool:
         return self.states.get(row_id, ("off", ""))[0] in ("connecting", "live", "reconnecting", "finishing")
@@ -285,9 +279,7 @@ class DestinationsPanel(Gtk.Box):
             target = self.outputs.rows[row.id].target if self.outputs is not None and row.id in self.outputs.rows else None
             if target:
                 rows.append(MenuItem("Show file", icon="folder-open", on_activate=lambda: _show_file(target, self)))
-            rows += [MenuItem("Record whenever I go live", icon="circle-dot", selected=row.enabled,
-                              on_activate=lambda: self._set_record_with_live(row)),
-                     MenuItem("Open folder", icon="folder", on_activate=lambda: self._open_folder(row))]
+            rows += [MenuItem("Open folder", icon="folder", on_activate=lambda: self._open_folder(row))]
         FloatingMenu(rows, label=row.label, title=row.label).popup(anchor, x=x, y=y)
 
     def _changed(self) -> None:

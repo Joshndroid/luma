@@ -574,6 +574,7 @@ class StreamyWindow(AppWindow):
 
     def _row_state(self, _outputs, _row_id: str, _state: str, _words: str) -> None:
         """A destination row changed: taps open or close, chips show what is live, the bar follows."""
+        self._update_preview_running()  # a row ending with the window hidden lets the program rest; one starting runs it
         self.engine.sync_taps()
         self._sync_canvas_state()
         for r in self.dest_store.rows:
@@ -794,11 +795,17 @@ class StreamyWindow(AppWindow):
         from .engine import log
 
         visible = self._on_screen()
-        if not visible and not self.engine.outputs and self.engine.running:
+        # Sending = any destination row that is live, connecting or reconnecting (the outputs fan-out), or the
+        # engine's own outputs. While anything is sent the program never rests: a locked screen or a hidden
+        # window must not freeze a stream (it starved Restream, which closed the connection, and the
+        # reconnect then waited for a key frame that never came).
+        outputs = getattr(self, "outputs", None)
+        sending = bool(self.engine.outputs) or bool(outputs is not None and outputs.live())
+        if not visible and not sending and self.engine.running:
             log("the window is off screen and nothing is sent: the program rests")
             self.engine.stop()
-        elif visible and not self.engine.running and getattr(self, "_tick", 0):
-            log("the window is on screen: the program runs")
+        elif (visible or sending) and not self.engine.running and getattr(self, "_tick", 0):
+            log("the window is on screen: the program runs" if visible else "something is sent: the program runs")
             self._start_engine()  # shown again (the first start is _start_engine's own, at idle)
 
     def _fill_fake_sources(self) -> None:
@@ -2582,8 +2589,7 @@ class StreamyWindow(AppWindow):
                     BarAction("copy", "Duplicate", on_activate=self.duplicate_selected),
                     BarAction("trash-2", "Delete", danger=True, on_activate=self.delete_selected)]
             items.append(SEPARATOR)
-        else:
-            items.append(BarAction("plus", "Add widget", menu=self._add_menu))
+        # Adding a widget lives on the Widgets panel (its + and right-click), not in the bar.
         self.readouts = {}
         if self.recording_since is not None:
             self.readouts["record"] = BarChip("Recording", meta=clock(time.monotonic() - self.recording_since),
@@ -2598,7 +2604,10 @@ class StreamyWindow(AppWindow):
             items.append(self.readouts["stream"])
             items.append(BarAction("square", "End stream", danger=True, primary=True, on_activate=self.ask_end_stream))
         elif self._streams_ready():
-            items.append(BarAction("radio-tower", "Go live", primary=True, on_activate=self.go_live))
+            # Recording's switch on: Go live records too, and says so (unless a recording already runs).
+            both = self.recording_since is None and self.dest_panel.record_with_live()
+            items.append(BarAction("radio-tower", "Go live & record" if both else "Go live", primary=True,
+                                   on_activate=self.go_live))
         self._sync_canvas_state()
         self._sync_output_title()
         if more is not None:
@@ -3560,6 +3569,7 @@ class StreamyWindow(AppWindow):
         self._refresh_bar()
 
     def stop_recording(self) -> None:
+        self._recording_with_live = False  # stopped on its own: End stream has no recording to end
         self.dest_panel.record(False)
         self._refresh_bar()
 
@@ -3597,6 +3607,9 @@ class StreamyWindow(AppWindow):
         if self.stream_state != "off":
             return
         if self._streams_ready():
+            # A recording Go live starts is part of going live: End stream ends it too. One already
+            # running (Record in the bar) is left alone, before and after.
+            self._recording_with_live = self.recording_since is None and self.dest_panel.record_with_live()
             self.dest_panel.go_live(record=None if self.dest_panel.record_with_live() else False)
             return
         self.add_destination()
@@ -3665,12 +3678,16 @@ class StreamyWindow(AppWindow):
         key_entry.grab_focus()
 
     def ask_end_stream(self) -> None:
+        with_recording = getattr(self, "_recording_with_live", False) and self.recording_since is not None
         DestructiveDialog.in_bar(self.center, title="End the stream?",
-                                 body="Viewers see the stream end. A recording keeps going.",
+                                 body="Viewers see the stream end. The recording stops and is saved." if with_recording
+                                 else "Viewers see the stream end. A recording keeps going.",
                                  action="End stream", on_confirm=self._end_stream)
 
     def _end_stream(self) -> None:
-        self.dest_panel.end()
+        with_recording = getattr(self, "_recording_with_live", False)
+        self._recording_with_live = False
+        self.dest_panel.end(recording=with_recording)
         self.engine.stop_stream()
 
     def _output_state(self, _engine, kind: str, state: str) -> None:

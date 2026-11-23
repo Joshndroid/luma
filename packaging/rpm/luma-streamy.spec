@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.19%{?dist}
+Release:        1.luma.20%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -141,6 +141,9 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} STREAMY_FORMATS_BESIDE=1 STREAMY_FORMA
   timeout 120 python3 -B tests/engine_formats.py
 # A resize is composited on the next canvas frame, never behind an older picture.
 PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 120 python3 -B tests/engine_resize_frame.py
+# A recording and a stream row (FLV) carry the program's sound, also from an encoder that moves its
+# timestamps (vah264enc); skipped where no H.264 and AAC encoder is installed (no OpenH264 here).
+PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 300 python3 -B tests/engine_stream_sound.py
 # The installed app opens on drawn stand-in sources and renders its window
 # at phone and desktop widths. The first try waits 15 s: on a loaded builder
 # the window can take that long to map while llvmpipe composites the scene.
@@ -183,6 +186,25 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.20
+- Streams carry sound again: vah264enc puts its output 1000 hours above
+  its input, and every stream row dropped all of the encode's sound as
+  before its first picture. Encoded samples now go back on their input's
+  timeline.
+- A row starts with the sound its encode put out since its first picture
+  went in: behind a slow encoder, recordings and streams began seconds
+  late on sound.
+- Dropped sound is logged (rate-limited), with each encode's and row's
+  first sound offset; STREAMY_ROW_DUMP=<dir> writes what a stream row
+  sends.
+- A screen lock no longer stops the program while a destination is live
+  (the server closed the connection and the reconnect waited for good).
+- An encode's timestamps carry on across a program restart.
+- Encodes keep 30 fps whatever rate a canvas hands over (60 fps doubled
+  every bitrate).
+- The Recording row records whenever Go live starts; End stream ends that
+  recording. No Add widget in the action bar.
+
 * Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.19
 - Every scene's sources stay open: a scene switch reopens nothing and shows
   no "Connecting" card. A source no shown scene uses is parked (a camera's

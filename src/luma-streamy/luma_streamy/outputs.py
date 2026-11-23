@@ -13,6 +13,7 @@ GLib main loop.
 """
 from __future__ import annotations
 
+import collections
 import os
 import threading
 import time
@@ -43,6 +44,28 @@ def log(text: str) -> None:
 
 #: A live row writes its numbers to the journal this often (seconds).
 STATS_LOG_S = 5
+
+
+#: An encoder whose first output is this far (ns) from its first input has moved its timestamps to a base of
+#: its own (vah264enc puts its output 1000 hours later); smaller differences are the encoder's own timing (an AAC
+#: encoder's priming) and stay.
+ENCODER_REBASE_MIN = 500_000_000
+
+#: An encode keeps this much of its encoded sound (ns): a row starts on a key frame that a slow encoder
+#: put out seconds after it went in, and takes the sound from that picture on, not from when it starts.
+SOUND_BACKLOG_NS = 5 * 1_000_000_000
+
+#: Pictures closer together than this (ns) are over the encode's rate: 3/4 of a frame at og.FPS, so a
+#: jittery 30 fps source keeps every picture and a 60 fps one keeps every other.
+MIN_FRAME_GAP = 3 * 10**9 // (4 * og.FPS)
+
+
+def counted(counts: dict, key: str, text: str) -> None:
+    """Log a dropped sample at the 1st, 10th, 100th and every 1000th time it happens for ``key``, so a
+    stream that loses its sound leaves a trace without flooding the journal."""
+    n = counts[key] = counts.get(key, 0) + 1
+    if n in (1, 10, 100) or n % 1000 == 0:
+        log(f"{text} ({n} so far)")
 
 
 def build(spec: Element) -> Gst.Element:
@@ -120,6 +143,9 @@ class Row:
         self._last_tick = time.monotonic()
         self._lock = threading.Lock()
         self._bus_id = 0
+        self._drops: dict[str, int] = {}
+        self._sound_seen = False
+        self._sound_last: int | None = None  # the newest sound pts pushed in
 
     @property
     def is_stream(self) -> bool:
@@ -148,6 +174,10 @@ class Row:
                     _on_main(self._failed, str(error))
                     return
                 self.t0 = buffer.pts
+                # The sound the encode put out since this picture went in: on a slow encoder (seconds behind
+                # on a busy machine) the row would otherwise start that much later on sound than on pictures.
+                for recent in self.group.recent_sound(self.t0):
+                    self._push_sound(recent)
             src = self.video_src
             if src.get_property("current-level-buffers") >= src.get_property("max-buffers"):
                 self.stats.dropped_network += 1
@@ -163,12 +193,37 @@ class Row:
 
     def push_sound(self, sample: Gst.Sample) -> None:
         with self._lock:
-            if self.stopping or self.sound_src is None or self.t0 is None:
-                return
-            buffer = sample.get_buffer()
-            if buffer.pts == Gst.CLOCK_TIME_NONE or buffer.pts < self.t0:
-                return
-            self.sound_src.emit("push-buffer", self._shift(buffer))
+            self._push_sound(sample)
+
+    def _push_sound(self, sample: Gst.Sample) -> None:
+        """One encoded sound sample into the row (its lock held)."""
+        if self.stopping:
+            return
+        if self.pipeline is None or self.t0 is None:
+            return  # not built yet (or reconnecting): it starts on a key frame, and takes the sound after it then
+        buffer = sample.get_buffer()
+        if self._sound_last is not None and buffer.pts != Gst.CLOCK_TIME_NONE and buffer.pts <= self._sound_last:
+            return  # already in (pushed as the row started, from the encode's recent sound)
+        if self.sound_src is None:
+            counted(self._drops, "nopad", f"row {self.id}: sound dropped: the row was built without sound")
+            return
+        if buffer.pts == Gst.CLOCK_TIME_NONE:
+            counted(self._drops, "nopts", f"row {self.id}: sound dropped: no timestamp")
+            return
+        if buffer.pts < self.t0:
+            counted(self._drops, "early", f"row {self.id}: sound dropped: {(self.t0 - buffer.pts) / Gst.SECOND:.3f} s "
+                                          f"before the row's first picture")
+            return
+        src = self.sound_src
+        if src.get_property("current-level-buffers") >= src.get_property("max-buffers"):
+            counted(self._drops, "full", f"row {self.id}: sound dropped: the mux isn't taking it "
+                                         f"({src.get_property('current-level-buffers')} waiting)")
+            return
+        if not self._sound_seen:
+            self._sound_seen = True
+            log(f"row {self.id}: first sound {(buffer.pts - self.t0) / Gst.SECOND:+.3f} s from its first picture")
+        self._sound_last = buffer.pts
+        src.emit("push-buffer", self._shift(buffer))
 
     def _shift(self, buffer: Gst.Buffer) -> Gst.Buffer:
         out = fresh(buffer)
@@ -194,7 +249,11 @@ class Row:
         if not link_to_mux((head + adapter)[-1], mux, video_caps if not adapter else
                            Gst.Caps.from_string(og.video_adapter(self.id, self.kind, codec)[-1].props["caps"])):
             raise OutputError(f"{codec} doesn't go to {mux.get_factory().get_name()}")
-        link_all(tail)
+        dump = os.environ.get("STREAMY_ROW_DUMP")
+        if dump and self.is_stream and len(tail) >= 2:
+            self._dump_branch(pipeline, tail, dump)
+        else:
+            link_all(tail)
         sound = None
         if self.group.sound_caps is not None:
             sound = [build(e) for e in og.row_head(self.id, "sound")]
@@ -215,6 +274,49 @@ class Row:
             raise OutputError("the destination could not start")
         log(f"row {self.id}: built {self.kind} {self.target.split('/')[2] if '://' in self.target else self.target} "
             f"on {video_caps.to_string()[:200]}")
+
+    def _dump_branch(self, pipeline: Gst.Pipeline, tail: list[Gst.Element], folder: str) -> None:
+        """STREAMY_ROW_DUMP=<dir>: the exact bytes the mux hands the stream's sink, also written to
+        <dir>/<row>-<time>.<flv|ts>, and every caps event there (rtmp2sink sends the caps'
+        streamheader, not the header buffers) to the same name + .caps."""
+        os.makedirs(folder, exist_ok=True)
+        base = os.path.join(folder, f"{self.id}-{time.strftime('%Y%m%d-%H%M%S')}")
+        path = base + (".flv" if self.kind == "rtmp" else ".ts" if self.kind == "srt" else ".bin")
+        tee = Gst.ElementFactory.make("tee", f"row-{self.id}-dumptee")
+        queue = Gst.ElementFactory.make("queue", f"row-{self.id}-dumpq")
+        for name, value in (("max-size-time", 0), ("max-size-buffers", 0), ("max-size-bytes", 0)):
+            queue.set_property(name, value)
+        sink = Gst.ElementFactory.make("filesink", f"row-{self.id}-dump")
+        for name, value in (("location", path), ("async", False), ("sync", False)):
+            sink.set_property(name, value)
+        for element in (tee, queue, sink):
+            pipeline.add(element)
+        link_all([tail[0], tee, tail[1]])
+        link_all([tee, queue, sink])
+        link_all(tail[1:])
+        started = time.monotonic()
+
+        def caps_event(_pad, info) -> Gst.PadProbeReturn:
+            event = info.get_event()
+            if event is not None and event.type == Gst.EventType.CAPS:
+                caps = event.parse_caps()
+                # The header buffers' sizes, from the caps string (GstValueArray isn't iterable in Python).
+                text = caps.to_string()
+                start = text.find("streamheader=(buffer)<")
+                sizes = []
+                if start >= 0:
+                    body = text[start + len("streamheader=(buffer)<"):text.find(">", start)]
+                    sizes = [len(part.strip()) // 2 for part in body.split(",")]
+                try:
+                    with open(base + ".caps", "a") as out:
+                        out.write(f"{time.monotonic() - started:.3f} s: streamheader {sizes} "
+                                  f"{caps.to_string()[:4000]}\n")
+                except OSError:
+                    pass
+            return Gst.PadProbeReturn.OK
+
+        tee.get_static_pad("sink").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, caps_event)
+        log(f"row {self.id}: dumping what is sent to {path}")
 
     def _count(self, _pad, info) -> Gst.PadProbeReturn:
         if info.type & Gst.PadProbeType.BUFFER_LIST:
@@ -277,6 +379,8 @@ class Row:
             pipeline, self.pipeline = self.pipeline, None
             self.video_src = self.sound_src = None
             self.t0 = None
+            self._sound_seen = False
+            self._sound_last = None
         if pipeline is None:
             return
         bus = pipeline.get_bus()
@@ -376,11 +480,22 @@ class Encode:
         self.sound_caps: Gst.Caps | None = None
         self.t0: int | None = None
         self.dropped = 0
+        self.paced = 0  # pictures over FPS, dropped by timestamp before the encoder
+        self._last_pts: int | None = None
         self.stopping = False
         self._eos: set[str] = set()
         self._lock = threading.Lock()
         self._encoder: Gst.Element | None = None
         self._vout: Gst.Element | None = None
+        self._drops: dict[str, int] = {}
+        self._sound_seen = False
+        #: Per medium: the first timestamp pushed into its encoder, and how far its encoder moved its output
+        #: from the input's timeline (learned from the first encoded sample, then taken off every one).
+        self._first_in: dict[str, int] = {}
+        self._offset: dict[str, int] = {}
+        #: The last SOUND_BACKLOG_NS of encoded sound, for a row that starts on a picture encoded before it.
+        self._sound_backlog: collections.deque = collections.deque()
+        self._backlog_lock = threading.Lock()
 
     def _build(self, caps: Gst.Caps) -> None:
         pipeline = Gst.Pipeline.new(f"streamy-encode-{self.preset.key}")
@@ -437,8 +552,24 @@ class Encode:
                     _on_main(self.outputs._encode_failed, self, str(error))
                     return
                 self.t0 = buffer.pts
+            elif self._last_pts is not None and buffer.pts + Gst.SECOND < self._last_pts:
+                # The program was rebuilt (its clock starts again): carry on from the last picture sent, so
+                # the encoder and every row see time keep going instead of dropping everything as "before t0".
+                sent = self._last_pts - self.t0
+                self.t0 = buffer.pts - sent - Gst.SECOND // og.FPS
+                self._last_pts = None
+                log(f"encode {self.preset.key}: the program restarted; timestamps carry on from {sent / Gst.SECOND:.1f} s")
             if buffer.pts < self.t0:
                 return
+            # The encode is FPS: a picture closer than ~3/4 of a frame to the last one kept is dropped here,
+            # by timestamp, whatever rate the program's tap hands over (it gave its 60 fps canvas rate
+            # through, which doubled every bitrate: CBR spends its budget per declared frame).
+            if self._last_pts is not None and buffer.pts - self._last_pts < MIN_FRAME_GAP:
+                self.paced += 1
+                if self.paced == 1:
+                    log(f"encode {self.preset.key}: pictures arrive faster than {og.FPS} fps; keeping {og.FPS}")
+                return
+            self._last_pts = buffer.pts
             src = self.video_src
             if src.get_property("current-level-buffers") >= src.get_property("max-buffers"):
                 self.dropped += 1  # the encoder is behind
@@ -447,18 +578,36 @@ class Encode:
                 return
             out = fresh(buffer)
             out.pts, out.dts = buffer.pts - self.t0, Gst.CLOCK_TIME_NONE
+            self._first_in.setdefault("video", out.pts)
             src.emit("push-buffer", out)
 
     def push_sound(self, sample: Gst.Sample) -> None:
         buffer = sample.get_buffer()
         with self._lock:
-            if self.stopping or self.sound_src is None or self.t0 is None or buffer.pts == Gst.CLOCK_TIME_NONE:
+            if self.stopping or self.pipeline is None:
+                return  # the encode starts on its first picture; the sound before it isn't wanted
+            key = self.preset.key
+            if self.sound_src is None:
+                counted(self._drops, "nopad", f"encode {key}: sound dropped: no AAC encoder")
+                return
+            if buffer.pts == Gst.CLOCK_TIME_NONE:
+                counted(self._drops, "nopts", f"encode {key}: sound dropped: no timestamp")
                 return
             if buffer.pts < self.t0:
+                counted(self._drops, "early", f"encode {key}: sound dropped: {(self.t0 - buffer.pts) / Gst.SECOND:.3f} s "
+                                              f"before the first picture")
                 return
+            src = self.sound_src
+            if src.get_property("current-level-buffers") >= src.get_property("max-buffers"):
+                counted(self._drops, "full", f"encode {key}: sound dropped: the AAC encoder is behind")
+                return
+            if not self._sound_seen:
+                self._sound_seen = True
+                log(f"encode {key}: first sound {(buffer.pts - self.t0) / Gst.SECOND:+.3f} s from the first picture")
             out = fresh(buffer)
             out.pts, out.dts = buffer.pts - self.t0, Gst.CLOCK_TIME_NONE
-            self.sound_src.emit("push-buffer", out)
+            self._first_in.setdefault("sound", out.pts)
+            src.emit("push-buffer", out)
 
     # Encoded out (GStreamer threads)
 
@@ -466,15 +615,60 @@ class Encode:
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.OK
+        sample = self._input_timeline(sample, media)
         if media == "sound":
             if self.sound_caps is None:
                 self.sound_caps = sample.get_caps()
+            pts = sample.get_buffer().pts
+            with self._backlog_lock:
+                self._sound_backlog.append(sample)
+                while pts != Gst.CLOCK_TIME_NONE and self._sound_backlog[0].get_buffer().pts + SOUND_BACKLOG_NS < pts:
+                    self._sound_backlog.popleft()
+            # Rows after the backlog's lock (a row starting holds its own lock, then takes that one).
             for row in list(self.rows.values()):
                 row.push_sound(sample)
         else:
             for row in list(self.rows.values()):
                 row.push_video(sample)
         return Gst.FlowReturn.OK
+
+    def recent_sound(self, since: int) -> list[Gst.Sample]:
+        """The encoded sound at or after ``since`` (pts) still held, oldest first."""
+        with self._backlog_lock:
+            return [s for s in self._sound_backlog if s.get_buffer().pts != Gst.CLOCK_TIME_NONE and
+                    s.get_buffer().pts >= since]
+
+    def _input_timeline(self, sample: Gst.Sample, media: str) -> Gst.Sample:
+        """The encoded sample on the timeline its input was pushed on. Rows interleave video and sound by
+        these times, and an encoder that moves its output to a base of its own (vah264enc adds 1000 hours,
+        keeping its DTS positive) put every picture 1000 hours after the sound: each row dropped all its
+        sound as "before the first picture". The offset is the first output's distance from the first
+        input (an encoder's first output is its first input), taken off every sample after it."""
+        buffer = sample.get_buffer()
+        offset = self._offset.get(media)
+        if offset is None:
+            first = self._first_in.get(media)
+            if first is None or buffer.pts == Gst.CLOCK_TIME_NONE:
+                return sample
+            offset = buffer.pts - first
+            if abs(offset) < ENCODER_REBASE_MIN:
+                offset = 0
+            else:
+                name = self.choice.video if media == "video" else self.choice.audio
+                log(f"encode {self.preset.key}: {name}'s timestamps are offset by {offset / Gst.SECOND:.3f} s; "
+                    f"mapped back")
+            self._offset[media] = offset
+        if not offset:
+            return sample
+        out = fresh(buffer)
+        for field in ("pts", "dts"):
+            value = getattr(buffer, field)
+            if value != Gst.CLOCK_TIME_NONE:
+                # A DTS before the first picture (an encoder's reorder priming) has no place on the input's
+                # timeline: it goes (the muxers take the PTS).
+                setattr(out, field, value - offset if value >= offset else
+                        (0 if field == "pts" else Gst.CLOCK_TIME_NONE))
+        return Gst.Sample.new(out, sample.get_caps(), sample.get_segment(), sample.get_info())
 
     def _encoded_eos(self, _sink, media: str) -> None:
         self._eos.add(media)

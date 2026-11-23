@@ -430,7 +430,8 @@ def outputs(win) -> None:
     win.select(None)
     win._refresh_bar()
     assert "Add a destination" not in labels(), labels()
-    print("bar: outputs only, never a key for adding a destination")
+    assert "Add widget" not in labels(), labels()
+    print("bar: outputs only, never a key for adding a destination or a widget")
     # Turning a stream row on or off in Destinations changes the bar at once, with no other event.
     streams = [r for r in win.dest_store.rows if r.is_stream]
     row = streams[0] if streams else win.dest_store.add("restream")
@@ -441,6 +442,19 @@ def outputs(win) -> None:
         assert ("Go live" in labels()) == win._streams_ready() == (on or any(
             r.is_stream and r.enabled for r in win.dest_store.rows if r is not row)), labels()
     print("bar: Go live follows a stream row turned on and off")
+    # Recording's switch on: the bar says Go live & record; off: Go live.
+    rec = next(r for r in win.dest_store.rows if not r.is_stream)
+    was = rec.enabled
+    for on in (True, False):
+        rec.enabled = on
+        win.dest_store.update(rec)
+        win.dest_panel._changed()
+        if win._streams_ready() and win.recording_since is None:
+            assert ("Go live & record" in labels()) == on and ("Go live" in labels()) != on, labels()
+    rec.enabled = was
+    win.dest_store.update(rec)
+    win.dest_panel._changed()
+    print("bar: Go live & record while Recording goes with Go live")
     win.center.show_bar = show_bar
 
 
