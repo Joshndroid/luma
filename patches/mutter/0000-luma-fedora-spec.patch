@@ -1,11 +1,11 @@
 --- a/mutter.spec
 +++ b/mutter.spec
-@@ -29,13 +29,55 @@
+@@ -29,13 +29,56 @@
  
  Name:          mutter
  Version:       50.4
 -Release:       %autorelease
-+Release:       1.luma.29%{?dist}
++Release:       1.luma.30%{?dist}
  Summary:       Window and compositing manager based on Clutter
  
  # Automatically converted from old format: GPLv2+ - review is highly recommended.
@@ -54,10 +54,11 @@
 +Patch1035:     0036-clutter-stage-Mark-capture-paints-let-captures-be-made-to-paint.patch
 +Patch1036:     0037-clutter-Update-only-the-views-a-redraw-lands-on.patch
 +Patch1041:     0042-Let-windows-hide-from-screen-captures.patch
++Patch1046:     0047-Let-a-configure-handler-restore-a-window-in-any-state.patch
  
  
  BuildRequires: cvt
-@@ -169,6 +211,12 @@
+@@ -169,6 +212,12 @@
  
  %prep
  %autosetup -S git -n %{name}-%{tarball_version}
@@ -70,7 +71,7 @@
  
  %build
  %meson -Degl_device=true
-@@ -179,6 +227,29 @@
+@@ -179,6 +228,29 @@
  
  %find_lang %{name}
  
@@ -100,7 +101,7 @@
  %files -f %{name}.lang
  %license COPYING
  %doc NEWS
-@@ -200,6 +271,7 @@
+@@ -200,6 +272,7 @@
  %{_datadir}/GConf/gsettings/mutter-schemas.convert
  %{_datadir}/glib-2.0/schemas/org.gnome.mutter.gschema.xml
  %{_datadir}/glib-2.0/schemas/org.gnome.mutter.wayland.gschema.xml

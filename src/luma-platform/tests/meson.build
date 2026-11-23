@@ -123,6 +123,17 @@ test(
   env: ['G_DEBUG=fatal-criticals'],
 )
 
+restore_test = executable(
+  'test-luma-restore',
+  'test-restore.c',
+  dependencies: ui_dep,
+)
+test(
+  'restore',
+  restore_test,
+  env: ['G_DEBUG=fatal-criticals'],
+)
+
 # LumaUI parts (ADR-052): a part's C test joins once it exists, and the parity
 # test compares every C part's widget tree with its Python twin's.
 fs = import('fs')

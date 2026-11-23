@@ -167,6 +167,61 @@ returns `FALSE`. Python apps call `AppWindow.set_hidden_from_capture()`
 `_LUMA_WINDOW_HIDDEN_FROM_CAPTURE` CARDINAL property on their window to 1.
 See ADR-053.
 
+## Windows and documents that come back
+
+Every app's windows come back after a restart, a log-out or a crash, and
+continue on the person's other devices: the shell restores their place,
+state, order and focus. An app also gets its own state back by giving each
+window a key and saving what the window needs (C API level 12):
+
+```c
+static void
+save_window (LumaRestore *restore, GtkWindow *window, GVariantDict *state, gpointer data)
+{
+  luma_restore_add_document (state, document_uri (window), document_title (window),
+                             document_dirty (window), unsaved_text (window));
+  g_variant_dict_insert (state, "scroll", "d", scroll_position (window));
+}
+
+static void
+restore_window (LumaRestore *restore, const char *reason, const char *key,
+                GVariant *state, gpointer app)
+{
+  GtkWindow *window = open_window (app, state);
+  luma_window_set_restore_key (window, key);
+  gtk_window_present (window);
+}
+
+static void
+startup (GApplication *app)
+{
+  LumaRestore *restore = luma_restore_get_default (GTK_APPLICATION (app));
+  g_signal_connect (restore, "save-window", G_CALLBACK (save_window), NULL);
+  g_signal_connect (restore, "restore-window", G_CALLBACK (restore_window), app);
+}
+
+static void
+activate (GApplication *app)
+{
+  if (luma_restore_restore (luma_restore_get_default (GTK_APPLICATION (app))))
+    return;
+  open_window (app, NULL);
+}
+```
+
+Give every `GtkApplicationWindow` a key before it is first shown
+(`luma_window_set_restore_key (window, "main")`). `restore-window` comes once
+per saved window, in order; the shell places each re-created window where
+its key was. `save` and `restore` carry app-wide state. The reason is
+`restore` (same device), `continue` (from another device) or `recover`.
+Keep the state small: URIs, the view, and unsaved text. It goes only to the
+shell, which gives an app only its own state back, and travels to the
+person's other devices end-to-end encrypted. Python apps use
+`luma_appkit.restore.enable(app, open_window)` with `AppWindow.restore_key`,
+`save_state()`, `restore_state()` and `documents()` (`LUMAUI_API_LEVEL` 15).
+Without Luma's shell nothing is saved and `luma_restore_restore()` returns
+`FALSE`. See ADR-055.
+
 ## Where C differs from Python
 
 - **Refusals come when a part is shown.** C parts are filled in after they

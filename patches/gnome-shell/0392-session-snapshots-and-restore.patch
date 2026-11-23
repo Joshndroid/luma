@@ -1,0 +1,1193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Mon, 23 Nov 2026 04:00:00 -0600
+Subject: [PATCH] Session snapshots and restore
+
+The windows a person had open survive log-out, restarts, shutdown and
+crashes, and can continue on another device (ADR-055).
+
+lumaSession.js takes a snapshot of every application window in stacking
+order: app, key, monitor (with its vendor, product and serial), workspace,
+frame and floating rectangles (absolute and as a share of the work area),
+state, minimized, always on top, focus, and the state LumaUI apps give.
+It is taken on lock, suspend (under a sleep delay inhibitor), lid close,
+log-out and shutdown, and at most once a minute while windows change, into
+$XDG_STATE_HOME/luma/session (0700, files 0600). After the log-out
+snapshot nothing more is written, so the windows closing as the session
+ends don't replace it.
+
+At login, the last snapshot is restored once (org.projectluma.session
+reopen-windows). Each app is started; each window is placed in its first
+configure, before Mutter places or shows it, from its key, title or
+order; apps that don't reopen their own windows are asked for more.
+When every window has drawn, the stack is ordered, the workspace switched
+and the focused window focused. Another monitor layout maps windows by
+monitor identity, then role, then position, keeping their share of the
+work area. A partial restore says what it couldn't do.
+
+org.projectluma.Session1 on org.projectluma.Session: TakeRestore,
+SetWindowKey and SaveState for apps (each caller only for its own app and
+windows), Snapshot, GetSnapshot and Restore for unsandboxed system callers.
+---
+ data/meson.build                         |    2 +
+ data/org.projectluma.session.gschema.xml |   26 +
+ js/js-resources.gresource.xml            |    1 +
+ js/ui/endSessionDialog.js                |    5 +
+ js/ui/lumaSession.js                     | 1029 ++++++++++++++++++++++
+ js/ui/main.js                            |   12 +
+ 6 files changed, 1075 insertions(+)
+ create mode 100644 data/org.projectluma.session.gschema.xml
+ create mode 100644 js/ui/lumaSession.js
+
+diff --git a/data/meson.build b/data/meson.build
+index 9f7e8cf..56d3685 100644
+--- a/data/meson.build
++++ b/data/meson.build
+@@ -112,6 +112,8 @@ schema = configure_file(
+ install_data('00_org.gnome.shell.gschema.override', install_dir: schemadir)
+ # Luma Capture: the screenshot tool's Options (org.project_luma.capture).
+ install_data('org.project_luma.capture.gschema.xml', install_dir: schemadir)
++# Session snapshots and restore (ADR-055).
++install_data('org.projectluma.session.gschema.xml', install_dir: schemadir)
+ # Luma Capture: the helper that lets the floating thumbnail be dragged into apps.
+ install_data('luma-capture-drag.js', install_dir: libexecdir, rename: 'luma-capture-drag',
+   install_mode: 'rwxr-xr-x')
+diff --git a/data/org.projectluma.session.gschema.xml b/data/org.projectluma.session.gschema.xml
+new file mode 100644
+index 0000000..0d47b91
+--- /dev/null
++++ b/data/org.projectluma.session.gschema.xml
+@@ -0,0 +1,26 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
++<schemalist>
++  <schema id="org.projectluma.session" path="/org/projectluma/session/">
++    <key name="reopen-windows" type="b">
++      <default>true</default>
++      <summary>Reopen windows after restart</summary>
++      <description>At login after a log-out, restart, shutdown or crash, open the windows that were open, where they were.</description>
++    </key>
++    <key name="continue-offer" type="b">
++      <default>true</default>
++      <summary>Offer to continue from other devices</summary>
++      <description>When another of the account's devices has a newer session, offer to open its windows here.</description>
++    </key>
++    <key name="continue-share" type="b">
++      <default>true</default>
++      <summary>Let other devices continue from this one</summary>
++      <description>Keep an end-to-end encrypted copy of this session in Luma Connect Sync for the account's other devices.</description>
++    </key>
++    <key name="excluded-apps" type="as">
++      <default>[]</default>
++      <summary>Apps whose windows are not reopened</summary>
++      <description>Desktop IDs of apps left out of session snapshots.</description>
++    </key>
++  </schema>
++</schemalist>
+diff --git a/js/js-resources.gresource.xml b/js/js-resources.gresource.xml
+index a21d539..a771c23 100644
+--- a/js/js-resources.gresource.xml
++++ b/js/js-resources.gresource.xml
+@@ -94,6 +94,7 @@
+     <file>ui/lumaDisplayArrival.js</file>
+     <file>ui/lumaWindowCorners.js</file>
+     <file>ui/lumaWindowWatch.js</file>
++    <file>ui/lumaSession.js</file>
+     <file>ui/lumaFocusVisible.js</file>
+     <file>ui/lumaWell.js</file>
+     <file>ui/lumaWellModel.js</file>
+diff --git a/js/ui/endSessionDialog.js b/js/ui/endSessionDialog.js
+index ee26bff..2897068 100644
+--- a/js/ui/endSessionDialog.js
++++ b/js/ui/endSessionDialog.js
+@@ -28,6 +28,7 @@ import UPower from 'gi://UPowerGlib';
+ import * as CheckBox from './checkBox.js';
+ import * as Dialog from './dialog.js';
+ import * as GnomeSession from '../misc/gnomeSession.js';
++import * as Main from './main.js';
+ import * as LoginManager from '../misc/loginManager.js';
+ import * as ModalDialog from './modalDialog.js';
+ import * as UserWidget from './userWidget.js';
+@@ -498,6 +499,10 @@ class EndSessionDialog extends ModalDialog.ModalDialog {
+         this._fadeOutDialog();
+         this._stopTimer();
+         this._stopAltCapture();
++        // The windows close once the session ends: save them first, and
++        // nothing after (ADR-055).
++        await Main.lumaSession?.finalSnapshot(
++            signal === 'ConfirmedLogout' ? 'logout' : 'shutdown').catch(logError);
+         this._dbusImpl.emit_signal(signal, null);
+     }
+ 
+diff --git a/js/ui/lumaSession.js b/js/ui/lumaSession.js
+new file mode 100644
+index 0000000..502e3a9
+--- /dev/null
++++ b/js/ui/lumaSession.js
+@@ -0,0 +1,1029 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// The session survives log-out, restarts and crashes, and follows the person
++// to their other devices (ADR-055, docs/decisions/055-continue.md).
++//
++// A snapshot is every application window in stacking order: its app, key,
++// monitor, workspace, frame and floating rectangles (absolute and as a share
++// of the monitor's work area), state, focus, and the state LumaUI apps give
++// for it. Restoring starts the apps and places each window in its first
++// configure (MetaWindow::configure), before Mutter places or shows it; when
++// the windows are there, stacking, minimized windows, the workspace and
++// focus follow. Snapshots live in $XDG_STATE_HOME/luma/session (0700/0600).
++//
++//   journalctl --user -b -g luma-session
++
++import Gio from 'gi://Gio';
++import GLib from 'gi://GLib';
++import Meta from 'gi://Meta';
++import Shell from 'gi://Shell';
++
++import * as LoginManager from '../misc/loginManager.js';
++import * as Main from './main.js';
++import * as MessageTray from './messageTray.js';
++
++export const FORMAT = 1;
++const SCHEMA = 'org.projectluma.session';
++const PERIODIC_MS = 60 * 1000;
++const SETTLE_MS = 3000;
++const RESTORE_WAIT_MS = 20 * 1000;
++const LATE_WINDOW_MS = 15 * 60 * 1000;
++const SAVE_TIMEOUT_MS = 500;
++const MORE_WINDOWS_MS = 1500;
++const SLEEP_BUDGET_MS = 2000;
++const CONTINUE_TTL_S = 72 * 3600;
++
++const SessionIface = `<node>
++  <interface name="org.projectluma.Session1">
++    <method name="TakeRestore">
++      <arg type="s" name="app_id" direction="in"/>
++      <arg type="s" name="reason" direction="out"/>
++      <arg type="v" name="state" direction="out"/>
++    </method>
++    <method name="SetWindowKey">
++      <arg type="o" name="window" direction="in"/>
++      <arg type="s" name="key" direction="in"/>
++    </method>
++    <method name="SaveState">
++      <arg type="u" name="serial" direction="in"/>
++      <arg type="v" name="state" direction="in"/>
++    </method>
++    <signal name="SaveRequested">
++      <arg type="u" name="serial"/>
++    </signal>
++    <method name="Snapshot">
++      <arg type="s" name="reason" direction="in"/>
++      <arg type="s" name="snapshot" direction="out"/>
++    </method>
++    <method name="GetSnapshot">
++      <arg type="s" name="snapshot" direction="out"/>
++    </method>
++    <method name="Restore">
++      <arg type="s" name="snapshot" direction="in"/>
++      <arg type="s" name="mode" direction="in"/>
++      <arg type="s" name="result" direction="out"/>
++    </method>
++    <signal name="SnapshotTaken">
++      <arg type="s" name="reason"/>
++    </signal>
++    <signal name="RestoreFinished">
++      <arg type="s" name="result"/>
++    </signal>
++  </interface>
++</node>`;
++
++const BUS_NAME = 'org.projectluma.Session';
++const OBJECT_PATH = '/org/projectluma/Session';
++
++function log(message) {
++    console.log(`[luma-session] ${message}`);
++}
++
++export function stateDir() {
++    return GLib.build_filenamev([GLib.get_user_state_dir(), 'luma', 'session']);
++}
++
++function machineId() {
++    try {
++        const [, bytes] = GLib.file_get_contents('/etc/machine-id');
++        return new TextDecoder().decode(bytes).trim();
++    } catch {
++        return '';
++    }
++}
++
++function rect(r) {
++    return {x: r.x, y: r.y, width: r.width, height: r.height};
++}
++
++function share(r, area) {
++    return {
++        x: (r.x - area.x) / Math.max(1, area.width),
++        y: (r.y - area.y) / Math.max(1, area.height),
++        width: r.width / Math.max(1, area.width),
++        height: r.height / Math.max(1, area.height),
++    };
++}
++
++function unshare(s, area) {
++    return {
++        x: Math.round(area.x + s.x * area.width),
++        y: Math.round(area.y + s.y * area.height),
++        width: Math.round(s.width * area.width),
++        height: Math.round(s.height * area.height),
++    };
++}
++
++// Keep a rectangle inside the work area without making it smaller than it
++// has to be.
++export function fit(r, area) {
++    const width = Math.min(r.width, area.width);
++    const height = Math.min(r.height, area.height);
++    const x = Math.min(Math.max(r.x, area.x), area.x + area.width - width);
++    const y = Math.min(Math.max(r.y, area.y), area.y + area.height - height);
++    return {x, y, width, height};
++}
++
++function sameArea(a, b) {
++    return a && b && a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
++}
++
++// Saved monitor index -> current monitor index. Identity (vendor, product,
++// serial) first, then the built-in to the built-in, then the same place
++// relative to the primary monitor, then the primary monitor.
++export function mapMonitors(saved, current) {
++    const used = new Set();
++    const map = new Map();
++    const identity = m => m.vendor || m.product || m.serial
++        ? `${m.vendor}|${m.product}|${m.serial}` : null;
++    for (const s of saved) {
++        const match = current.find(c => !used.has(c.index) && identity(c) && identity(c) === identity(s));
++        if (match) {
++            map.set(s.index, match.index);
++            used.add(match.index);
++        }
++    }
++    for (const s of saved.filter(m => !map.has(m.index) && m.builtin)) {
++        const match = current.find(c => !used.has(c.index) && c.builtin);
++        if (match) {
++            map.set(s.index, match.index);
++            used.add(match.index);
++        }
++    }
++    const primarySaved = saved.find(m => m.primary) ?? saved[0];
++    const primaryCurrent = current.find(c => c.primary) ?? current[0];
++    for (const s of saved.filter(m => !map.has(m.index))) {
++        const dx = Math.sign(s.x - (primarySaved?.x ?? 0));
++        const dy = Math.sign(s.y - (primarySaved?.y ?? 0));
++        const match = current.find(c => !used.has(c.index) &&
++            Math.sign(c.x - primaryCurrent.x) === dx && Math.sign(c.y - primaryCurrent.y) === dy);
++        if (match) {
++            map.set(s.index, match.index);
++            used.add(match.index);
++        } else {
++            map.set(s.index, primaryCurrent?.index ?? 0);
++        }
++    }
++    return map;
++}
++
++const STATES = ['floating', 'maximized', 'tiled-left', 'tiled-right', 'fullscreen'];
++
++function windowState(window) {
++    if (window.is_fullscreen())
++        return 'fullscreen';
++    if (window.is_maximized())
++        return 'maximized';
++    const flags = window.get_maximize_flags?.() ?? 0;
++    if (flags === Meta.MaximizeFlags.VERTICAL) {
++        // A window tiled to a side is maximized vertically and half wide.
++        const area = window.get_work_area_current_monitor();
++        const frame = window.get_frame_rect();
++        if (frame.x <= area.x + 1)
++            return 'tiled-left';
++        if (frame.x + frame.width >= area.x + area.width - 1)
++            return 'tiled-right';
++    }
++    return 'floating';
++}
++
++function floatingRect(window) {
++    if (window.get_floating_rect)
++        return window.get_floating_rect();
++    return window.get_frame_rect();
++}
++
++// The windows a person would expect back: their own application windows,
++// not dialogs (the app re-creates those), menus or the shell's own.
++export function isRestorable(window) {
++    if (window.is_override_redirect() || window.get_transient_for())
++        return false;
++    if (window.get_window_type() !== Meta.WindowType.NORMAL)
++        return false;
++    if (window.is_skip_taskbar())
++        return false;
++    return true;
++}
++
++function windowIds(window) {
++    return {
++        sandboxed: window.get_sandboxed_app_id() ?? '',
++        gtk: window.get_gtk_application_id() ?? '',
++        wmClass: window.get_wm_class() ?? '',
++        wmInstance: window.get_wm_class_instance() ?? '',
++    };
++}
++
++function appIdOf(window) {
++    const app = Shell.WindowTracker.get_default().get_window_app(window);
++    if (app && !app.is_window_backed())
++        return app.get_id();
++    return null;
++}
++
++// The ids a window could be known by, in the forms a desktop ID takes.
++function candidateAppIds(window) {
++    const ids = new Set();
++    const tracked = appIdOf(window);
++    if (tracked)
++        ids.add(tracked);
++    const {sandboxed, gtk, wmClass, wmInstance} = windowIds(window);
++    for (const id of [sandboxed, gtk, wmClass, wmInstance]) {
++        if (!id)
++            continue;
++        ids.add(`${id}.desktop`);
++        ids.add(`${id.toLowerCase()}.desktop`);
++    }
++    return ids;
++}
++
++function variantToText(variant) {
++    return variant ? variant.print(true) : null;
++}
++
++function textToVariant(text) {
++    if (!text)
++        return null;
++    try {
++        return GLib.Variant.parse(null, text, null, null);
++    } catch (e) {
++        log(`unreadable app state: ${e.message}`);
++        return null;
++    }
++}
++
++function readJson(path) {
++    try {
++        const [, bytes] = GLib.file_get_contents(path);
++        return JSON.parse(new TextDecoder().decode(bytes));
++    } catch {
++        return null;
++    }
++}
++
++function writePrivate(path, text) {
++    GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o700);
++    const file = Gio.File.new_for_path(path);
++    file.replace_contents(new TextEncoder().encode(text), null, false,
++        Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION, null);
++}
++
++function decodeScope(text) {
++    return text.replace(/\\x([0-9a-f]{2})/gi, (_m, hex) => String.fromCharCode(parseInt(hex, 16)));
++}
++
++// Who a D-Bus caller is: its process, whether it is sandboxed (another mount
++// namespace: Flatpak, ADR-052 app sandboxes) and the app its scope or its
++// Flatpak instance names.
++async function callerIdentity(sender) {
++    const [pid] = (await Gio.DBus.session.call('org.freedesktop.DBus', '/org/freedesktop/DBus',
++        'org.freedesktop.DBus', 'GetConnectionUnixProcessID', new GLib.Variant('(s)', [sender]),
++        new GLib.VariantType('(u)'), Gio.DBusCallFlags.NONE, -1, null)).deepUnpack();
++    let sandboxed = false;
++    try {
++        sandboxed = GLib.file_read_link(`/proc/${pid}/ns/mnt`) !== GLib.file_read_link('/proc/self/ns/mnt');
++    } catch {
++        sandboxed = true;
++    }
++    let appId = null;
++    try {
++        const info = new GLib.KeyFile();
++        info.load_from_file(`/proc/${pid}/root/.flatpak-info`, GLib.KeyFileFlags.NONE);
++        appId = info.get_string('Application', 'name');
++    } catch {}
++    if (!appId) {
++        try {
++            const [, bytes] = GLib.file_get_contents(`/proc/${pid}/cgroup`);
++            const text = new TextDecoder().decode(bytes);
++            const match = text.match(/app-(?:gnome|flatpak|luma)-(.+?)-[0-9a-z]+\.scope/);
++            if (match)
++                appId = decodeScope(match[1]).replace(/\.desktop$/, '');
++        } catch {}
++    }
++    return {pid, sandboxed, appId};
++}
++
++function sameApp(a, b) {
++    const norm = id => (id ?? '').replace(/\.desktop$/, '').toLowerCase();
++    return norm(a) !== '' && norm(a) === norm(b);
++}
++
++export class LumaSession {
++    constructor() {
++        this._settings = null;
++        try {
++            this._settings = new Gio.Settings({schema_id: SCHEMA});
++        } catch (e) {
++            log(`no ${SCHEMA} schema: ${e.message}`);
++        }
++        this._dir = stateDir();
++        this._device = machineId();
++        this._dirty = false;
++        this._frozen = false;
++        this._lastWrite = 0;
++        this._writeId = 0;
++        this._serial = 0;
++        this._clients = new Map();      // bus name -> {appId, watch}
++        this._keys = new Map();         // `${bus}|${path}` -> key
++        this._answers = null;           // serial -> Map(bus -> state)
++        this._pendingRestore = new Map(); // app id (normalised) -> {reason, state}
++        this._restoring = null;
++
++        this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(SessionIface, this);
++        this._dbusImpl.export(Gio.DBus.session, OBJECT_PATH);
++        this._nameId = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS_NAME,
++            Gio.BusNameOwnerFlags.NONE, null, null);
++
++        this._watchWindows();
++        this._watchSession();
++
++        if (Main.layoutManager._startingUp)
++            Main.layoutManager.connectObject('startup-complete', () => this._restoreAtLogin(), this);
++        else
++            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
++                this._restoreAtLogin();
++                return GLib.SOURCE_REMOVE;
++            });
++    }
++
++    get reopenWindows() {
++        return this._settings?.get_boolean('reopen-windows') ?? true;
++    }
++
++    // --- snapshots -------------------------------------------------------
++
++    _monitors() {
++        const manager = global.backend.get_monitor_manager();
++        const logical = manager.get_logical_monitors();
++        const workspace = global.workspace_manager.get_active_workspace();
++        return Main.layoutManager.monitors.map(monitor => {
++            const lm = logical.find(l => l.get_number() === monitor.index);
++            const hw = lm?.get_monitors()?.[0] ?? null;
++            const area = workspace.get_work_area_for_monitor(monitor.index);
++            return {
++                index: monitor.index,
++                connector: hw?.get_connector() ?? '',
++                vendor: hw?.get_vendor() ?? '',
++                product: hw?.get_product() ?? '',
++                serial: hw?.get_serial() ?? '',
++                builtin: hw?.is_builtin() ?? false,
++                primary: monitor.index === Main.layoutManager.primaryIndex,
++                x: monitor.x, y: monitor.y, width: monitor.width, height: monitor.height,
++                scale: monitor.geometry_scale,
++                workArea: rect(area),
++            };
++        });
++    }
++
++    _windows() {
++        const excluded = new Set(this._settings?.get_strv('excluded-apps') ?? []);
++        const all = global.display.list_all_windows().filter(w => isRestorable(w) &&
++            !excluded.has(appIdOf(w)));
++        return global.display.sort_windows_by_stacking(all);
++    }
++
++    _describe(window, monitors, focus) {
++        const monitorIndex = window.get_monitor();
++        const area = monitors[monitorIndex]?.workArea ?? rect(window.get_work_area_current_monitor());
++        const frame = rect(window.get_frame_rect());
++        const floating = rect(floatingRect(window));
++        const workspace = window.is_on_all_workspaces() ? -1 : window.get_workspace()?.index() ?? 0;
++        const bus = window.get_gtk_unique_bus_name();
++        const path = window.get_gtk_window_object_path();
++        const key = (bus && path && this._keys.get(`${bus}|${path}`)) || window.get_tag() || null;
++        return {
++            app: appIdOf(window),
++            ids: windowIds(window),
++            kind: window.get_client_type() === Meta.WindowClientType.X11 ? 'x11' : 'wayland',
++            key,
++            title: window.get_title() ?? '',
++            seq: window.get_stable_sequence(),
++            monitor: monitorIndex,
++            workspace,
++            frame,
++            frameShare: share(frame, area),
++            floating,
++            floatingShare: share(floating, area),
++            state: windowState(window),
++            minimized: window.minimized,
++            above: window.is_above(),
++            sticky: window.is_on_all_workspaces() && !window.is_always_on_all_workspaces(),
++            focus: window === focus,
++            gtk: bus && path ? {bus, path} : null,
++        };
++    }
++
++    async _collectAppStates() {
++        if (this._clients.size === 0)
++            return new Map();
++        const serial = ++this._serial;
++        const answers = new Map();
++        this._answers = {serial, answers};
++        this._dbusImpl.emit_signal('SaveRequested', new GLib.Variant('(u)', [serial]));
++        await new Promise(resolve => {
++            const started = GLib.get_monotonic_time();
++            const id = GLib.timeout_add(GLib.PRIORITY_HIGH, 20, () => {
++                const done = answers.size >= this._clients.size;
++                if (done || GLib.get_monotonic_time() - started > SAVE_TIMEOUT_MS * 1000) {
++                    resolve();
++                    return GLib.SOURCE_REMOVE;
++                }
++                return GLib.SOURCE_CONTINUE;
++            });
++            this._answerWait = id;
++        });
++        this._answers = null;
++        return answers;
++    }
++
++    async collect(reason) {
++        const monitors = this._monitors();
++        const focus = global.display.focus_window;
++        const windows = this._windows().map(w => this._describe(w, monitors, focus));
++        const states = await this._collectAppStates();
++        const apps = new Map();
++        for (const w of windows) {
++            if (!w.app || apps.has(w.app))
++                continue;
++            apps.set(w.app, {app: w.app, windows: 0, state: null});
++        }
++        for (const w of windows) {
++            if (w.app)
++                apps.get(w.app).windows++;
++        }
++        for (const [bus, state] of states) {
++            const client = this._clients.get(bus);
++            if (!client)
++                continue;
++            const entry = [...apps.values()].find(a => sameApp(a.app, client.appId));
++            if (entry)
++                entry.state = variantToText(state);
++        }
++        const wm = global.workspace_manager;
++        return {
++            format: FORMAT,
++            id: GLib.uuid_string_random(),
++            device: this._device,
++            deviceName: GLib.get_host_name(),
++            deviceClass: GLib.getenv('LUMA_DEVICE_CLASS') || 'computer',
++            taken: Math.floor(Date.now() / 1000),
++            expires: Math.floor(Date.now() / 1000) + CONTINUE_TTL_S,
++            reason,
++            workspaces: {count: wm.get_n_workspaces(), active: wm.get_active_workspace_index()},
++            monitors,
++            windows,
++            apps: [...apps.values()],
++        };
++    }
++
++    async snapshot(reason) {
++        if (this._frozen)
++            return null;
++        if (this._restoring)
++            return null;
++        const snapshot = await this.collect(reason);
++        const current = GLib.build_filenamev([this._dir, 'current.json']);
++        const previous = GLib.build_filenamev([this._dir, 'previous.json']);
++        try {
++            if (GLib.file_test(current, GLib.FileTest.EXISTS))
++                Gio.File.new_for_path(current).move(Gio.File.new_for_path(previous),
++                    Gio.FileCopyFlags.OVERWRITE, null, null);
++            writePrivate(current, JSON.stringify(snapshot));
++        } catch (e) {
++            logError(e, '[luma-session] could not save the session');
++            return null;
++        }
++        this._dirty = false;
++        this._lastWrite = GLib.get_monotonic_time();
++        this._dbusImpl.emit_signal('SnapshotTaken', new GLib.Variant('(s)', [reason]));
++        log(`saved ${snapshot.windows.length} windows (${reason})`);
++        return snapshot;
++    }
++
++    // The last snapshot of this session: nothing written after it, so the
++    // windows closing during log-out don't replace it with an empty desktop.
++    async finalSnapshot(reason) {
++        const snapshot = await this.snapshot(reason);
++        this._frozen = true;
++        return snapshot;
++    }
++
++    _markDirty() {
++        if (this._frozen || this._restoring)
++            return;
++        this._dirty = true;
++        if (this._writeId)
++            return;
++        const since = (GLib.get_monotonic_time() - this._lastWrite) / 1000;
++        const delay = Math.max(SETTLE_MS, PERIODIC_MS - since);
++        this._writeId = GLib.timeout_add(GLib.PRIORITY_LOW, delay, () => {
++            this._writeId = 0;
++            if (this._dirty)
++                this.snapshot('periodic').catch(logError);
++            return GLib.SOURCE_REMOVE;
++        });
++    }
++
++    _watchWindows() {
++        const dirty = () => this._markDirty();
++        global.display.connectObject(
++            'window-created', (_d, window) => this._windowCreated(window),
++            'restacked', dirty,
++            'notify::focus-window', dirty, this);
++        global.window_manager.connectObject(
++            'minimize', dirty, 'unminimize', dirty, 'size-changed', dirty,
++            'destroy', dirty, 'switch-workspace', dirty, this);
++        global.connectObject('shutdown', () => {
++            if (!this._frozen && this._windows().length > 0)
++                this.collect('shutdown').then(s => writePrivate(
++                    GLib.build_filenamev([this._dir, 'current.json']), JSON.stringify(s))).catch(logError);
++        }, this);
++    }
++
++    _watchSession() {
++        Main.screenShield?.connectObject('locked-changed', () => {
++            if (Main.screenShield.locked)
++                this.snapshot('lock').catch(logError);
++        }, this);
++
++        const loginManager = LoginManager.getLoginManager();
++        this._takeSleepInhibitor();
++        loginManager.connectObject('prepare-for-sleep', (_lm, aboutToSuspend) => {
++            if (!aboutToSuspend) {
++                this._takeSleepInhibitor();
++                return;
++            }
++            const release = () => {
++                this._sleepInhibitor?.close(null);
++                this._sleepInhibitor = null;
++            };
++            const timer = GLib.timeout_add(GLib.PRIORITY_HIGH, SLEEP_BUDGET_MS, () => {
++                release();
++                return GLib.SOURCE_REMOVE;
++            });
++            this.snapshot('suspend').catch(logError).finally(() => {
++                GLib.source_remove(timer);
++                release();
++            });
++        }, this);
++
++        try {
++            this._shutdownSignal = Gio.DBus.system.signal_subscribe('org.freedesktop.login1',
++                'org.freedesktop.login1.Manager', 'PrepareForShutdown', '/org/freedesktop/login1', null,
++                Gio.DBusSignalFlags.NONE, (_c, _s, _p, _i, _n, params) => {
++                    const [starting] = params.deepUnpack();
++                    if (starting)
++                        this.finalSnapshot('shutdown').catch(logError);
++                });
++        } catch (e) {
++            log(`no shutdown signal: ${e.message}`);
++        }
++
++        try {
++            global.backend.connectObject('lid-is-closed-changed', () => {
++                if (global.backend.is_lid_closed())
++                    this.snapshot('lid').catch(logError);
++            }, this);
++        } catch (e) {
++            log(`no lid signal: ${e.message}`);
++        }
++    }
++
++    async _takeSleepInhibitor() {
++        if (this._sleepInhibitor)
++            return;
++        try {
++            this._sleepInhibitor = await LoginManager.getLoginManager().inhibit(
++                'Saving the open windows', null);
++        } catch (e) {
++            log(`no sleep inhibitor: ${e.message}`);
++        }
++    }
++
++    // --- restore ---------------------------------------------------------
++
++    _restoreAtLogin() {
++        if (!this.reopenWindows)
++            return;
++        const path = GLib.build_filenamev([this._dir, 'current.json']);
++        const snapshot = readJson(path);
++        if (!snapshot || snapshot.format !== FORMAT || snapshot.restoredAt)
++            return;
++        if (snapshot.device && snapshot.device !== this._device)
++            return;
++        if (this._windows().length > 0) {
++            log('windows already open, not restoring');
++            return;
++        }
++        snapshot.restoredAt = Math.floor(Date.now() / 1000);
++        try {
++            writePrivate(path, JSON.stringify(snapshot));
++        } catch (e) {
++            logError(e, '[luma-session] could not mark the session restored');
++            return;
++        }
++        this.restore(snapshot, 'restore');
++    }
++
++    restore(snapshot, mode) {
++        if (this._restoring)
++            return {ok: false, reason: 'busy'};
++        const wm = global.workspace_manager;
++        const current = this._monitors();
++        const monitorMap = mapMonitors(snapshot.monitors ?? [], current);
++        const busy = mode === 'continue' && this._windows().length > 0;
++        // Over an existing session, a new workspace after the last one.
++        let base = 0;
++        if (busy) {
++            base = wm.get_n_workspaces();
++            const last = wm.get_workspace_by_index(base - 1);
++            if (last && last.list_windows().filter(isRestorable).length === 0)
++                base -= 1;
++        }
++        const needed = base + Math.max(1, snapshot.workspaces?.count ?? 1);
++        while (wm.get_n_workspaces() < needed)
++            wm.append_new_workspace(false, global.get_current_time());
++
++        const slots = (snapshot.windows ?? []).map((w, index) => ({...w, index, window: null}));
++        const restoring = {
++            snapshot, mode, base, monitorMap, current, slots,
++            started: GLib.get_monotonic_time(),
++            apps: new Map(),
++            result: {mode, windows: slots.length, placed: 0, missing: [], late: [], failed: []},
++        };
++        this._restoring = restoring;
++
++        const byApp = new Map();
++        for (const slot of slots) {
++            const id = slot.app ?? `${slot.ids?.wmClass}.desktop`;
++            if (!byApp.has(id))
++                byApp.set(id, []);
++            byApp.get(id).push(slot);
++        }
++        const appSystem = Shell.AppSystem.get_default();
++        for (const [id, appSlots] of byApp) {
++            const app = appSystem.lookup_app(id);
++            if (!app) {
++                restoring.result.missing.push(id);
++                for (const slot of appSlots)
++                    slot.missing = true;
++                continue;
++            }
++            const appEntry = (snapshot.apps ?? []).find(a => a.app === id);
++            const state = textToVariant(appEntry?.state);
++            if (state)
++                this._pendingRestore.set(id.replace(/\.desktop$/, '').toLowerCase(),
++                    {reason: mode, state});
++            restoring.apps.set(id, {app, slots: appSlots, lumaui: Boolean(state), launched: 0});
++            try {
++                if (app.state === Shell.AppState.STOPPED) {
++                    app.launch(0, -1, Shell.AppLaunchGpu.APP_PREF);
++                } else if (!state) {
++                    app.open_new_window(-1);
++                }
++                restoring.apps.get(id).launched = 1;
++            } catch (e) {
++                restoring.result.failed.push(id);
++                log(`could not start ${id}: ${e.message}`);
++            }
++        }
++        this._restoreTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, RESTORE_WAIT_MS, () => {
++            this._restoreTimer = 0;
++            this._finishRestore();
++            return GLib.SOURCE_REMOVE;
++        });
++        log(`restoring ${slots.length} windows of ${byApp.size} apps (${mode})`);
++        this._checkRestoreDone();
++        return {ok: true};
++    }
++
++    _windowCreated(window) {
++        this._markDirty();
++        if (!this._restoring && !this._late)
++            return;
++        window.connectObject('configure', (w, config) => {
++            if (config.get_is_initial())
++                this._configure(w, config);
++        }, this);
++    }
++
++    _slotFor(window) {
++        const restoring = this._restoring ?? this._late;
++        if (!restoring || !isRestorable(window))
++            return null;
++        const ids = candidateAppIds(window);
++        const open = restoring.slots.filter(s => !s.window && !s.missing &&
++            ((s.app && ids.has(s.app)) ||
++             (s.ids?.wmClass && ids.has(`${s.ids.wmClass}.desktop`)) ||
++             (s.ids?.sandboxed && ids.has(`${s.ids.sandboxed}.desktop`))));
++        if (open.length === 0)
++            return null;
++        const bus = window.get_gtk_unique_bus_name();
++        const path = window.get_gtk_window_object_path();
++        const key = (bus && path && this._keys.get(`${bus}|${path}`)) || window.get_tag();
++        if (key) {
++            const keyed = open.find(s => s.key === key);
++            if (keyed)
++                return keyed;
++        }
++        const title = window.get_title() ?? '';
++        if (title) {
++            const exact = open.find(s => s.title === title);
++            if (exact)
++                return exact;
++        }
++        const unkeyed = open.filter(s => !s.key || !key);
++        const pool = unkeyed.length > 0 ? unkeyed : open;
++        return [...pool].sort((a, b) => a.seq - b.seq)[0];
++    }
++
++    _target(slot) {
++        const restoring = this._restoring ?? this._late;
++        const monitor = restoring.monitorMap.get(slot.monitor) ?? 0;
++        const savedMonitor = (restoring.snapshot.monitors ?? []).find(m => m.index === slot.monitor);
++        const currentMonitor = restoring.current.find(m => m.index === monitor) ?? restoring.current[0];
++        const area = currentMonitor.workArea;
++        const exact = savedMonitor && sameArea(savedMonitor.workArea, area) &&
++            savedMonitor.vendor === currentMonitor.vendor && savedMonitor.serial === currentMonitor.serial;
++        const floating = exact ? slot.floating : fit(unshare(slot.floatingShare, area), area);
++        const frame = exact ? slot.frame : fit(unshare(slot.frameShare, area), area);
++        return {monitor, area, floating, frame, exact};
++    }
++
++    _configure(window, config) {
++        const slot = this._slotFor(window);
++        if (!slot)
++            return;
++        const restoring = this._restoring ?? this._late;
++        slot.window = window;
++        restoring.result.placed++;
++        // Ready once the client has drawn (a minimized window is never
++        // shown, but it is stacked when its first frame arrives).
++        const ready = () => {
++            if (slot.shown)
++                return;
++            slot.shown = true;
++            this._checkRestoreDone();
++        };
++        window.connectObject('shown', ready, this);
++        if (slot.minimized) {
++            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
++                ready();
++                return GLib.SOURCE_REMOVE;
++            });
++        }
++        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
++            window.get_compositor_private()?.connectObject('first-frame', ready, this);
++            return GLib.SOURCE_REMOVE;
++        });
++        const target = this._target(slot);
++        slot.target = target;
++        if (window.is_restored_from_session?.()) {
++            log(`${slot.app}: restored by its client`);
++        } else {
++            const r = slot.state === 'floating' ? target.frame : target.floating;
++            // set_rect() takes the rectangle by value, which GJS can't pass.
++            config.set_position(r.x, r.y);
++            config.set_size(r.width, r.height);
++            switch (slot.state) {
++            case 'maximized':
++                config.set_is_maximized?.(true);
++                break;
++            case 'tiled-left':
++                config.set_tile_side?.(Meta.Side.LEFT, target.monitor, 0);
++                break;
++            case 'tiled-right':
++                config.set_tile_side?.(Meta.Side.RIGHT, target.monitor, 0);
++                break;
++            case 'fullscreen':
++                config.set_is_fullscreen(true);
++                break;
++            }
++            if (slot.workspace < 0)
++                window.stick();
++            else
++                window.change_workspace_by_index(restoring.base + slot.workspace, false);
++        }
++        if (slot.above)
++            window.make_above();
++        if (slot.minimized)
++            window.minimize();
++        const late = restoring === this._late;
++        if (late)
++            restoring.result.late.push(slot.app);
++        log(`${slot.app}: window ${slot.index} placed${target.exact ? ' exactly' : ''}`);
++        this._openMoreWindows(slot);
++        this._checkRestoreDone();
++    }
++
++    // An app that doesn't reopen its own windows opens one; once no new
++    // window of it has come for a moment, ask it for one more, until every
++    // window of it in the snapshot is there.
++    _openMoreWindows(slot) {
++        const restoring = this._restoring;
++        const entry = restoring?.apps.get(slot.app);
++        if (!entry || entry.lumaui)
++            return;
++        if (entry.moreId)
++            GLib.source_remove(entry.moreId);
++        entry.moreId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, MORE_WINDOWS_MS, () => {
++            entry.moreId = 0;
++            if (this._restoring !== restoring)
++                return GLib.SOURCE_REMOVE;
++            const remaining = entry.slots.filter(s => !s.window).length;
++            if (remaining > 0 && entry.launched < entry.slots.length) {
++                entry.launched++;
++                try {
++                    entry.app.open_new_window(-1);
++                } catch (e) {
++                    log(`${slot.app}: no new window: ${e.message}`);
++                }
++            }
++            return GLib.SOURCE_REMOVE;
++        });
++    }
++
++    _checkRestoreDone() {
++        const restoring = this._restoring;
++        if (!restoring)
++            return;
++        // Every window is on the screen (or minimized) before the stack is
++        // ordered, so a window mapping late can't land on top.
++        const active = global.workspace_manager.get_active_workspace();
++        if (restoring.slots.every(s => s.missing || (s.window &&
++            (s.shown || !s.window.located_on_workspace(active))))) {
++            if (this._restoreTimer)
++                GLib.source_remove(this._restoreTimer);
++            this._restoreTimer = 0;
++            // Let the last window map before ordering the stack.
++            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
++                this._finishRestore();
++                return GLib.SOURCE_REMOVE;
++            });
++        }
++    }
++
++    _finishRestore() {
++        const restoring = this._restoring;
++        if (!restoring)
++            return;
++        this._restoring = null;
++        const {slots, base, snapshot, result} = restoring;
++        // Bottom to top: each raise puts the window above the ones before it.
++        for (const slot of slots)
++            slot.window?.raise();
++        const wm = global.workspace_manager;
++        const active = base + (snapshot.workspaces?.active ?? 0);
++        // A fresh server time: a restore runs from a timeout, with no event
++        // whose time would let the activation through.
++        const time = global.display.get_current_time_roundtrip();
++        if (active < wm.get_n_workspaces() && active !== wm.get_active_workspace_index())
++            wm.get_workspace_by_index(active).activate(time);
++        const focus = slots.find(s => s.focus && s.window && !s.window.minimized);
++        if (focus) {
++            Main.activateWindow(focus.window, time);
++            // A client's own user time (an X11 client's, a startup token's)
++            // can be ahead of the server time and turn the activation into
++            // "demands attention". The person had this window focused.
++            if (global.display.focus_window !== focus.window)
++                focus.window.focus(time);
++            if (global.display.focus_window !== focus.window)
++                log(`${focus.app}: window ${focus.index} could not take the focus`);
++        }
++        const unplaced = slots.filter(s => !s.window && !s.missing);
++        result.unplaced = [...new Set(unplaced.map(s => s.app))];
++        result.seconds = (GLib.get_monotonic_time() - restoring.started) / 1e6;
++        log(`restored ${result.placed} of ${result.windows} windows in ${result.seconds.toFixed(1)} s` +
++            (result.missing.length ? `; not installed: ${result.missing.join(', ')}` : '') +
++            (result.unplaced.length ? `; didn't open in time: ${result.unplaced.join(', ')}` : ''));
++        this._lastResult = result;
++        this._dbusImpl.emit_signal('RestoreFinished', new GLib.Variant('(s)', [JSON.stringify(result)]));
++        if (unplaced.length > 0) {
++            this._late = {...restoring, slots: unplaced};
++            this._lateTimer = GLib.timeout_add(GLib.PRIORITY_LOW, LATE_WINDOW_MS, () => {
++                this._late = null;
++                this._lateTimer = 0;
++                return GLib.SOURCE_REMOVE;
++            });
++        }
++        if (result.missing.length + result.unplaced.length + result.failed.length > 0)
++            this._notifyPartial(result);
++        this._markDirty();
++    }
++
++    _notifyPartial(result) {
++        const open = result.placed;
++        const source = MessageTray.getSystemSource();
++        const reasons = [];
++        if (result.missing.length)
++            reasons.push(`Not on this device: ${result.missing.map(id => this._appName(id)).join(', ')}`);
++        if (result.unplaced.length)
++            reasons.push(`Didn't open: ${result.unplaced.map(id => this._appName(id)).join(', ')}`);
++        const notification = new MessageTray.Notification({
++            source,
++            title: `Reopened ${open} of ${result.windows} windows`,
++            body: reasons.join('\n'),
++        });
++        source.addNotification(notification);
++    }
++
++    _appName(id) {
++        return Shell.AppSystem.get_default().lookup_app(id)?.get_name() ?? id.replace(/\.desktop$/, '');
++    }
++
++    // --- org.projectluma.Session1 ----------------------------------------
++
++    async TakeRestoreAsync([appId], invocation) {
++        try {
++            const caller = await callerIdentity(invocation.get_sender());
++            if (caller.appId && !sameApp(caller.appId, appId))
++                throw new Error(`${appId} is not the caller's app`);
++            if (caller.sandboxed && !caller.appId)
++                throw new Error('unidentified sandboxed caller');
++            this._addClient(invocation.get_sender(), appId);
++            const key = appId.replace(/\.desktop$/, '').toLowerCase();
++            const pending = this._pendingRestore.get(key);
++            this._pendingRestore.delete(key);
++            invocation.return_value(new GLib.Variant('(sv)', [
++                pending?.reason ?? 'none',
++                pending?.state ?? new GLib.Variant('a{sv}', {}),
++            ]));
++        } catch (e) {
++            invocation.return_error_literal(Gio.DBusError, Gio.DBusError.ACCESS_DENIED, e.message);
++        }
++    }
++
++    SetWindowKeyAsync([path, key], invocation) {
++        const sender = invocation.get_sender();
++        const id = `${sender}|${path}`;
++        if (key)
++            this._keys.set(id, key);
++        else
++            this._keys.delete(id);
++        invocation.return_value(null);
++    }
++
++    SaveStateAsync([serial, state], invocation) {
++        const sender = invocation.get_sender();
++        if (this._answers && this._answers.serial === serial && this._clients.has(sender))
++            this._answers.answers.set(sender, state);
++        invocation.return_value(null);
++    }
++
++    async _requireHost(invocation) {
++        const caller = await callerIdentity(invocation.get_sender());
++        if (caller.sandboxed || caller.appId)
++            throw new Error('only the system may read or apply sessions');
++    }
++
++    async SnapshotAsync([reason], invocation) {
++        try {
++            await this._requireHost(invocation);
++            const snapshot = await this.snapshot(reason || 'request');
++            invocation.return_value(new GLib.Variant('(s)', [JSON.stringify(snapshot ?? {})]));
++        } catch (e) {
++            invocation.return_error_literal(Gio.DBusError, Gio.DBusError.ACCESS_DENIED, e.message);
++        }
++    }
++
++    async GetSnapshotAsync(_params, invocation) {
++        try {
++            await this._requireHost(invocation);
++            const snapshot = readJson(GLib.build_filenamev([this._dir, 'current.json']));
++            invocation.return_value(new GLib.Variant('(s)', [JSON.stringify(snapshot ?? {})]));
++        } catch (e) {
++            invocation.return_error_literal(Gio.DBusError, Gio.DBusError.ACCESS_DENIED, e.message);
++        }
++    }
++
++    async RestoreAsync([text, mode], invocation) {
++        try {
++            await this._requireHost(invocation);
++            if (Main.sessionMode.isLocked)
++                throw new Error('the session is locked');
++            const snapshot = JSON.parse(text);
++            if (snapshot.format !== FORMAT)
++                throw new Error(`unknown snapshot format ${snapshot.format}`);
++            if (mode === 'continue' && snapshot.expires && snapshot.expires < Date.now() / 1000)
++                throw new Error('the snapshot has expired');
++            const result = this.restore(snapshot, mode === 'continue' ? 'continue' : 'restore');
++            invocation.return_value(new GLib.Variant('(s)', [JSON.stringify(result)]));
++        } catch (e) {
++            invocation.return_error_literal(Gio.DBusError, Gio.DBusError.FAILED, e.message);
++        }
++    }
++
++    _addClient(bus, appId) {
++        if (this._clients.has(bus))
++            return;
++        const watch = Gio.bus_watch_name_on_connection(Gio.DBus.session, bus,
++            Gio.BusNameWatcherFlags.NONE, null, () => {
++                Gio.bus_unwatch_name(watch);
++                this._clients.delete(bus);
++                for (const id of [...this._keys.keys()]) {
++                    if (id.startsWith(`${bus}|`))
++                        this._keys.delete(id);
++                }
++            });
++        this._clients.set(bus, {appId, watch});
++    }
++}
+diff --git a/js/ui/main.js b/js/ui/main.js
+index e74fd28..17a9ee6 100644
+--- a/js/ui/main.js
++++ b/js/ui/main.js
+@@ -37,6 +37,7 @@ import * as LookingGlass from './lookingGlass.js';
+ import * as LumaSearch from './lumaSearch.js';
+ import * as LumaWindowCorners from './lumaWindowCorners.js';
+ import * as LumaWindowWatch from './lumaWindowWatch.js';
++import * as LumaSession from './lumaSession.js';
+ import * as LumaShare from './lumaShare.js';
+ import * as NotificationDaemon from './notificationDaemon.js';
+ import * as WindowAttentionHandler from './windowAttentionHandler.js';
+@@ -72,6 +73,7 @@ export let overview = null;
+ export let lumaSearch = null;
+ export let lumaWindowCorners = null;
+ export let lumaWindowWatch = null;
++export let lumaSession = null;
+ export let lumaShare = null;
+ export let runDialog = null;
+ export let lookingGlass = null;
+@@ -280,6 +282,16 @@ async function _initializeUI() {
+     if (LoginManager.canLock())
+         screenShield = new ScreenShield.ScreenShield();
+ 
++    // Session snapshots and restore (ADR-055): after the screen shield, whose
++    // lock it saves on.
++    if (!sessionMode.isGreeter && sessionMode.hasOverview) {
++        try {
++            lumaSession = new LumaSession.LumaSession();
++        } catch (error) {
++            logError(error, 'Failed to start session restore');
++        }
++    }
++
+     inputMethod = new InputMethod.InputMethod();
+     global.stage.context.get_backend().set_input_method(inputMethod);
+     global.connect('shutdown',

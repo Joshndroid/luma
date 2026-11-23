@@ -58,7 +58,9 @@ from . import lumaui_tokens as tokens  # noqa: E402
 #     sidebar (lumaui-sidebar-places), Inset(padding="list") rows 4 apart.
 # 13: TvActionBar (tv.action_bar), TvFocus.add(console=), TvRoom.set_wallpaper(), desktop_wallpaper.
 # 14: AppWindow.set_hidden_from_capture() and .hidden_from_capture (C luma_window_set_hidden_from_capture).
-LUMAUI_API_LEVEL = 14
+# 15: luma_appkit.restore (enable, restore, reason); AppWindow.restore_key, save_state(), restore_state(),
+#     documents() (C LumaRestore, luma_window_set_restore_key).
+LUMAUI_API_LEVEL = 15
 
 _PACKAGE = Path(__file__).resolve().parent
 _portable_installed: set[int] = set()

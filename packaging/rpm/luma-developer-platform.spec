@@ -4,7 +4,7 @@
 
 Name:           luma-developer-platform
 Version:        0.1.0
-Release:        1.luma.152%{?dist}
+Release:        1.luma.153%{?dist}
 Summary:        Adaptive and semantic application platform for Project Luma
 License:        Apache-2.0
 URL:            https://projectluma.org/developers
@@ -177,7 +177,7 @@ python3 - <<'PY_CHECK'
 import json
 from pathlib import Path
 rows = [json.loads(line) for line in Path("%{_vpath_builddir}/meson-logs/testlog.json").read_text().splitlines() if line.strip()]
-expected = {"luma-developer-platform:" + name for name in ("semantics", "background-agent", "context", "adopted-context", "media-fader", "scaffold", "application-icon", "window-frame", "welcome", "application-menu", "native-app-updates", "empty-state", "save-sheet", "surface-policy", "surface-backdrop", "window-shape", "window-capture", "reorder-hint", "media-transport-lcd", "timeline", "mobile-identity", "hidden-width-watch", "first-frame-width", "tv-island")}
+expected = {"luma-developer-platform:" + name for name in ("semantics", "background-agent", "context", "adopted-context", "media-fader", "scaffold", "application-icon", "window-frame", "welcome", "application-menu", "native-app-updates", "empty-state", "save-sheet", "surface-policy", "surface-backdrop", "window-shape", "window-capture", "restore", "reorder-hint", "media-transport-lcd", "timeline", "mobile-identity", "hidden-width-watch", "first-frame-width", "tv-island")}
 names = {row["name"] for row in rows}
 # Platform checks, plus LumaUI-1's own part tests, token check and C/Python parity.
 lumaui = {name for name in names if name.startswith("luma-developer-platform:lumaui-")}
@@ -382,6 +382,15 @@ done
 %{python3_sitelib}/luma_sdk/
 
 %changelog
+* Mon Nov 23 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.153
+- LumaRestore (luma_restore_get_default, _restore, _get_reason,
+  _add_document; signals save, save-window, restore, restore-window) and
+  luma_window_set_restore_key(): an app's windows, documents and state come
+  back after a restart and on the person's other devices, through the
+  shell's org.projectluma.Session1 (ADR-055). Python luma_appkit.restore and
+  AppWindow.restore_key, save_state(), restore_state(), documents().
+  C API level 12, Python 15.
+
 * Sat Nov 21 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.152
 - luma_window_set_hidden_from_capture(), luma_window_get_hidden_from_capture()
   and luma_window_get_capture_hiding_supported(): a window stays on screen
