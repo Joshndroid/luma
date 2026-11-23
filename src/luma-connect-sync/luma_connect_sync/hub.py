@@ -7,6 +7,8 @@ token. Bodies and tokens are never logged.
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import json
 import os
 import socket
@@ -83,6 +85,8 @@ class Hub:
         self.registration = registration
         self.timeout = timeout
         self.requests = 0
+        # Signs requests that change something with this device's key (set by Account); see crypto.request_message.
+        self.signer: Callable[[bytes], bytes] | None = None
 
     @property
     def device(self) -> str:
@@ -93,6 +97,12 @@ class Hub:
         headers = {"Authorization": f"Bearer {self.registration.token}", "Accept": "application/json", "User-Agent": USER_AGENT}
         if data is not None:
             headers["Content-Type"] = content_type
+        relative = path if not path.startswith("/") else ""
+        if method != "GET" and relative and not relative.startswith("devices/self") and self.signer is not None:
+            from .crypto import b64, request_message
+            at = int(time.time())
+            headers["X-Luma-Sync-Time"] = str(at)
+            headers["X-Luma-Sync-Signature"] = b64(self.signer(request_message(self.device, method, relative, at, data or b"")))
         request = Request(url, data=data, method=method, headers=headers)
         self.requests += 1
         try:

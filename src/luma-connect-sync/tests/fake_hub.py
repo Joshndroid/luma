@@ -94,7 +94,7 @@ class FakeHub:
         return row
 
     # -- the routes
-    def handle(self, method: str, path: str, query: dict, token: str, body: bytes):
+    def handle(self, method: str, path: str, query: dict, token: str, body: bytes, headers: dict | None = None, raw_query: str = ""):
         with self.lock:
             self.requests += 1
             if path == "/__test/devices" and method == "POST":
@@ -126,6 +126,8 @@ class FakeHub:
             if not path.startswith("/api/sync/v1/"):
                 raise Refused(404, "not_found")
             rest = path[len("/api/sync/v1/"):]
+            if self.verify and method != "GET" and rest != "devices/self":
+                self.check_request(a, who, device, method, rest + (f"?{raw_query}" if raw_query else ""), body, headers or {})
             data = json.loads(body) if body and not re.fullmatch(r"zones/[0-9a-f]{32}/blobs/[0-9a-f]{64}", rest) else {}
             names = {t["device"]: t["name"] for t in self.tokens.values()}
             if rest == "account" and method == "DELETE":
@@ -361,6 +363,20 @@ class FakeHub:
                 return 200, zone["blobs"][blob]
             raise Refused(404, "not_found")
 
+    @staticmethod
+    def check_request(a: dict, who: dict, device: str, method: str, path: str, body: bytes, headers: dict) -> None:
+        """Like the Hub (sync/routes.mjs signedBy): a request that changes something carries the device's signature."""
+        row = a["devices"].get(device)
+        if not row or row["state"] == "revoked":
+            raise Refused(403, "not_registered")
+        try:
+            at = int(headers.get("x-luma-sync-time", ""))
+        except ValueError:
+            raise Refused(401, "signature_required") from None
+        message = f"luma-sync-request-v1\0{device}\0{method}\0{path}\0{at}\0".encode() + hashlib.sha256(body).digest()
+        if abs(time.time() - at) > 300 or not signed(row["sign_pub"], headers.get("x-luma-sync-signature", ""), message):
+            raise Refused(401, "signature_required")
+
     def check_statement(self, a: dict, account: str, device: str, data: dict) -> None:
         """The Hub's copy of what devices check again: the statement names this envelope, cert and the device's keys."""
         target = a["devices"][data["device"]]
@@ -393,7 +409,8 @@ def serve(hub: FakeHub, port: int = 0) -> ThreadingHTTPServer:
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
             token = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
             try:
-                status, value = hub.handle(self.command, url.path, parse_qs(url.query), token, body)
+                status, value = hub.handle(self.command, url.path, parse_qs(url.query), token, body,
+                                           {k.lower(): v for k, v in self.headers.items()}, url.query)
             except Refused as error:
                 status, value = error.status, {"error": str(error), "code": error.code}
             except Exception as error:  # noqa: BLE001 - a fake bug shows as a 500 with its reason

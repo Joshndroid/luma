@@ -118,6 +118,13 @@ class Engine:
 
     def refresh_zones(self) -> dict[str, dict]:
         self._zones = {zone["zone"]: zone for zone in self.hub.get("zones")["zones"]}
+        # Every zone's generation is remembered, not only those this device wrote, so the floor set at the next
+        # account key change covers them all (review S3).
+        seen = self.local.get("zone_generations", {})
+        grown = {zone: info["generation"] for zone, info in self._zones.items()
+                 if isinstance(info.get("generation"), int) and info["generation"] > seen.get(zone, 0)}
+        if grown:
+            self.local.put("zone_generations", {**seen, **grown})
         return self._zones
 
     def zone(self, label: str, create: bool = True, owner: str | None = None) -> dict | None:

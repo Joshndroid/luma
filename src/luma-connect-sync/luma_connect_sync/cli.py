@@ -4,10 +4,12 @@
   status | devices | apps | restore | conflicts      what Sync knows, as JSON
   setup [--words-file PATH]                        turn Sync on; shows the recovery key once
   join [--wait SECONDS]                            ask to join; prints the code to compare
+  join-confirm yes|no                              on the joining device: the other device showed the same code
   requests                                         other devices asking to join, with codes
   approve JOIN --code NNNNNN | deny JOIN           answer a request
   recover [--words-file PATH]                      join with the recovery key (stdin otherwise)
   revoke DEVICE [--new-recovery-key FILE]          remove a device and replace the keys (and the recovery key)
+  recovery-key [--words-file PATH]                 show (or write) a recovery key that was replaced, and clear the notice
   app on|off APP | app delete APP                  per-app switch; delete its synced data
   sync [--app APP]                                 one cycle now
   daemon                                           run the service (luma-connect-syncd)
@@ -50,6 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     join = commands.add_parser("join")
     join.add_argument("--wait", type=int, default=600)
     join.add_argument("--code-file", help="also write the code here when it appears (for scripted tests)")
+    confirm = commands.add_parser("join-confirm")
+    confirm.add_argument("answer", choices=["yes", "no"])
+    shown_key = commands.add_parser("recovery-key")
+    shown_key.add_argument("--words-file")
     approve = commands.add_parser("approve")
     approve.add_argument("join")
     approve.add_argument("--code", required=True)
@@ -124,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
                     shown = view.code
                     print(f"Code: {view.code[:3]} {view.code[3:]}  (approve on: {', '.join(a['name'] for a in view.approvers)}; "
                           f"this device's key: {view.fingerprint})", flush=True)
+                    print("When the other device shows the same code, run: luma-connect-sync join-confirm yes", flush=True)
                     if arguments.code_file:
                         Path(arguments.code_file).write_text(f"{view.join} {view.code}\n")
                 if view.state in {"approved", "denied", "expired", "tampered"}:
@@ -134,6 +141,21 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(2)
             print("No device answered yet; the request stays open. Run join again to keep waiting.")
             return 1
+        elif arguments.command == "join-confirm":
+            with sync.exclusive():
+                view = sync.account.confirm_join(arguments.answer == "yes")
+            print("Confirmed; this device joins once it is approved." if view.state in {"confirmed", "approved"}
+                  else "Stopped. Ask again from the start.")
+            return 0 if arguments.answer == "yes" else 1
+        elif arguments.command == "recovery-key":
+            words = sync.account.recovery_words()
+            if arguments.words_file:
+                _private_write(Path(arguments.words_file), " ".join(words) + "\n")
+                print("The recovery key was written to the file you named.")
+            else:
+                for index in range(0, 24, 4):
+                    print("  " + "  ".join(f"{index + i + 1:2d} {words[index + i]:<9}" for i in range(4)))
+            sync.local.delete("recovery_replaced")
         elif arguments.command == "approve":
             with sync.exclusive():
                 sync.account.approve(arguments.join, arguments.code)
@@ -150,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
             with sync.exclusive():
                 epoch, words = sync.account.revoke(arguments.device, new_recovery=bool(arguments.new_recovery_key))
             print(f"Removed. Your other devices have new keys (epoch {epoch}).")
+            if words:
+                sync.local.delete("recovery_replaced")      # the person sees them here
             if words and arguments.new_recovery_key:
                 _private_write(Path(arguments.new_recovery_key), " ".join(words) + "\n")
                 print("The recovery key was replaced; the new one was written to the file you named.")

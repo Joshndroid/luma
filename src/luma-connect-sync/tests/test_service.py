@@ -145,7 +145,8 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("NotAuthorized", refused.exception.message)
         self.assertEqual(json.loads(self.call(b, "GetJoin", None, "(s)")[0])["state"], "code", "nothing was approved")
         self.approve_directly("Desktop", requests[0]["id"], view["code"])
-        self.assertEqual(json.loads(self.call(b, "GetJoin", None, "(s)")[0])["state"], "approved")
+        self.assertEqual(json.loads(self.call(b, "GetJoin", None, "(s)")[0])["state"], "code", "taken only after the person confirms here")
+        self.assertEqual(json.loads(self.call(b, "ConfirmJoin", GLib.Variant("(b)", (True,)), "(s)")[0])["state"], "approved")
         context = GLib.MainContext.default()
         while context.pending():
             context.iteration(False)

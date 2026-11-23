@@ -67,7 +67,7 @@ def sandboxed(pid: int, proc: Path = PROC) -> str:
 
 
 # Methods that hand out keys or take a recovery key answer only the shell, Settings and a person's terminal (review M4).
-TRUSTED_ONLY = {"ApproveJoin", "RemoveDevice", "JoinWithRecoveryKey", "RevealRecoveryKey", "BeginSetup", "FinishSetup", "ListJoinRequests", "GetJoin", "RequestJoin",
+TRUSTED_ONLY = {"ConfirmJoin", "AcknowledgeRecoveryKey", "ApproveJoin", "RemoveDevice", "JoinWithRecoveryKey", "RevealRecoveryKey", "BeginSetup", "FinishSetup", "ListJoinRequests", "GetJoin", "RequestJoin",
                 "DeleteAllSyncedData"}
 TRUSTED_UNITS = ("org.gnome.Shell@", "gnome-shell", "org.gnome.Settings", "gnome-control-center", "org.projectluma.Settings",
                  "app-gnome-org.gnome.Settings", "luma-settings")
@@ -262,6 +262,11 @@ class Service:
         self._require(sender, REVEAL_ACTION)
         return GLib.Variant("(as)", (self.sync.account.recovery_words(),))
 
+    def m_AcknowledgeRecoveryKey(self, _sender):
+        self.sync.local.delete("recovery_replaced")
+        self.sync.emit("StateChanged")
+        return None
+
     # Joining (this device)
     def _join_json(self, view) -> GLib.Variant:
         value = {"state": view.state, "code": view.code, "join": view.join, "approvers": view.approvers}
@@ -275,6 +280,12 @@ class Service:
     def m_GetJoin(self, _sender):
         with self.sync.exclusive():
             return self._join_json(self.sync.account.join_view())
+
+    def m_ConfirmJoin(self, _sender, matched):
+        with self.sync.exclusive():
+            view = self.sync.account.confirm_join(bool(matched))
+        self.wake.set()
+        return self._join_json(view)
 
     def m_CancelJoin(self, _sender):
         self.sync.account.cancel_join()

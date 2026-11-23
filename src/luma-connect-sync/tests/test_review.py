@@ -160,6 +160,7 @@ class H1ForgedApproval(Members):
                 d.account.request_join()
                 self.a.account.join_requests()
                 self.assertEqual(d.account.join_view().state, "code")
+                d.account.confirm_join(True)          # even when the person (wrongly) says the codes matched
                 self.forged(d, d.hub.device if wrapper == "self" else self.a.hub.device, d.account.keys())
                 with self.assertRaises(SyncStateError) as refused:
                     d.account.join_view()

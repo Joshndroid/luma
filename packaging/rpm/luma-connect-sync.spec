@@ -2,7 +2,7 @@
 # Phase 1 of ADR-054. Not composed into an image until the Settings UI and
 # the Hub module are live; it runs as a user-level preview until then.
 Name:           luma-connect-sync
-Version:        0.2.0
+Version:        0.2.1
 Release:        1.luma.1%{?dist}
 Summary:        Luma Connect Sync: end-to-end encrypted sync of apps and app state
 License:        Apache-2.0
@@ -73,6 +73,11 @@ cd tests && PYTHONPATH=$PWD/..:$PWD %{python3} -m unittest discover -p "test_*.p
 %{_datadir}/luma/sync/
 
 %changelog
+* Mon Nov 23 2026 Project Luma <dev@projectluma.org> - 0.2.1-1.luma.1
+- Re-review fixes: approve checks and wraps from one request; capped, visible
+  join answers; the joining device waits for the person's confirmation;
+  replaced recovery keys are shown; late recovery joins are dropped; the
+  zone generation floor covers every zone; signed requests.
 * Sun Nov 22 2026 Project Luma <dev@projectluma.org> - 0.2.0-1.luma.1
 - Security review fixes, wire format 2: signed membership, approvals bound to
   the joining device's keys, signed bundles with removed devices, zone key

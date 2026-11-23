@@ -380,6 +380,7 @@ class Uploads:
 
     def send(self) -> int:
         ids = list(self.pending)
+        random.SystemRandom().shuffle(ids)        # the check, too, doesn't show which pieces belong together (S6)
         missing = self.engine.missing(self.zone, ids)
         order = [blob for blob in ids if blob in missing]
         random.SystemRandom().shuffle(order)

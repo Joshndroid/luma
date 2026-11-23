@@ -52,15 +52,27 @@ Joining: the new device commits to its half of the code; the first member
 online posts the approvers' half (the same on every member, derived from the
 ASK); the new device keeps the first half it sees and reveals once; the
 approver checks the reveal opens the commitment; both show six digits over
-the whole transcript. The approver signs a membership statement and the
-envelope; the new device accepts only an envelope from a member that matches
-its code. Members are the signed bundle plus signed statements, never the
+the whole transcript. The person confirms on the new device that both codes
+matched (`ConfirmJoin`, `luma-connect-sync join-confirm yes`). The approver
+checks the code and wraps the key from one and the same request, answers at
+most one open request per device and three new ones a day, and shows a card
+for each. The approver signs a membership statement and the envelope; the new
+device accepts only an envelope from a member that matches its code, after
+the person's confirmation. Members are the signed bundle plus signed statements, never the
 Hub's list.
 
 Revoking a device makes a new ASK chained to the old one, signed by the
 remover, listing the removed device for good, and new zone key generations;
-devices refuse to write with an older one. If the removed device held the
-recovery words, the recovery key is replaced too.
+devices refuse to write with an older one (for every zone they have seen). If
+the removed device held the recovery words, the recovery key is replaced too:
+the new words stay sealed on the device that replaced them, and `GetState`
+shows `new_recovery_key` until the person reads them (`RevealRecoveryKey`,
+`luma-connect-sync recovery-key`) and acknowledges. A device that joined with
+the old words while the removal was pending doesn't get the new key.
+
+Every request that changes something on the Hub is signed with the device
+key (sealed, unreadable to apps), so the Luma Connect token in `device.json`,
+which apps with home access can read, can't change or delete synced data.
 
 ## org.projectluma.ConnectSync1
 

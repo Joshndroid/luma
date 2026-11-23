@@ -57,7 +57,9 @@ class PendingSetup:
 
 @dataclass
 class JoinView:
-    state: str                         # none | waiting | code | approved | denied | expired | tampered
+    state: str                         # none | waiting | code | confirmed | approved | denied | expired | tampered
+    # "code": shown, waiting for the person to say on this device that both codes matched (review B3);
+    # "confirmed": they did; the approval is taken when it arrives.
     code: str = ""
     join: str = ""
     approvers: list[dict[str, str]] = field(default_factory=list)
@@ -67,6 +69,7 @@ class JoinView:
 class Account:
     def __init__(self, hub: Hub, keystore, local, device_class: str = "computer") -> None:
         self.hub = hub
+        hub.signer = lambda message: self.keys().sign.sign(message)
         self.keystore = keystore
         self.local = local              # engine.LocalState: small non-secret values
         self.device = hub.device
@@ -291,8 +294,13 @@ class Account:
             if not state.get("rekey") and not exclude:
                 return bundle.epoch, None  # type: ignore[union-attr]
         keys = self.keys()
-        members = self.members(bundle, keep_removed=True)
         hub_revoked = {d["device"] for d in state["devices"] if d["state"] == "revoked"}
+        # The devices being removed first, so nothing they signed for a device this one never counted gets in (S4).
+        first = self.members(bundle, keep_removed=True)
+        leaving = {crypto.removal(d, k["sign"]) for d, k in first.items() if d in (exclude or set()) or d in hub_revoked}
+        if leaving:
+            self.local.put("removed", sorted(set(self.local.get("removed", [])) | leaving))
+        members = self.members(bundle, keep_removed=True)
         gone = set(self.local.get("removed", []))
         removed = {d for d, k in members.items()
                    if d in (exclude or set()) or d in hub_revoked or crypto.is_removed(gone, d, k["sign"])}
@@ -309,6 +317,13 @@ class Account:
         if recovery is not None:
             holders = [self.device]
             words = crypto.recovery_words(new_recovery)  # type: ignore[arg-type]
+            # The old words are being retired: a device that came in with them after this device last counted the
+            # members (e.g. during the removal) doesn't carry them into the new epoch (review S2).
+            seen = self.local.get("known_members", {})
+            known = set(seen.get("members", [])) if seen.get("epoch") == bundle.epoch else set()  # type: ignore[union-attr]
+            late = {d for d, k in members.items() if k.get("via") == "recovery" and d not in known and d != self.device}
+            removed |= late
+            entries |= {crypto.removal(d, members[d]["sign"]) for d in late}
         remaining = {d: {"sign": k["sign"], "box": k["box"]} for d, k in members.items() if d not in removed}
         # Remembered before anything is sent, so a key the removed device makes in the meantime is refused below.
         self.local.put("removed", sorted(set(self.local.get("removed", [])) | entries))
@@ -343,6 +358,8 @@ class Account:
         self.local.put("zone_floor", {**self.local.get("zone_floor", {}), **fresh_generations})
         if words:
             self.keystore.put(self.device, "recovery", " ".join(words).encode())
+            # Never silent (review S1): the person is asked to write the new words down until they have seen them.
+            self.local.put("recovery_replaced", {"epoch": new.epoch, "at": int(time.time())})
         return new.epoch, words
 
     def revoke(self, device: str, new_recovery: bool = False) -> tuple[int, list[str] | None]:
@@ -379,6 +396,11 @@ class Account:
                      for d in state["devices"] if d["state"] == "member"]
         mine = self.me(state)
         if mine and mine["state"] == "member" and pending.get("revealed"):
+            if not pending.get("confirmed"):
+                # Only after the person said on this device that the codes matched (review B3): the Hub chose the
+                # approvers' half this device fixed, so nothing else here can tell a real approval from a Hub-made account.
+                return JoinView("code", code=pending["code"], join=pending["id"], approvers=approvers,
+                                fingerprint=crypto.fingerprint(keys.sign_pub, keys.box_pub))
             self._accept_approval(pending)
             return JoinView("approved", join=pending["id"], approvers=approvers)
         row = next((j for j in self.hub.get("joins")["joins"] if j["id"] == pending["id"]), None)
@@ -402,8 +424,25 @@ class Account:
             pending["revealed"] = True
             self.local.put("join", pending)
             self.hub.post(f"joins/{row['id']}/reveal", {"nonce": pending["nonce"]})
-        return JoinView("code", code=pending["code"], join=row["id"], approvers=approvers,
-                        fingerprint=crypto.fingerprint(keys.sign_pub, keys.box_pub))
+        return JoinView("confirmed" if pending.get("confirmed") else "code", code=pending["code"], join=row["id"],
+                        approvers=approvers, fingerprint=crypto.fingerprint(keys.sign_pub, keys.box_pub))
+
+    def confirm_join(self, matched: bool) -> JoinView:
+        """The person's answer on this device: the code on the other device was the same (and they approved it there),
+        or it wasn't. A mismatch ends the join as tampered."""
+        pending = self.local.get("join")
+        if not pending or not pending.get("revealed"):
+            raise SyncStateError("join_incomplete", "There is no code to compare yet.")
+        if not matched:
+            view = self._tampered(pending)
+            try:
+                self.hub.delete(f"joins/{pending['id']}")
+            except HubError:
+                pass
+            return view
+        pending["confirmed"] = True
+        self.local.put("join", pending)
+        return self.join_view()
 
     def _tampered(self, pending: dict) -> JoinView:
         pending["tampered"] = True
@@ -474,40 +513,78 @@ class Account:
         self.local.delete("join")     # the words are not kept here (review H3, M6)
 
     # ------------------------------------------------------------ approving (an existing device)
+    JOIN_ANSWERS_PER_DAY = 3
+
     def join_requests(self) -> list[dict]:
-        """Open requests, each with its code once both halves are in and check out. Posts the approvers' half when missing."""
+        """Open requests, each with its code once both halves are in and check out.
+
+        The approvers' half is posted for at most one open request per device and a few new requests a day (review B2):
+        every half posted fixes one code a Hub could later match, so each answered request becomes a card the person
+        sees. Requests beyond that are listed as held, without a code.
+        """
         bundle = self.bundle()
         if bundle is None:
             return []
+        rows = self.hub.get("joins")["joins"]
         out = []
-        for row in self.hub.get("joins")["joins"]:
+        answered = self.local.get("join_answers", {})          # join id -> when this device posted its half
+        now = time.time()
+        answered = {k: v for k, v in answered.items() if now - v < 7 * 86400}
+        today = sum(1 for v in answered.values() if now - v < 86400)
+        newest: dict[str, dict] = {}
+        for row in rows:
             if row.get("answer") or row["device"] == self.device:
                 continue
-            commitment = unb64(row["commitment"])
-            expected = bundle.join_nonce(row["id"], row["device"], commitment)
-            if not row.get("approver_nonce"):
+            if row["device"] not in newest or row.get("created_at", 0) > newest[row["device"]].get("created_at", 0):
+                newest[row["device"]] = row
+        held = 0
+        for row in rows:
+            if row.get("answer") or row["device"] == self.device:
+                continue
+            if newest[row["device"]] is not row:
+                held += 1
+                continue
+            expected = bundle.join_nonce(row["id"], row["device"], unb64(row["commitment"]))
+            if not row.get("approver_nonce") and row["id"] not in answered:
+                if today >= self.JOIN_ANSWERS_PER_DAY:
+                    held += 1
+                    out.append(self._card(bundle, row, expected, held=True))
+                    continue
                 try:
                     self.hub.post(f"joins/{row['id']}/nonce", {"nonce": b64(expected)})
                 except HubError as error:
                     if error.code != "join_mismatch":
                         raise
+                answered[row["id"]] = now
+                today += 1
                 row = next((j for j in self.hub.get("joins")["joins"] if j["id"] == row["id"]), row)
-            sign_pub, box_pub = unb64(row["sign_pub"]), unb64(row["box_pub"])
-            view = {"id": row["id"], "device": row["device"], "name": row["name"], "class": row.get("class", "computer"),
-                    "created_at": row["created_at"], "code": "", "tampered": False,
-                    "fingerprint": crypto.fingerprint(sign_pub, box_pub)}
-            if row.get("approver_nonce") and unb64(row["approver_nonce"]) != expected:
-                view["tampered"] = True
-            elif row.get("device_nonce"):
-                device_nonce = unb64(row["device_nonce"])
-                # The revealed half must open the commitment made before n_a existed (review C1).
-                if crypto.join_commitment(device_nonce) != commitment:
-                    view["tampered"] = True
-                else:
-                    view["code"] = crypto.join_code(bundle.account, row["id"], row["device"], sign_pub, box_pub,
-                                                    commitment, expected, device_nonce)
-            out.append(view)
+            out.append(self._card(bundle, row, expected))
+        self.local.put("join_answers", answered)
+        self.local.put("join_requests_held", held)
         return out
+
+    @staticmethod
+    def _card(bundle: Bundle, row: dict, expected: bytes, held: bool = False) -> dict:
+        """What the person sees for one request, computed from that one row only: its keys, its halves, its code."""
+        commitment = unb64(row["commitment"])
+        sign_pub, box_pub = unb64(row["sign_pub"]), unb64(row["box_pub"])
+        view = {"id": row["id"], "device": row["device"], "name": row["name"], "class": row.get("class", "computer"),
+                "created_at": row["created_at"], "code": "", "tampered": False, "held": held,
+                "sign_pub": row["sign_pub"], "box_pub": row["box_pub"],
+                "fingerprint": crypto.fingerprint(sign_pub, box_pub)}
+        if held:
+            return view
+        if row.get("approver_nonce") and unb64(row["approver_nonce"]) != expected:
+            view["tampered"] = True
+        elif row.get("device_nonce"):
+            device_nonce = unb64(row["device_nonce"])
+            # The revealed half must open the commitment made before n_a existed (review C1).
+            if crypto.join_commitment(device_nonce) != commitment:
+                view["tampered"] = True
+            else:
+                view["code"] = crypto.join_code(bundle.account, row["id"], row["device"], sign_pub, box_pub,
+                                                commitment, expected, device_nonce)
+        return view
 
     def approve(self, join_id: str, code: str) -> None:
         bundle = self.bundle()
@@ -515,11 +592,13 @@ class Account:
             raise SyncStateError("not_member", "This device hasn't joined Sync.")
         if self.device not in self.members(bundle):
             raise SyncStateError("not_member", "This device isn't a member any more.")
-        rows = {j["id"]: j for j in self.hub.get("joins")["joins"] if not j.get("answer")}
-        view = next((v for v in self.join_requests() if v["id"] == join_id), None)
-        row = rows.get(join_id)
-        if row is None or view is None:
+        # One fetch: the code is checked on, and the key wrapped to, the same row (review B1).
+        row = next((j for j in self.hub.get("joins")["joins"] if j["id"] == join_id and not j.get("answer")), None)
+        if row is None:
             raise SyncStateError("join_unknown", "That request was answered on another device or withdrawn.")
+        if row["device"] == self.device:
+            raise SyncStateError("join_unknown", "That request is this device's own.")
+        view = self._card(bundle, row, bundle.join_nonce(row["id"], row["device"], unb64(row["commitment"])))
         if view["tampered"] or not view["code"]:
             raise SyncStateError("join_incomplete" if not view["tampered"] else "tampered",
                                  "The code isn't ready yet." if not view["tampered"] else "This request was tampered with. Don't approve it.")
@@ -528,7 +607,7 @@ class Account:
         if not secrets.compare_digest(view["code"], "".join(ch for ch in code if ch.isdigit())):
             raise SyncStateError("code_mismatch", "The codes don't match. Don't approve this device.")
         keys = self.keys()
-        box_pub, sign_pub = unb64(row["box_pub"]), unb64(row["sign_pub"])
+        box_pub, sign_pub = unb64(view["box_pub"]), unb64(view["sign_pub"])
         envelope = crypto.wrap(bundle, row["device"], box_pub)
         cert = bundle.cert(row["device"], sign_pub, box_pub)
         statement = crypto.add_statement(bundle.account, bundle.epoch, row["device"], sign_pub, box_pub, "approval", self.device, envelope, cert)

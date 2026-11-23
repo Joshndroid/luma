@@ -60,7 +60,8 @@ class Base(unittest.TestCase):
         card = approver.account.join_requests()[0]
         self.assertEqual(card["code"], view.code, "both devices show the same code")
         approver.account.approve(card["id"], view.code)
-        self.assertEqual(newcomer.account.join_view().state, "approved")
+        self.assertEqual(newcomer.account.join_view().state, "code", "nothing is taken before the person confirms here")
+        self.assertEqual(newcomer.account.confirm_join(True).state, "approved")
         return view.code
 
 
@@ -123,7 +124,7 @@ class KeyTests(Base):
         with self.assertRaises(SyncStateError):
             a.account.approve(card["id"], "000000" if code != "000000" else "111111")
         a.account.approve(card["id"], code)
-        self.assertEqual(b.account.join_view().state, "approved")
+        self.assertEqual(b.account.confirm_join(True).state, "approved")
         self.assertEqual(b.account.bundle().ask, a.account.bundle().ask)
         self.assertEqual(a.account.join_requests(), [], "the card clears once answered")
         # Not me.

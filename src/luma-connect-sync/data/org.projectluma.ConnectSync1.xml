@@ -31,16 +31,23 @@
     <method name="CancelSetup"/>
     <!-- polkit org.projectluma.connect-sync.reveal-recovery-key -->
     <method name="RevealRecoveryKey"><arg name="words" type="as" direction="out"/></method>
+    <!-- After GetState shows attention.reason "new_recovery_key" (the recovery key was replaced when the device
+         that held it was removed): the person has written the new words down (read with RevealRecoveryKey). -->
+    <method name="AcknowledgeRecoveryKey"/>
 
-    <!-- This device joining: {state: none|waiting|code|approved|denied|expired, code,
-         join, approvers: [{device, name, class}]} -->
+    <!-- This device joining: {state: none|waiting|code|confirmed|approved|denied|expired|tampered, code,
+         join, approvers: [{device, name, class}]}. In "code" the person compares the code with the other device and
+         answers ConfirmJoin here; the approval is only taken after ConfirmJoin(true) ("confirmed"). -->
     <method name="RequestJoin"><arg name="json" type="s" direction="out"/></method>
     <method name="GetJoin"><arg name="json" type="s" direction="out"/></method>
+    <method name="ConfirmJoin"><arg name="matched" type="b" direction="in"/><arg name="json" type="s" direction="out"/></method>
     <method name="CancelJoin"/>
     <method name="JoinWithRecoveryKey"><arg name="words" type="s" direction="in"/></method>
     <signal name="JoinChanged"><arg name="json" type="s"/></signal>
 
-    <!-- Other devices asking to join: [{id, device, name, class, code, created_at, tampered}] -->
+    <!-- Other devices asking to join: [{id, device, name, class, code, created_at, tampered, held, fingerprint}].
+         Every request this device answered has a card (JoinRequested), even before its code is ready; at most one
+         per device and three new ones a day are answered, the rest are "held" (no code). -->
     <method name="ListJoinRequests"><arg name="json" type="s" direction="out"/></method>
     <method name="ApproveJoin"><arg name="join" type="s" direction="in"/><arg name="code" type="s" direction="in"/></method>
     <method name="DenyJoin"><arg name="join" type="s" direction="in"/></method>

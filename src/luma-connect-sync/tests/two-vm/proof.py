@@ -266,6 +266,7 @@ class Proof:
         if not same:
             return
         self.cli("a", f"approve {join_id} --code {code_b}")
+        self.cli("b", "join-confirm yes")      # the person says on b that both codes matched (re-review B3)
         ok, seconds = self.wait("approved", lambda: "Approved" in self.user("b", "cat /tmp/lcs-join.log"), 120, 2)
         status = self.status("b")
         self.emit("a approved; b is a member", ok and status["account"]["standing"] == "member", f"{seconds:.0f} s, epoch {status['account']['epoch']}")

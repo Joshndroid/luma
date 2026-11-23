@@ -296,6 +296,13 @@ def envelope_message(account: str, target: str, epoch: int, ciphertext: bytes) -
     return f"luma-sync-envelope-sig-v1\0{account}\0{target}\0{epoch}\0".encode() + hashlib.sha256(ciphertext).digest()
 
 
+def request_message(device: str, method: str, path: str, at: int, body: bytes) -> bytes:
+    """What a device signs on every Sync request that changes something (review S5): the bearer token alone, which
+    other software on the computer may be able to read, never changes or deletes anything. The Hub checks it under
+    the device's registered key (sync/routes.mjs requestMessage)."""
+    return f"luma-sync-request-v1\0{device}\0{method}\0{path}\0{at}\0".encode() + hashlib.sha256(body).digest()
+
+
 def statement_bytes(statement: dict[str, object]) -> bytes:
     """A membership statement as signed; the Hub checks it too (sync/store.mjs statementBytes)."""
     return b"luma-sync-membership-v1\0" + canonical(statement)

@@ -260,7 +260,8 @@ class Sync:
         current = self.account.join_requests()
         ids = {row["id"] for row in current}
         for row in current:
-            if row["id"] not in seen and row["code"]:
+            # A card for every request this device answered, before its code is ready (review B2): no silent answers.
+            if row["id"] not in seen and not row.get("held"):
                 # No code in the signal: every session-bus client hears signals; the card fetches it (review L8).
                 self.emit("JoinRequested", row["id"], row["device"], row["name"], row["class"])
                 seen.add(row["id"])
@@ -293,8 +294,16 @@ class Sync:
         usage = hub.get("usage") or {}
         state = last.get("state", "syncing")
         attention = None
+        replaced = self.local.get("recovery_replaced")
         if state == "revoked":
             attention = {"reason": "revoked", "detail": last.get("detail", "")}
+        elif replaced:
+            # Review S1: never silent. Shown until the person reads the new words (RevealRecoveryKey) and acknowledges.
+            attention = {"reason": "new_recovery_key", "at": replaced.get("at"),
+                         "detail": "Your recovery key was replaced when the device that kept it was removed. "
+                                   "Write down the new one; the old words no longer work."}
+        elif last.get("code") == "keys_unreadable":
+            attention = {"reason": "keys_unreadable", "detail": last.get("detail", "")}
         elif last.get("code") == "quota":
             attention = {"reason": "quota", "detail": last.get("detail", ""), "used": usage.get("bytes"), "quota": usage.get("quota_bytes")}
         conflicts = [c for c in self.local.get("conflicts", []) if time.time() - c["at"] < 86400]
@@ -308,7 +317,8 @@ class Sync:
         return {"state": shown, "detail": last.get("detail", ""), "attention": attention, "last_sync": last.get("last_sync"),
                 "enabled": settings["enabled"], "categories": settings["categories"], "phase_one": sorted(PHASE_ONE),
                 "storage": {"used": usage.get("bytes", 0), "quota": usage.get("quota_bytes", 0)},
-                "devices": len([d for d in hub.get("devices", []) if d["state"] == "member"]), "this_device": self.hub.device}
+                "devices": len([d for d in hub.get("devices", []) if d["state"] == "member"]), "this_device": self.hub.device,
+                "join_requests_held": self.local.get("join_requests_held", 0)}
 
     def devices(self) -> list[dict]:
         hub = self.account.state()
