@@ -38,7 +38,7 @@ SECRET_SCHEMA = "org.projectluma.Streamy.Destination"
 KEY, SIGN_IN = "stream-key", "oauth"
 CANVAS_ICONS = {"landscape": "rectangle-horizontal", "vertical": "smartphone"}
 #: What "Add" offers, in order.
-ADDABLE = ("twitch", "youtube", "kick", "tiktok", "restream", "custom")
+ADDABLE = ("twitch", "youtube", "kick", "tiktok", "x", "restream", "custom")
 
 
 def logos_dir() -> Path:

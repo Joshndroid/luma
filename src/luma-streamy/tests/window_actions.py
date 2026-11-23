@@ -339,6 +339,16 @@ def outputs(win) -> None:
     win._refresh_bar()
     assert "Add a destination" not in labels(), labels()
     print("bar: outputs only, never a key for adding a destination")
+    # Turning a stream row on or off in Destinations changes the bar at once, with no other event.
+    streams = [r for r in win.dest_store.rows if r.is_stream]
+    row = streams[0] if streams else win.dest_store.add("restream")
+    for on in (True, False, True):
+        row.enabled = on
+        win.dest_store.update(row)
+        win.dest_panel._changed()
+        assert ("Go live" in labels()) == win._streams_ready() == (on or any(
+            r.is_stream and r.enabled for r in win.dest_store.rows if r is not row)), labels()
+    print("bar: Go live follows a stream row turned on and off")
     win.center.show_bar = show_bar
 
 

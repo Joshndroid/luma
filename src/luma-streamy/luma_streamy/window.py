@@ -546,7 +546,7 @@ class StreamyWindow(AppWindow):
         self.outputs = Outputs()
         self.dest_store = DestinationStore.load(data_dir() / "destinations.json")
         self.dest_panel = DestinationsPanel(self.dest_store, center=self.center, host=self.host, outputs=self.outputs,
-                                            on_changed=self._sync_canvas_state)
+                                            on_changed=self._destinations_changed)
         self.stats_panel = StatsPanel(outputs=self.outputs, store=self.dest_store)
         self.chat_panel = ChatPanel(center=self.center, host=self.host, path=data_dir() / "chat.json",
                                     outputs=self.outputs)
@@ -3380,6 +3380,12 @@ class StreamyWindow(AppWindow):
                 rows.append(MenuItem(f"{name} · Off", icon=CANVAS_GLYPHS[key], note="Turn on",
                                      on_activate=lambda k=key: self._canvas_chip(k, True)))
         return rows
+
+    def _destinations_changed(self) -> None:
+        """A destination added, removed, turned on or off, or edited: the canvases say which are live and
+        the bar offers Go live exactly when a stream row would go live."""
+        self._sync_canvas_state()
+        self._refresh_bar()
 
     def _sync_canvas_state(self) -> None:
         """Canvas state as words: "Live" after a canvas panel's title while an output takes it."""
