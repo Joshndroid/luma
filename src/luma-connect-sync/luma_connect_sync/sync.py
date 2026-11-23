@@ -136,6 +136,8 @@ class Sync:
                 raise
             except SyncStateError as error:
                 return self._record("attention", str(error), code=error.code)
+            except KeystoreError as error:
+                return self._record("attention", str(error), code="keys_unreadable")
             if standing == "revoked":
                 self.account.forget()
                 return self._record("revoked", "This device no longer syncs. Everything on it stays.")

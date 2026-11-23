@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 
+log = logging.getLogger("luma-connect-sync")
 ZONE = "keychain"
 MAX_ITEMS = 64
 HELPER_RUNS: dict[str, float] = {}     # app -> when a helper last ran under its id (the watcher ignores those closes)
@@ -135,10 +137,19 @@ def publish(engine, local, target) -> None:
     entries = read(target.app)
     state = local.get(f"portal:{target.zone}", {})
     _version, record = engine.get(ZONE, target.keychain_name)
-    merged = {fingerprint([e]): e for e in ((record or {}).get("items") or []) + entries}
+    synced = ((record or {}).get("items") or []) if (record or {}).get("owner") == target.owner else []
+    merged = {fingerprint([e]): e for e in synced + entries}
     items = sorted(merged.values(), key=lambda e: sorted(dict(e["attributes"]).items()))[:MAX_ITEMS]
     if items and (record or {}).get("items") != items:
         engine.save(ZONE, target.keychain_name, {"items": items, "owner": target.owner})
+        log.info("%s: %d sign-ins published", target.app, len(items))
+    # "applied" means in this device's keyring: synced items it doesn't have yet are stored now (the app is closed),
+    # e.g. when the app made a fresh keyring file before the synced ones arrived.
+    here = {fingerprint([e]) for e in entries}
+    missing = [e for e in items if fingerprint([e]) not in here]
+    if missing:
+        write(target.app, missing)
+        log.info("%s: %d sign-ins stored", target.app, len(missing))
     local.put(f"portal:{target.zone}", {**state, "stamp": _stamp(target.app), "applied": fingerprint(items)})
 
 
@@ -149,7 +160,11 @@ def restore(engine, local, target) -> None:
     _version, record = engine.get(ZONE, target.keychain_name)
     items = (record or {}).get("items") or []
     state = local.get(f"portal:{target.zone}", {})
-    if not items or (record or {}).get("owner") != target.owner or state.get("applied") == fingerprint(items):
+    if not items or state.get("applied") == fingerprint(items):
+        return
+    if (record or {}).get("owner") != target.owner:
+        log.info("%s: synced sign-ins belong to another publisher of this app; not stored", target.app)
         return
     write(target.app, items)
+    log.info("%s: %d sign-ins stored", target.app, len(items))
     local.put(f"portal:{target.zone}", {**state, "stamp": _stamp(target.app), "applied": fingerprint(items)})

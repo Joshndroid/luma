@@ -11,8 +11,13 @@ start)
   [ -f "$work/$name.qcow2" ] || qemu-img create -q -f qcow2 -b "$base" -F qcow2 "$work/$name.qcow2"
   echo "$p" > "$work/$name.port"
   virsh -q --connect qemu:///system destroy "connect-sync-$name" >/dev/null 2>&1 || true
-  virsh -q --connect qemu:///system undefine --nvram "connect-sync-$name" >/dev/null 2>&1 || true
   unset XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+  # Keep a defined VM: its NVRAM and TPM state hold what systemd-creds sealed (a new TPM can't open them).
+  if virsh -q --connect qemu:///system dominfo "connect-sync-$name" >/dev/null 2>&1 && [ ! -e "$work/$name.fresh" ]; then
+    exec virsh -q --connect qemu:///system start "connect-sync-$name"
+  fi
+  virsh -q --connect qemu:///system undefine --nvram --tpm "connect-sync-$name" >/dev/null 2>&1 || true
+  rm -f "$work/$name.fresh"
   virt-install --connect qemu:///system --name "connect-sync-$name" --import \
     --memory 4096 --vcpus 4 --cpu host-passthrough --machine q35 --boot uefi \
     --disk "path=$work/$name.qcow2,format=qcow2,bus=virtio,cache=unsafe,discard=unmap" \

@@ -38,6 +38,8 @@ import secrets
 import shutil
 import stat
 import subprocess
+import tempfile
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -66,6 +68,9 @@ DATA_DIRS = [Path("/usr/share/luma/sync"), Path(__file__).resolve().parent.paren
 
 class SnapshotAborted(Exception):
     """A file changed while it was read, the app opened, or a manifest broke a rule; nothing was changed."""
+
+
+log = logging.getLogger("luma-connect-sync")
 
 
 @dataclass
@@ -128,9 +133,13 @@ def unit_of(relative: str) -> str:
 # ---------------------------------------------------------------- owners (review H4)
 
 def _gpg_fingerprints(keyring: Path) -> list[str]:
+    if not keyring.is_file():
+        return []
     try:
-        out = subprocess.run(["gpg", "--batch", "--no-options", "--homedir", "/nonexistent", "--with-colons", "--show-keys", str(keyring)],
-                             capture_output=True, text=True, timeout=20, check=False).stdout
+        # A throwaway home: gpg refuses a missing one, and the person's own keyring is never touched.
+        with tempfile.TemporaryDirectory(prefix="luma-sync-gpg-") as home:
+            out = subprocess.run(["gpg", "--batch", "--no-options", "--no-autostart", "--homedir", home, "--with-colons",
+                                  "--show-keys", str(keyring)], capture_output=True, text=True, timeout=20, check=False).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     return sorted({line.split(":")[9] for line in out.splitlines() if line.startswith("fpr:") and len(line.split(":")) > 9})
@@ -752,6 +761,8 @@ class AppData:
         base_id = info.get("base") if info.get("owner") == target.owner else None
         remote_new = bool(head) and head["snapshot"] != base_id
         if not quiet:
+            if remote_new:
+                log.info("%s: newer state waits until the app closes", app)
             return self._state(app, "waiting" if remote_new else info.get("state", "synced"))
         if folder_bytes(target.folder, self.patterns) > BUDGET and not info.get("large_ok"):
             return self._state(app, "over_budget")
@@ -768,6 +779,7 @@ class AppData:
             self._set_progress(app, "restoring", 0.0)
             remote = self.remote_manifest(target, head)
             self.apply(target, remote, progress=lambda value: self._set_progress(app, "restoring", value))
+            log.info("%s: state from %s applied", app, head.get("device_name") or head.get("device"))
             if target.kind == "flatpak":
                 portal_secrets.restore(self.engine, self.local, target)
             return self._state(app, "synced", from_device=head.get("device_name") or head.get("device"))

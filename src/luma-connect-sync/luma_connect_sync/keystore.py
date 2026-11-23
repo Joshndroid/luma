@@ -24,6 +24,7 @@ import base64
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 SCHEMA = "org.projectluma.ConnectSync"
@@ -115,13 +116,24 @@ class CredsKeystore:
 
     @staticmethod
     def _creds(*arguments: str, data: bytes | None = None) -> bytes:
-        try:
-            result = subprocess.run(["systemd-creds", "--user", *arguments], input=data, capture_output=True, timeout=60)
-        except (OSError, subprocess.SubprocessError) as error:
-            raise KeystoreError("This device can't seal Sync's keys (systemd-creds is unavailable).") from error
-        if result.returncode:
-            raise KeystoreError("This device's credential service refused Sync's keys.")
-        return result.stdout
+        reason = ""
+        # The credential service can be briefly unreachable while the session starts; try a few times.
+        for attempt in range(4):
+            try:
+                result = subprocess.run(["systemd-creds", "--user", *arguments], input=data, capture_output=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as error:
+                reason = type(error).__name__
+            else:
+                if not result.returncode:
+                    return result.stdout
+                # systemd-creds' own message; it never contains the secret.
+                reason = (result.stderr.decode(errors="replace").strip().splitlines() or [f"exit {result.returncode}"])[-1][:200]
+                if "TPM" in reason or "integrity" in reason:
+                    # Sealed to a security chip that was reset or replaced: no retry will open it.
+                    raise KeystoreError("This device's Sync keys can't be opened any more (its security chip was reset or "
+                                        "replaced). Remove it from another device, then join again.")
+            time.sleep(1 + 2 * attempt)
+        raise KeystoreError(f"This device's credential service refused Sync's keys ({reason}).")
 
     def get(self, device: str, kind: str) -> bytes | None:
         path = self._path(device, kind)

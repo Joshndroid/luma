@@ -255,6 +255,25 @@ class H3Keystore(unittest.TestCase):
         finally:
             os.environ["PATH"] = old
 
+    def test_keys_sealed_to_a_reset_tpm(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        tool = root / "bin/systemd-creds"
+        tool.parent.mkdir()
+        tool.write_text("#!/bin/sh\necho 'The TPM integrity check for this key failed, key probably belongs to another TPM.' >&2\nexit 1\n")
+        tool.chmod(0o755)
+        (root / "keys").mkdir()
+        (root / "keys/dev-1.bundle.cred").write_bytes(b"sealed")
+        old = os.environ["PATH"]
+        os.environ["PATH"] = f"{tool.parent}:{old}"
+        try:
+            started = time.monotonic()
+            with self.assertRaises(keystore.KeystoreError) as refused:
+                keystore.CredsKeystore(root / "keys").get("dev-1", "bundle")
+            self.assertLess(time.monotonic() - started, 5, "no retries for a key no retry can open")
+            self.assertIn("join again", str(refused.exception))
+        finally:
+            os.environ["PATH"] = old
+
     def test_default_is_sealed_files(self) -> None:
         old = os.environ.pop("LUMA_CONNECT_SYNC_KEYSTORE", None)
         try:
@@ -280,6 +299,15 @@ class H4Owner(Members):
         self.b.engine.fetch(real.zone)
         with self.assertRaises(appdata.SnapshotAborted):
             self.b.appdata.remote_manifest(impostor, head)
+
+    def test_fingerprints_from_a_real_keyring(self) -> None:
+        import glob
+        import shutil
+        keys = sorted(glob.glob("/etc/pki/rpm-gpg/RPM-GPG-KEY-*")) + sorted(glob.glob("/usr/share/keyrings/*.gpg"))
+        if not shutil.which("gpg") or not keys:
+            self.skipTest("needs gpg and a public key on this machine")
+        self.assertTrue(appdata._gpg_fingerprints(Path(keys[0])), "gpg must read the keyring without a home of its own")
+        self.assertEqual(appdata._gpg_fingerprints(Path("/nonexistent/keyring.gpg")), [])
 
     def test_owner_is_the_remote_and_its_keys(self) -> None:
         installed = {"org.example.Kiln": {"remote": "flathub", "installation": "user"}}
@@ -366,6 +394,31 @@ class H5StoreRecords(unittest.TestCase):
                                         "from_repository": True})
         self.assertNotIn("backdoor", json.dumps(seen["record"]))
         self.assertNotIn("evil", json.dumps(seen["record"]))
+
+
+class SignInsArrive(Members):
+    """Proof finding: an app that made a fresh, empty keyring before the synced sign-ins arrived still gets them."""
+
+    def test_publish_stores_what_this_keyring_lacks(self) -> None:
+        from luma_connect_sync import portal_secrets as ps
+        ta, tb = self.a.target("org.example.Kiln"), self.b.target("org.example.Kiln")
+        keyrings = {self.a.hub.device: [{"label": "x", "attributes": {"account": "p"}, "content_type": "text/plain", "secret": "c2VjcmV0"}],
+                    self.b.hub.device: []}
+        stamps = {self.a.hub.device: [1, 1], self.b.hub.device: [0, 1]}
+        current = {"device": self.a.hub.device}
+        saved = (ps.read, ps.write, ps.uses_portal, ps._stamp)
+        ps.read = lambda app: list(keyrings[current["device"]])
+        ps.write = lambda app, items: keyrings[current["device"]].extend(items)
+        ps.uses_portal = lambda app: True
+        ps._stamp = lambda app: stamps[current["device"]]
+        try:
+            ps.publish(self.a.engine, self.a.local, ta)
+            current["device"] = self.b.hub.device
+            ps.publish(self.b.engine, self.b.local, tb)     # b's app made an empty keyring first
+            ps.restore(self.b.engine, self.b.local, tb)
+        finally:
+            ps.read, ps.write, ps.uses_portal, ps._stamp = saved
+        self.assertEqual(keyrings[self.b.hub.device], keyrings[self.a.hub.device])
 
 
 class M1Pieces(Members):

@@ -125,10 +125,33 @@ class Proof:
     def start(self, name: str) -> None:
         running = (self.work / f"{name}.port").exists() and self.vm("ssh", name, "true", check=False, timeout=20).returncode == 0
         booting = subprocess.run(["virsh", "-c", "qemu:///system", "domstate", f"connect-sync-{name}"], capture_output=True, text=True).stdout.strip() == "running"
-        if not running and not booting:
+        serial = Path(f"/var/log/libvirt/qemu/connect-sync-{name}-serial.log")
+
+        def boot() -> int:
             self.vm("stop", name, check=False)
             self.vm("start", name, str(PORTS[name]))
-        ok, seconds = self.wait("ssh", lambda: self.ssh(name, "true", timeout=20) == "", 1800, 10)
+            return serial.stat().st_size if serial.exists() else 0
+        # A VM that is up but doesn't answer SSH is stuck from an earlier attempt: boot it again.
+        offset = boot() if not running else (serial.stat().st_size if serial.exists() else 0)
+        started, ok = time.monotonic(), False
+        for attempt in range(3):
+            # A loaded build host can stall a first boot (udev timeouts, emergency mode, pid 1 frozen): boot again.
+            def up_or_stuck() -> bool:
+                if serial.exists() and serial.stat().st_size > offset:
+                    with open(serial, "rb") as log:
+                        log.seek(offset)
+                        tail = log.read()
+                    if b"Freezing execution" in tail or b"emergency mode" in tail:
+                        raise RuntimeError("stuck")
+                return self.ssh(name, "true", timeout=20) == ""
+            try:
+                ok, _ = self.wait("ssh", up_or_stuck, 1200, 10)
+            except RuntimeError:
+                self.emit(f"{name}: boot {attempt + 1} stalled on the loaded host; booting again", True, "")
+                offset = boot()
+                continue
+            break
+        seconds = time.monotonic() - started
         if not self.emit(f"{name}: boots and answers SSH", ok, f"{seconds:.0f} s"):
             raise SystemExit(1)
         subprocess.run(["tar", "-czf", str(self.work / "lcs.tgz"), "--exclude=__pycache__", "--exclude=tests", "-C", str(SOURCE), "."], check=True)
@@ -320,8 +343,12 @@ done
             return setting == "'dark'" and document == canary
         ok, seconds = self.wait("state", arrived, 600, 5)
         self.emit("b: the setting and the document arrive after closing on a (quiet point 20 s + sync)", ok, f"{time.monotonic() - closed:.0f} s after closing")
-        signed = self.user("b", f"flatpak run --command=sh {app} -c {shlex.quote(self.secret_script('lookup'))}", input=self.state["password_canary"], check=False).strip()
-        self.emit("b: the sign-in opens on b (portal secret carried in the app's owner-scoped portal record)", signed == "True", signed)
+        # The sign-in can follow one cycle later (a's keyring may change after its folder was sent); probing runs the app.
+        def opens() -> bool:
+            return self.user("b", f"flatpak run --command=sh {app} -c {shlex.quote(self.secret_script('lookup'))}",
+                             input=self.state["password_canary"], check=False).strip() == "True"
+        ok, seconds = self.wait("sign-in", opens, 600, 60)
+        self.emit("b: the sign-in opens on b (portal secret carried in the app's owner-scoped portal record)", ok, f"{seconds:.0f} s")
 
     def s_running(self) -> None:
         self.user("b", f"setsid nohup flatpak run --command=sleep {DOC_APP} 75 > /dev/null 2>&1 &")
