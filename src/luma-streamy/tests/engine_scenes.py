@@ -77,6 +77,20 @@ class Fanout:
         return [(pts, seen) for pts, seen in list(self.frames) if pts < start]
 
 
+def dump(engine) -> str:
+    """Each layer's state, for a failure's message."""
+    rows = []
+    for wid, b in engine.branches.items():
+        for fmt, layer in b.layers.items():
+            queue = layer.elements[1].get_static_pad("sink")
+            rows.append(f"{wid}/{fmt}: scene {b.scene_id} fade {b.fade} linked {layer.linked} valve-drop "
+                        f"{layer.valve.get_property('drop')} queue-caps {queue.get_current_caps() is not None} "
+                        f"frame-caps {layer.frame.get_static_pad('src').get_current_caps() is not None} alpha "
+                        f"{layer.pad.get_property('alpha'):.2f} state {layer.frame.get_state(0)[1].value_nick} "
+                        f"feed-shown {b.feed.shown} parked {b.feed.parked} tee-peer {layer.tee_pad.get_peer() is not None}")
+    return "\n".join(rows)
+
+
 def main() -> int:
     project = Project.starter()
     one = project.active_scene
@@ -135,7 +149,7 @@ def main() -> int:
     last_pts, last = fanout.before(start)[-1]
     print(f"cut: last before {last} at -{(start - last_pts) / 1e6:.0f} ms; first after {first} at "
           f"+{(first_pts - start) / 1e6:.0f} ms")
-    assert last["display"] < BG + 20 and last["camera-small"] > BG + 40, last
+    assert last["display"] < BG + 20 and last["camera-small"] > BG + 40, f"{last}\n{dump(engine)}"
     assert first["display"] > BG + 40, f"the display wasn't on the first frame after the cut: {first}"
     assert first["camera-big"] > BG + 40, first  # the big box (the small one lies inside it)
     assert first_pts - start < 2 * FRAME, "the first frame after the cut came late"
@@ -148,7 +162,7 @@ def main() -> int:
 
     # 2. A fade back: the display (in Two only) fades out; then a fade to Two again brings it to full
     #    alpha in the set duration. Meanwhile the camera glides between its two boxes.
-    run(1.0)
+    assert until(lambda: len(fanout.after(start + 20 * FRAME)) > 0, 15), "the outputs stopped"
     full = sorted(seen["display"] for _pts, seen in fanout.after(start + 4 * FRAME))[len(fanout.after(start + 4 * FRAME)) // 2]
     engine.transition = ("fade", 300)
     pads = {}
@@ -169,13 +183,16 @@ def main() -> int:
     engine.show_scene(one)
     assert until(lambda: "landscape" in engine.switched_at, 1)
     back = engine.switched_at["landscape"]
-    run(0.8)
+    # Waits are in output time: on a loaded builder the mixer can composite at half the clock's pace.
+    assert until(lambda: len(fanout.after(back + 600 * Gst.MSECOND)) > 0, 15), "the outputs stopped"
     engine.switched_at = {}
     project.activate(two.id)
     engine.show_scene(two)
     assert until(lambda: "landscape" in engine.switched_at, 1)
     fade = engine.switched_at["landscape"]
     assert until(lambda: len(fanout.after(fade + 400 * Gst.MSECOND)) > 3, 5), "no output pictures after the fade"
+    print("fade out (ms, luma):", [(round((pts - back) / 1e6), s["display"]) for pts, s in fanout.after(back - 2 * FRAME)
+                                    if pts < fade][:16])
     seen = [(pts - fade, s["display"]) for pts, s in fanout.after(fade - 2 * FRAME)]
     print("fade in (ms, luma):", [(round(t / 1e6), y) for t, y in seen[:14]], "full", full)
     ramp = [y for t, y in seen if 0 < t < 300 * Gst.MSECOND]
@@ -190,7 +207,8 @@ def main() -> int:
     print("glide (ms, small xpos/width, big xpos/width):",
           [(round(t / 1e6), g["small"][0], g["small"][2], g["big"][0], g["big"][2]) for t, g in glide[::3]])
     assert len(glide) >= 8, f"too few frames during the glide: {len(glide)}"
-    assert all(g["small"][:3] == g["big"][:3] for _t, g in glide), "the two layers parted during the glide"
+    parted = [(round(t / 1e6), g["small"][:3], g["big"][:3]) for t, g in glide if g["small"][:3] != g["big"][:3]]
+    assert not parted, f"the two layers parted during the glide: {parted}"
     xs = [g["small"][0] for _t, g in glide]
     assert xs[0] <= 970 and all(b >= a for a, b in zip(xs, xs[1:])) and xs[-1] >= 1390, xs
     settled = [g for t, g in track if t > back + 340 * Gst.MSECOND and t < fade]

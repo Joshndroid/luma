@@ -36,7 +36,7 @@ A session snapshot is one JSON document, format 1. The shell takes it; nothing i
 
 Mutter already has the hook Continue needs: `MetaWindow::configure` is emitted once per window with its initial `MetaWindowConfig`, for Wayland at the initial commit before the first configure is sent and for X11 before the window is mapped. A handler that sets the position marks the window placed, so Mutter's own placement never runs. The shell restores from there; no window is moved after it has been seen.
 
-Luma's Mutter adds what is missing (`patches/mutter/0047`):
+Luma's Mutter adds what is missing (`patches/mutter/0048`):
 
 1. `meta_window_config_set_maximized()`, `meta_window_config_set_tile_mode()` and `meta_window_config_set_tile_monitor()` are exported, so a configure handler can open a window maximized or tiled, not only at a position or fullscreen.
 2. When a configure handler gives both a position and a maximized, tiled or fullscreen state, the position becomes the window's floating rectangle first, so unmaximizing a restored window returns it to where it was before.
@@ -123,7 +123,7 @@ A restore that couldn't do everything says so once, in one notification: "Reopen
 
 ## Order of work
 
-1. **Phase A: one device.** Mutter 0047; the shell's snapshot, restore and `Session1` (`patches/gnome-shell/0392`); LumaUI `luma-restore` (C and Python) and its adoption by first-party apps; the Reopen windows after restart switch. *Shown:* a headless shell test that opens Wayland, GTK and X11 windows in every state on two monitors, restarts the shell and measures each window's rectangle, state, workspace, stacking and focus; then a VM that logs out and reboots with first-party apps open.
+1. **Phase A: one device.** Mutter 0048; the shell's snapshot, restore and `Session1` (`patches/gnome-shell/0392`); LumaUI `luma-restore` (C and Python) and its adoption by first-party apps; the Reopen windows after restart switch. *Shown:* a headless shell test that opens Wayland, GTK and X11 windows in every state on two monitors, restarts the shell and measures each window's rectangle, state, workspace, stacking and focus; then a VM that logs out and reboots with first-party apps open.
 2. **Phase B: computers.** The `continue` zone and its per-device wrap in `luma-connect-sync`; the offer; monitor mapping; the new-workspace rule; install-then-place; the result notification. *Shown:* two VMs with different screens: windows on one reappear on the other after Continue, with no title or app ID in the Hub database.
 3. **Phase C: more state.** `xdg_toplevel_tag_v1` keys for toolkits that adopt it; `ConnectSync1.Quiesce` at snapshot time for apps that can flush their data while running; Android activity relaunch; copies of open files that aren't in a synced folder (Folders, ADR-054 Phase 5).
 4. **Phase D: handhelds and TVs.** The single-app offer on phones and tablets, the handheld-to-computer offer and the TV record.

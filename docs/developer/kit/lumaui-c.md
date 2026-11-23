@@ -129,11 +129,14 @@ the header bar and other chrome keep their own size and the ratio holds for
 that widget alone; without it the whole window keeps the ratio. Either call
 may come before or after the window is shown.
 
-The compositor applies the ratio to every size it picks while the window
-floats, live while the person drags any edge or corner, and to sizes the app
-asks for. Maximizing makes the window the largest size with that ratio,
-centred. A window in a tile fills its tile and a fullscreen window fills the
-screen, so the content must still letterbox in any size.
+The compositor keeps the ratio wherever the window goes: live while the
+person drags any edge or corner, for sizes the app asks for, in tiles of
+every kind (the largest size with the ratio, centred in the tile, with the
+desktop showing around it) and when maximized (the same, in the maximize
+area). A tile smaller than the window's minimum size leaves the window at
+its minimum, at the tile's corner. Only fullscreen fills the screen, so the
+content still letterboxes there. An app's "free" shape mode removes the
+ratio, and the window fills its tile again.
 
 `luma_window_set_aspect_ratio()` returns `TRUE` when the compositor keeps
 the ratio; `luma_window_get_aspect_ratio_enforced()` asks without setting

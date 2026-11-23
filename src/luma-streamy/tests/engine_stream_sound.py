@@ -336,18 +336,11 @@ def main(out_dir: str, variants: list[str]) -> int:
         return 0
     failed = []
     for variant in variants or ["start", "added", "rebuilt", "flv", "offset"]:
-        for attempt in (1, 2):
-            try:
-                check(variant, out_dir)
-            except AssertionError as error:
-                if attempt == 1 and "nothing was written" in str(error):
-                    # No picture ever reached the row: a source dying as its layer joins the running canvas
-                    # (a known engine race, not the sound path). Once more.
-                    print(f"again: {error}", flush=True)
-                    continue
-                print(f"FAIL {error}", flush=True)
-                failed.append(variant)
-            break
+        try:
+            check(variant, out_dir)
+        except AssertionError as error:
+            print(f"FAIL {error}", flush=True)
+            failed.append(variant)
     return 1 if failed else 0
 
 

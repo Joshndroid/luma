@@ -156,7 +156,7 @@ index 15ae8df..847e882 100644
    uint unconstrained_rect_valid : 1;
  
 diff --git a/src/core/window.c b/src/core/window.c
-index 717b52e..77245da 100644
+index 5c4ee36..53c0a08 100644
 --- a/src/core/window.c
 +++ b/src/core/window.c
 @@ -127,6 +127,9 @@ static void     meta_window_show          (MetaWindow     *window);
@@ -169,7 +169,7 @@ index 717b52e..77245da 100644
  
  static void     ensure_mru_position_after (MetaWindow *window,
                                             MetaWindow *after_this_one);
-@@ -8776,6 +8779,47 @@ void
+@@ -8797,6 +8800,47 @@ void
  meta_window_apply_config (MetaWindow           *window,
                            MetaWindowConfig     *config,
                            MetaWindowApplyFlags  flags)
@@ -217,7 +217,7 @@ index 717b52e..77245da 100644
  {
    if (meta_window_config_get_is_fullscreen (config))
      {
-@@ -8853,6 +8897,49 @@ meta_window_set_tag (MetaWindow *window,
+@@ -8874,6 +8918,49 @@ meta_window_set_tag (MetaWindow *window,
   *
   * Returns: (nullable): An associated toplevel tag
   */
@@ -292,10 +292,10 @@ index 4e9d8ad..3ce528b 100644
 +META_EXPORT
 +MetaSide meta_window_config_get_tile_side (MetaWindowConfig *window_config);
 diff --git a/src/meta/window.h b/src/meta/window.h
-index 32f3cb2..7e9afc0 100644
+index 22d121b..b93308a 100644
 --- a/src/meta/window.h
 +++ b/src/meta/window.h
-@@ -454,6 +454,13 @@ void meta_window_protocol_to_stage_rect (MetaWindow *window,
+@@ -459,6 +459,13 @@ void meta_window_protocol_to_stage_rect (MetaWindow *window,
  META_EXPORT
  const char * meta_window_get_tag (MetaWindow *window);
  

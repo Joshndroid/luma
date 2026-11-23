@@ -4,6 +4,8 @@
 
 It logs its size after every layout so the driver can check that windows
 which never asked for an aspect ratio resize exactly as before.
+gtk3-x11-aspect is a GTK 3 window on X11 with a single aspect ratio (4:3)
+in its WM_NORMAL_HINTS.
 """
 import json
 import sys
@@ -17,11 +19,17 @@ def emit(width, height):
     log.flush()
 
 
-if toolkit == "gtk3":
+if toolkit in ("gtk3", "gtk3-x11-aspect"):
     import gi
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, Gtk
     window = Gtk.Window(title=name)
+    if toolkit == "gtk3-x11-aspect":
+        # An X11 client with one aspect ratio in WM_NORMAL_HINTS.
+        geometry = Gdk.Geometry()
+        geometry.min_aspect = geometry.max_aspect = 4 / 3
+        window.set_geometry_hints(None, geometry, Gdk.WindowHints.ASPECT)
     header = Gtk.HeaderBar(show_close_button=True, title=name)
     window.set_titlebar(header)
     window.set_default_size(520, 360)

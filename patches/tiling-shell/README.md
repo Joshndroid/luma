@@ -124,3 +124,13 @@ shared native window switcher. It reuses the active layout, existing tile
 preview/hit testing and ordinary tile placement, including spacing and window
 memory. Previewing does not change the real window's tile or geometry; only a
 valid drop commits. Cancellation and extension teardown close the preview.
+
+`0021-luma-shaped-windows-sit-in-their-tile.patch`: a window that keeps its
+shape (an app's aspect ratio lock, Mutter 0047) is the largest size with that
+shape centred in its tile, not the whole tile. Tiling Shell's tile hold,
+re-tiling after work-area changes and window memory compared the window's
+frame with the whole tile, so they put such a window back twice in vain and
+logged "tile-refused" (or held a remembered window until its timeout). They
+now compare with `meta_window_get_frame_rect_in_tile()`, the frame Mutter
+gives the window in that tile; on a Mutter without it the tile itself, as
+before. Tested by `tests/mutter/window-shape/run.sh OUT luma tilingshell`.

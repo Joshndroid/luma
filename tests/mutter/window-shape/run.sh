@@ -8,10 +8,12 @@
 # Mutter, gtk4-devel, wayland-devel, libadwaita, gtk3, python3-gobject,
 # mesa-dri-drivers and dbus-daemon; no GPU, display server or logind session.
 #
-#   run.sh OUTDIR [luma|stock]
+#   run.sh OUTDIR [luma|stock] [none|tilingshell]
 #
 # "stock" expects a Mutter without the protocol: the kit call must be a
-# silent no-op and nothing else may change. Screenshots, the client logs and
+# silent no-op and nothing else may change. "tilingshell" enables Tiling
+# Shell and runs its scenarios (zones, neighbours, drag-to-zone, keyboard);
+# "none" (the default) runs the drags, Mutter's own tiles and the rest. Screenshots, the client logs and
 # result.json land in OUTDIR; the exit status is the number of failures.
 set -euo pipefail
 
@@ -19,6 +21,7 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo=$(CDPATH= cd -- "$here/../../.." && pwd)
 out=$1
 expect=${2:-luma}
+tiler=${3:-none}
 mkdir -p "$out/build" "$out/runtime" "$out/config/glib-2.0/settings" "$out/data"
 chmod 0700 "$out/runtime"
 rm -f "$out"/*.png "$out"/*.log "$out/result.json"
@@ -36,12 +39,27 @@ gcc -O1 -Wall -Wextra -Werror -Wno-unused-parameter -DLUMA_HAVE_WAYLAND \
 cat >"$out/config/glib-2.0/settings/keyfile" <<'KEYFILE'
 [org/gnome/shell]
 welcome-dialog-last-shown-version='999'
+disable-user-extensions=false
+enabled-extensions=@EXTENSIONS@
 
 [org/gnome/desktop/interface]
 enable-animations=false
+
+[org/gnome/mutter]
+edge-tiling=true
+
+[org/gnome/mutter/keybindings]
+toggle-tiled-left=['<Super>Left']
+toggle-tiled-right=['<Super>Right']
 KEYFILE
 
-rpm -q mutter gnome-shell gtk4 libadwaita gtk3 >"$out/packages.txt" 2>&1 || :
+if [ "$tiler" = tilingshell ]; then
+  sed -i "s/@EXTENSIONS@/['tilingshell@ferrarodomenico.com']/" "$out/config/glib-2.0/settings/keyfile"
+else
+  sed -i "s/@EXTENSIONS@/@as []/" "$out/config/glib-2.0/settings/keyfile"
+fi
+
+rpm -q mutter gnome-shell gnome-shell-extension-tiling-shell gtk4 libadwaita gtk3 >"$out/packages.txt" 2>&1 || :
 
 status=0
 env -u DISPLAY -u WAYLAND_DISPLAY \
@@ -50,7 +68,8 @@ env -u DISPLAY -u WAYLAND_DISPLAY \
   GTK_A11Y=none NO_AT_BRIDGE=1 MUTTER_DEBUG=wayland \
   LUMA_SHAPE_OUT="$out" LUMA_SHAPE_HERE="$here" \
   LUMA_SHAPE_CLIENT="$out/build/client" LUMA_SHAPE_EXPECT="$expect" \
-  dbus-run-session -- timeout 600 gnome-shell --headless --no-x11 \
+  LUMA_SHAPE_TILER="$tiler" \
+  dbus-run-session -- timeout 600 gnome-shell --headless \
   --virtual-monitor 1920x1080 --automation-script="$here/driver.js" \
   >"$out/shell.log" 2>&1 || status=$?
 

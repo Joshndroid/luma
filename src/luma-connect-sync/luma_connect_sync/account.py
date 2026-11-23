@@ -317,11 +317,12 @@ class Account:
         if recovery is not None:
             holders = [self.device]
             words = crypto.recovery_words(new_recovery)  # type: ignore[arg-type]
-            # The old words are being retired: a device that came in with them after this device last counted the
-            # members (e.g. during the removal) doesn't carry them into the new epoch (review S2).
+            # The old words are being retired: no device added during this epoch that this device hadn't counted
+            # before the removal goes into the new one, whoever let it in: one that came in with the old words, and
+            # any it then approved (review S2 and its chain).
             seen = self.local.get("known_members", {})
             known = set(seen.get("members", [])) if seen.get("epoch") == bundle.epoch else set()  # type: ignore[union-attr]
-            late = {d for d, k in members.items() if k.get("via") == "recovery" and d not in known and d != self.device}
+            late = {d for d in members if d not in bundle.members and d not in known and d != self.device}  # type: ignore[union-attr]
             removed |= late
             entries |= {crypto.removal(d, members[d]["sign"]) for d in late}
         remaining = {d: {"sign": k["sign"], "box": k["box"]} for d, k in members.items() if d not in removed}

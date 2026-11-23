@@ -6,12 +6,15 @@
  * ratio.
  *
  *   client --name NAME --log FILE [--ratio W:H] [--whole-window] [--size WxH]
- *          [--libadwaita]
+ *          [--min WxH]
  *
  * Without --ratio it is an ordinary window. --whole-window locks the window
- * geometry instead of the content. Built against the kit's
- * luma-window-shape.c (see run.sh). */
+ * geometry instead of the content; --min is the content's minimum size.
+ * SIGUSR1 toggles the lock off and on, as an app's "free" aspect mode does.
+ * Built against the kit's luma-window-shape.c (see run.sh). */
+#include <glib-unix.h>
 #include <gtk/gtk.h>
+#include <signal.h>
 #include <stdio.h>
 
 #include "luma-window-shape.h"
@@ -22,7 +25,22 @@ static int ratio_w;
 static int ratio_h;
 static gboolean whole_window;
 static int last_w = -1, last_h = -1, last_cw = -1, last_ch = -1;
+static GdkToplevelState last_state;
 static gboolean enforced;
+static gboolean locked;
+static GtkWindow *main_window;
+
+static gboolean
+toggle_lock (gpointer data G_GNUC_UNUSED)
+{
+  locked = !locked;
+  luma_window_set_aspect_ratio (main_window, locked ? ratio_w : 0,
+                                locked ? ratio_h : 0);
+  fprintf (log_file, "{\"ev\":\"lock\",\"locked\":%s}\n",
+           locked ? "true" : "false");
+  fflush (log_file);
+  return G_SOURCE_CONTINUE;
+}
 
 static void
 draw_content (GtkDrawingArea *area, cairo_t *cr, int width, int height,
@@ -74,10 +92,13 @@ tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
   int ch = gtk_widget_get_height (content);
 
   if (surface && GDK_IS_TOPLEVEL (surface))
-    state = gdk_toplevel_get_state (GDK_TOPLEVEL (surface));
-  if (w == last_w && h == last_h && cw == last_cw && ch == last_ch)
+    state = gdk_toplevel_get_state (GDK_TOPLEVEL (surface)) &
+            (GDK_TOPLEVEL_STATE_MAXIMIZED | GDK_TOPLEVEL_STATE_FULLSCREEN |
+             GDK_TOPLEVEL_STATE_TILED);
+  if (w == last_w && h == last_h && cw == last_cw && ch == last_ch &&
+      state == last_state)
     return G_SOURCE_CONTINUE;
-  last_w = w; last_h = h; last_cw = cw; last_ch = ch;
+  last_w = w; last_h = h; last_cw = cw; last_ch = ch; last_state = state;
   fprintf (log_file,
            "{\"ev\":\"size\",\"t\":%" G_GINT64_FORMAT ",\"w\":%d,\"h\":%d,"
            "\"cw\":%d,\"ch\":%d,\"maximized\":%s,\"fullscreen\":%s,"
@@ -95,6 +116,7 @@ static void
 activate (GtkApplication *app, gpointer data G_GNUC_UNUSED)
 {
   const char *size = g_object_get_data (G_OBJECT (app), "size");
+  const char *min = g_object_get_data (G_OBJECT (app), "min");
   GtkWidget *window = gtk_application_window_new (app);
   GtkWidget *header = gtk_header_bar_new ();
   GtkWidget *content = gtk_drawing_area_new ();
@@ -110,6 +132,14 @@ activate (GtkApplication *app, gpointer data G_GNUC_UNUSED)
   gtk_widget_set_vexpand (content, TRUE);
   gtk_window_set_child (GTK_WINDOW (window), content);
   gtk_window_set_default_size (GTK_WINDOW (window), w, h);
+  if (min)
+    {
+      int mw = 0, mh = 0;
+
+      sscanf (min, "%dx%d", &mw, &mh);
+      gtk_widget_set_size_request (content, mw, mh);
+    }
+  main_window = GTK_WINDOW (window);
 
   if (ratio_w > 0)
     {
@@ -117,6 +147,8 @@ activate (GtkApplication *app, gpointer data G_GNUC_UNUSED)
         luma_window_set_aspect_content (GTK_WINDOW (window), content);
       enforced = luma_window_set_aspect_ratio (GTK_WINDOW (window),
                                                ratio_w, ratio_h);
+      locked = TRUE;
+      g_unix_signal_add (SIGUSR1, toggle_lock, NULL);
     }
   gtk_widget_add_tick_callback (window, tick, content, NULL);
   gtk_window_present (GTK_WINDOW (window));
@@ -131,6 +163,7 @@ main (int argc, char **argv)
   const char *log_path = NULL;
   const char *ratio = NULL;
   const char *size = NULL;
+  const char *min = NULL;
   g_autoptr (GtkApplication) app = NULL;
   g_autofree char *app_id = NULL;
   GOptionEntry entries[] = {
@@ -138,6 +171,7 @@ main (int argc, char **argv)
     { "log", 0, 0, G_OPTION_ARG_FILENAME, &log_path, NULL, NULL },
     { "ratio", 0, 0, G_OPTION_ARG_STRING, &ratio, NULL, NULL },
     { "size", 0, 0, G_OPTION_ARG_STRING, &size, NULL, NULL },
+    { "min", 0, 0, G_OPTION_ARG_STRING, &min, NULL, NULL },
     { "whole-window", 0, 0, G_OPTION_ARG_NONE, &whole_window, NULL, NULL },
     { NULL }
   };
@@ -155,6 +189,7 @@ main (int argc, char **argv)
   app_id = g_strdup_printf ("org.projectluma.WindowShapeTest.%s", name);
   app = gtk_application_new (app_id, G_APPLICATION_NON_UNIQUE);
   g_object_set_data_full (G_OBJECT (app), "size", g_strdup (size), g_free);
+  g_object_set_data_full (G_OBJECT (app), "min", g_strdup (min), g_free);
   g_signal_connect (app, "activate", G_CALLBACK (activate), NULL);
   return g_application_run (G_APPLICATION (app), 1, argv);
 }

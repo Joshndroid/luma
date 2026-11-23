@@ -8,7 +8,7 @@
 
 Name:           gnome-shell-extension-tiling-shell
 Version:        17.3
-Release:        1.luma.28%{?dist}
+Release:        1.luma.29%{?dist}
 Summary:        Advanced tiling window management for GNOME Shell
 License:        GPL-3.0-or-later
 URL:            https://github.com/domferr/tilingshell
@@ -35,6 +35,7 @@ Patch14:        0017-luma-floating-zone-editor-actions.patch
 Patch15:        0018-independent-window-spacing-and-resize.patch
 Patch16:        0019-rebuild-selection-after-monitor-reentry.patch
 Patch17:        0020-window-preview-drag.patch
+Patch18:        0021-luma-shaped-windows-sit-in-their-tile.patch
 BuildArch:      noarch
 BuildRequires:  glib2
 BuildRequires:  nodejs
@@ -70,6 +71,7 @@ find . -type f -exec chmod 0644 {} +
 %patch -P 15 -p1
 %patch -P 16 -p1
 %patch -P 17 -p1
+%patch -P 18 -p1
 cp %{SOURCE1} ../LICENSE
 install -m 0644 %{SOURCE2} schemas/
 

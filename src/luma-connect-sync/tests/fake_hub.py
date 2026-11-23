@@ -231,6 +231,9 @@ class FakeHub:
                 elif a["devices"][target].get("was_revoked"):
                     raise Refused(403, "approval_required")
                 if self.verify:
+                    # Like the Hub: no new member while a removal waits for the new key, unless no member is left.
+                    if a["rekey"] and any(r["state"] == "member" and r.get("cert_epoch") == a["epoch"] for r in a["devices"].values()):
+                        raise Refused(409, "rekey_pending")
                     self.check_statement(a, who["account"], device, data)
                 a["membership"].append({"id": len(a["membership"]) + 1, "epoch": data["epoch"], "device": target,
                                         "statement": data.get("statement", ""), "signature": data.get("statement_signature", ""),
