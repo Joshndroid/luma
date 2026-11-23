@@ -1,0 +1,82 @@
+diff --git a/components/lumaWindowMemory/windowMemory.js b/components/lumaWindowMemory/windowMemory.js
+index 6f194fd..3c0b57e 100644
+--- a/components/lumaWindowMemory/windowMemory.js
++++ b/components/lumaWindowMemory/windowMemory.js
+@@ -211,6 +211,17 @@ function frameOf(window) {
+   return [r.x, r.y, r.width, r.height];
+ }
+ 
++// A window that keeps its shape (an app's aspect ratio lock) sits in a tile
++// at the size and place Mutter gives that shape, not the whole tile.
++function frameInTile(window, frame) {
++  try {
++    const r = window.get_frame_rect_in_tile?.(buildRectangle({ x: frame[0], y: frame[1], width: frame[2], height: frame[3] }));
++    return r ? [r.x, r.y, r.width, r.height] : frame;
++  } catch (e) {
++    return frame;
++  }
++}
++
+ function sameFrame(a, b) {
+   return !!a && !!b && a.every((v, i) => Math.abs(v - b[i]) <= FRAME_SLACK);
+ }
+@@ -1006,7 +1017,8 @@ export default class LumaWindowMemory {
+     const frame = frameOf(window);
+     if (frame[2] <= 1 || frame[3] <= 1) return;
+     const maximized = window.maximizedHorizontally && window.maximizedVertically;
+-    const inPlace = hold.decision.target.k === "max" ? maximized && sameFrame(frame, hold.expected) : !maximized && sameFrame(frame, hold.expected);
++    const expected = hold.decision.target.k === "tile" ? frameInTile(window, hold.expected) : hold.expected;
++    const inPlace = hold.decision.target.k === "max" ? maximized && sameFrame(frame, expected) : !maximized && sameFrame(frame, expected);
+     if (!inPlace) {
+       // The client's own first size is its size when untiled.
+       if (!hold.natural && hold.decision.target.k === "tile" && !maximized) hold.natural = window.get_frame_rect().copy();
+@@ -1139,7 +1151,7 @@ export default class LumaWindowMemory {
+     const p = hold.decision.target;
+     const monitor = this._monitors().find((m) => m.key === p.m);
+     if (!monitor) return;
+-    if (hold.expected && sameFrame(frameOf(window), hold.expected)) return;
++    if (hold.expected && sameFrame(frameOf(window), p.k === "tile" ? frameInTile(window, hold.expected) : hold.expected)) return;
+     window[OWN_UNTIL] = this._now() + this.timing.settle + 500;
+     if (window.get_monitor() !== monitor.index) window.move_to_monitor(monitor.index);
+     if (p.k === "max") {
+diff --git a/components/tilingsystem/tilingManager.js b/components/tilingsystem/tilingManager.js
+index c2b7388..f326d4f 100755
+--- a/components/tilingsystem/tilingManager.js
++++ b/components/tilingsystem/tilingManager.js
+@@ -83,6 +83,18 @@ function lumaTilingVitals(event, message, fields = {}) {
+     console.warn(entry.MESSAGE);
+   }
+ }
++// Luma: where a window sits in a tile. A window that keeps its shape (an
++// app's aspect ratio lock) is the largest size with that shape, centred in
++// the tile, not the whole tile; Mutter says which
++// (meta_window_get_frame_rect_in_tile). Comparing its frame with the whole
++// tile would put it back in vain, and could make it look moved away.
++export function lumaFrameInTile(window, rect) {
++  try {
++    return window.get_frame_rect_in_tile?.(rect) ?? rect;
++  } catch (e) {
++    return rect;
++  }
++}
+ const MINIMUM_DISTANCE_TO_RESTORE_ORIGINAL_SIZE = 90;
+ 
+ class SnapAssistingInfo {
+@@ -569,7 +581,7 @@ class TilingManager {
+         this._enableScaling ? getScalingFactorOf(layout)[1] : void 0);
+       window._lumaReflowKey = key;
+       const before = window.get_frame_rect();
+-      if (dest.width <= 0 || dest.height <= 0 || before.equal(dest))
++      if (dest.width <= 0 || dest.height <= 0 || before.equal(lumaFrameInTile(window, dest)))
+         continue;
+       if (!spacingChanged) window._lumaReflowMoves.push(now);
+       // One continuous glide of the window's frame, no fade, on the Dash's
+@@ -631,7 +643,7 @@ class TilingManager {
+       if (window.minimized || window.maximizedHorizontally || window.maximizedVertically || !window.get_compositor_private())
+         return;
+       const now = window.get_frame_rect();
+-      if (now.equal(want)) {
++      if (now.equal(lumaFrameInTile(window, want))) {
+         window._lumaTileWant = null;
+         return;
+       }

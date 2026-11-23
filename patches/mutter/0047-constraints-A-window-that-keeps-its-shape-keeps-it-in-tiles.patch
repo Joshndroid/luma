@@ -1,0 +1,445 @@
+From 0714fc5bb8e9acafcfad4ebc730caa87e7c17fda Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sun, 22 Nov 2026 22:42:05 -0500
+Subject: [PATCH] constraints: A window that keeps its shape keeps it in tiles
+
+0033 let a client lock its content to an aspect ratio, but tiles still
+stretched it: Mutter's side-by-side tiles and the rectangles a tiling
+manager moves a window into filled the whole tile, and the client had
+to letterbox inside it. The shape is the app's to choose; tiling must
+not override it.
+
+A window is locked when it set a ratio through luma_window_shape_v1,
+or, for an X11 client, when WM_NORMAL_HINTS give one aspect ratio
+(min_aspect == max_aspect). A range of ratios is a preference and
+still fills its tile.
+
+In a tile, side-by-side or external (meta_window_set_externally_tiled),
+a locked window takes the largest size with its ratio inside the tile,
+centred. When that is below the window's minimum size, the window wins:
+the smallest size with its ratio not below its minimum, at the tile's
+origin. Maximize uses the same fit; fullscreen is unchanged. While the
+person resizes an externally tiled window, the aspect constraint
+handles it as for a floating window.
+
+An externally tiled Wayland window keeps the tile as its unconstrained
+rectangle when its client commits a smaller size, so a client that
+drops its lock fills the tile again.
+
+Marking a window externally tiled, or no longer tiled, now configures
+it at once with the new state, even when its frame does not change (a
+window already at its shape's size in the tile): before, a queued
+move-resize that changed nothing sent no configure, and the client went
+on drawing a floating window's shadows. A window put in a tile is
+constrained to the rectangle it was asked into; one let go of stays
+where it is until the tiling manager moves it.
+
+meta_window_get_frame_rect_in_tile() returns the frame a window takes
+in a tile, so a tiling manager can tell that a locked window is where
+it put it instead of putting it back.
+---
+ src/core/constraints.c            | 240 +++++++++++++++++++++++-------
+ src/core/window.c                 |  23 ++-
+ src/meta/window.h                 |   5 +
+ src/wayland/meta-window-wayland.c |   8 +-
+ 4 files changed, 224 insertions(+), 52 deletions(-)
+
+diff --git a/src/core/constraints.c b/src/core/constraints.c
+index 7838c76..1f25d4c 100644
+--- a/src/core/constraints.c
++++ b/src/core/constraints.c
+@@ -1335,29 +1335,140 @@ constrain_modal_dialog (MetaWindow         *window,
+                                                      check_only);
+ }
+ 
+-/* The largest size inside *width x *height whose content keeps the aspect
+- * ratio a Wayland client set through luma_window_shape_v1. The content is
+- * the frame rectangle less the client's fixed chrome (frame_aspect.base_*).
+- */
++/* A window whose shape is locked keeps it wherever Mutter or a tiling manager
++ * puts it: in tiles and when maximized, not only while it floats. Locked are
++ * windows with a ratio set through luma_window_shape_v1, and X11 windows whose
++ * WM_NORMAL_HINTS give a single aspect ratio (min_aspect == max_aspect); a
++ * range of ratios is a preference, not a lock, and still fills its tile. The
++ * ratio is for the content: the frame rectangle less a fixed base (the
++ * client's chrome, or an X11 frame's borders). */
++typedef struct
++{
++  double ratio;
++  int base_width;
++  int base_height;
++} AspectLock;
++
++static gboolean
++get_aspect_lock (MetaWindow *window,
++                 AspectLock *lock)
++{
++  const MetaSizeHints *hints = &window->size_hints;
++
++  if (window->frame_aspect.set)
++    {
++      lock->ratio = hints->min_aspect.x / (double) hints->min_aspect.y;
++      lock->base_width = window->frame_aspect.base_width;
++      lock->base_height = window->frame_aspect.base_height;
++      return TRUE;
++    }
++
++  if (window->client_type == META_WINDOW_CLIENT_TYPE_X11 &&
++      (hints->flags & META_SIZE_HINTS_PROGRAM_ASPECT) &&
++      hints->min_aspect.x > 0 && hints->min_aspect.y > 0 &&
++      (gint64) hints->min_aspect.x * hints->max_aspect.y ==
++      (gint64) hints->max_aspect.x * hints->min_aspect.y)
++    {
++      MtkRectangle frame = { 0, 0, 1000, 1000 };
++      MtkRectangle client;
++
++      meta_window_frame_rect_to_client_rect (window, &frame, &client);
++      lock->ratio = hints->min_aspect.x / (double) hints->min_aspect.y;
++      lock->base_width = frame.width - client.width;
++      lock->base_height = frame.height - client.height;
++      return TRUE;
++    }
++
++  return FALSE;
++}
++
++/* The largest size inside *width x *height whose content keeps the lock's
++ * ratio. */
+ static void
+-fit_size_to_frame_aspect (MetaWindow *window,
+-                          int        *width,
+-                          int        *height)
++fit_size_to_aspect_lock (const AspectLock *lock,
++                         int              *width,
++                         int              *height)
+ {
+-  int base_width = window->frame_aspect.base_width;
+-  int base_height = window->frame_aspect.base_height;
+-  double ratio = window->size_hints.min_aspect.x /
+-                 (double) window->size_hints.min_aspect.y;
+-  int content_width = MAX (*width - base_width, 1);
+-  int content_height = MAX (*height - base_height, 1);
+-
+-  if (content_width > content_height * ratio)
+-    content_width = MAX ((int) (content_height * ratio + 0.5), 1);
++  int content_width = MAX (*width - lock->base_width, 1);
++  int content_height = MAX (*height - lock->base_height, 1);
++
++  if (content_width > content_height * lock->ratio)
++    content_width = MAX ((int) (content_height * lock->ratio + 0.5), 1);
+   else
+-    content_height = MAX ((int) (content_width / ratio + 0.5), 1);
++    content_height = MAX ((int) (content_width / lock->ratio + 0.5), 1);
++
++  *width = content_width + lock->base_width;
++  *height = content_height + lock->base_height;
++}
++
++/* Puts a locked window in @area (a tile, or the area a maximized window
++ * fills): the largest size with its ratio, centred, with what is left of the
++ * area showing what is behind. When that is below the window's minimum size
++ * the window wins: the smallest size with its ratio that is not below its
++ * minimum, at the area's origin. */
++static void
++fit_rect_to_aspect_lock (const AspectLock   *lock,
++                         const MtkRectangle *min_size,
++                         MtkRectangle       *area)
++{
++  int width = area->width;
++  int height = area->height;
++
++  fit_size_to_aspect_lock (lock, &width, &height);
++
++  if (width < min_size->width || height < min_size->height)
++    {
++      int content_width = MAX (min_size->width - lock->base_width, 1);
++      int content_height = MAX (min_size->height - lock->base_height, 1);
++
++      if (content_width > content_height * lock->ratio)
++        content_height = MAX ((int) ceil (content_width / lock->ratio), 1);
++      else
++        content_width = MAX ((int) ceil (content_height * lock->ratio), 1);
++
++      area->width = content_width + lock->base_width;
++      area->height = content_height + lock->base_height;
++      return;
++    }
++
++  area->x += (area->width - width) / 2;
++  area->y += (area->height - height) / 2;
++  area->width = width;
++  area->height = height;
++}
++
++/**
++ * meta_window_get_frame_rect_in_tile:
++ * @window: a #MetaWindow
++ * @tile: the rectangle a tiling manager puts @window in
++ * @rect: (out caller-allocates): the frame rectangle @window takes there
++ *
++ * A window a tiling manager puts in a tile with
++ * meta_window_move_resize_frame() and marks with
++ * meta_window_set_externally_tiled() fills the tile, unless it keeps its
++ * shape (an aspect ratio set through luma_window_shape_v1, or a single X11
++ * aspect ratio). Such a window takes the largest size with its ratio,
++ * centred in the tile, or, when that is below its minimum size, the smallest
++ * size with its ratio that is not, at the tile's origin. A tiling manager
++ * uses this to tell whether a window is where it put it.
++ */
++void
++meta_window_get_frame_rect_in_tile (MetaWindow         *window,
++                                    const MtkRectangle *tile,
++                                    MtkRectangle       *rect)
++{
++  MtkRectangle min_size, max_size;
++  AspectLock lock;
+ 
+-  *width = content_width + base_width;
+-  *height = content_height + base_height;
++  g_return_if_fail (META_IS_WINDOW (window));
++  g_return_if_fail (tile != NULL && rect != NULL);
++
++  *rect = *tile;
++  if (!get_aspect_lock (window, &lock))
++    return;
++
++  get_size_limits (window, &min_size, &max_size);
++  fit_rect_to_aspect_lock (&lock, &min_size, rect);
+ }
+ 
+ static gboolean
+@@ -1374,6 +1485,7 @@ constrain_maximization (MetaWindow         *window,
+   gboolean horiz_equal, vert_equal;
+   gboolean constraint_already_satisfied;
+   MetaTileMode tile_mode;
++  AspectLock lock;
+ 
+   if (priority > PRIORITY_MAXIMIZATION)
+     return TRUE;
+@@ -1445,28 +1557,18 @@ constrain_maximization (MetaWindow         *window,
+         }
+     }
+ 
+-  /* A window that keeps its content at an aspect ratio
+-   * (luma_window_shape_v1) maximizes to the largest size with that ratio,
+-   * centred in the area it would otherwise fill, rather than stretching its
+-   * content or leaving the client to letterbox a screen-sized window. */
+-  if (window->frame_aspect.set &&
+-      meta_window_is_maximized (window) &&
+-      !meta_window_is_fullscreen (window))
+-    {
+-      int width = target_size.width;
+-      int height = target_size.height;
+-
+-      fit_size_to_frame_aspect (window, &width, &height);
+-      target_size.x += (target_size.width - width) / 2;
+-      target_size.y += (target_size.height - height) / 2;
+-      target_size.width = width;
+-      target_size.height = height;
+-    }
+-
+   /* Check min size constraints; max size constraints are ignored for maximized
+    * windows, as per bug 327543.
+    */
+   get_size_limits (window, &min_size, &max_size);
++
++  /* A locked window maximizes to the largest size with its ratio, centred in
++   * the area it would otherwise fill, rather than stretching its content or
++   * leaving the client to letterbox a screen-sized window. */
++  if (meta_window_is_maximized (window) &&
++      !meta_window_is_fullscreen (window) &&
++      get_aspect_lock (window, &lock))
++    fit_rect_to_aspect_lock (&lock, &min_size, &target_size);
+   hminbad = target_size.width < min_size.width && is_maximized_horizontally;
+   vminbad = target_size.height < min_size.height && is_maximized_vertically;
+   if (hminbad || vminbad)
+@@ -1509,10 +1611,40 @@ constrain_tiling (MetaWindow         *window,
+   gboolean hminbad, vminbad;
+   gboolean horiz_equal, vert_equal;
+   gboolean constraint_already_satisfied;
++  AspectLock lock;
+ 
+   if (priority > PRIORITY_TILING)
+     return TRUE;
+ 
++  /* A tiling manager's tile is the rectangle it asked for. Only a locked
++   * window needs anything done to it there: it takes the largest size with
++   * its ratio inside the tile, centred. While the person resizes it, the
++   * aspect constraint handles it as for a floating window. */
++  if (window->externally_tiled &&
++      !meta_window_is_tiled_side_by_side (window) &&
++      !meta_window_is_maximized (window) &&
++      !meta_window_is_fullscreen (window) &&
++      !info->is_user_action &&
++      info->action_type != ACTION_MOVE &&
++      get_aspect_lock (window, &lock))
++    {
++      target_size = info->current;
++      get_size_limits (window, &min_size, &max_size);
++      fit_rect_to_aspect_lock (&lock, &min_size, &target_size);
++
++      if (check_only || mtk_rectangle_equal (&target_size, &info->current))
++        return mtk_rectangle_equal (&target_size, &info->current);
++
++      meta_topic (META_DEBUG_GEOMETRY,
++                  "Keeping the shape of %s in its tile: %d,%d %dx%d -> %d,%d %dx%d",
++                  window->desc, info->current.x, info->current.y,
++                  info->current.width, info->current.height,
++                  target_size.x, target_size.y,
++                  target_size.width, target_size.height);
++      info->current = target_size;
++      return TRUE;
++    }
++
+   /* Determine whether constraint applies; exit if it doesn't */
+   if (!meta_window_is_tiled_side_by_side (window))
+     return TRUE;
+@@ -1524,13 +1656,21 @@ constrain_tiling (MetaWindow         *window,
+   meta_window_get_tile_area (window, tile_mode, &target_size);
+ 
+   /* Check min size constraints; max size constraints are ignored as for
+-   * maximized windows.
++   * maximized windows. A locked window keeps its shape in the tile instead,
++   * and its minimum size wins over the tile's.
+    */
+   get_size_limits (window, &min_size, &max_size);
+-  hminbad = target_size.width < min_size.width;
+-  vminbad = target_size.height < min_size.height;
+-  if (hminbad || vminbad)
+-    return TRUE;
++  if (get_aspect_lock (window, &lock))
++    {
++      fit_rect_to_aspect_lock (&lock, &min_size, &target_size);
++    }
++  else
++    {
++      hminbad = target_size.width < min_size.width;
++      vminbad = target_size.height < min_size.height;
++      if (hminbad || vminbad)
++        return TRUE;
++    }
+ 
+   /* Determine whether constraint is already satisfied; exit if it is */
+   horiz_equal = target_size.x      == info->current.x &&
+@@ -1741,6 +1881,7 @@ constrain_aspect_ratio (MetaWindow         *window,
+   double alt_width, alt_height;
+   MtkRectangle *start_rect;
+   MtkRectangle client_rect;
++  AspectLock lock;
+ 
+   if (priority > PRIORITY_ASPECT_RATIO)
+     return TRUE;
+@@ -1755,7 +1896,7 @@ constrain_aspect_ratio (MetaWindow         *window,
+       meta_window_is_maximized (window) ||
+       meta_window_is_fullscreen (window) ||
+       meta_window_is_tiled_side_by_side (window) ||
+-      window->externally_tiled ||
++      (window->externally_tiled && !get_aspect_lock (window, &lock)) ||
+       info->action_type == ACTION_MOVE)
+     return TRUE;
+ 
+@@ -2323,6 +2464,7 @@ constrain_inside_work_area (MetaWindow         *window,
+ {
+   MtkRectangle area, min_size, max_size, target;
+   MtkRectangle *rect = &info->current;
++  AspectLock lock;
+ 
+   if (priority > PRIORITY_INSIDE_WORK_AREA)
+     return TRUE;
+@@ -2341,19 +2483,17 @@ constrain_inside_work_area (MetaWindow         *window,
+    * keeping the top-left corner in the work area if even that does not fit. */
+   target.width = MAX (MIN (rect->width, area.width), min_size.width);
+   target.height = MAX (MIN (rect->height, area.height), min_size.height);
+-  /* Shrinking one side alone would undo an aspect ratio a client set through
+-   * luma_window_shape_v1; keep it while it still fits the minimum size. */
+-  if (window->frame_aspect.set &&
+-      (target.width != rect->width || target.height != rect->height) &&
++  /* Shrinking one side alone would undo a locked window's shape; keep it
++   * while it still fits the minimum size. */
++  if ((target.width != rect->width || target.height != rect->height) &&
+       !meta_window_is_maximized (window) &&
+       !meta_window_is_fullscreen (window) &&
+-      !meta_window_is_tiled_side_by_side (window) &&
+-      !window->externally_tiled)
++      get_aspect_lock (window, &lock))
+     {
+       int width = target.width;
+       int height = target.height;
+ 
+-      fit_size_to_frame_aspect (window, &width, &height);
++      fit_size_to_aspect_lock (&lock, &width, &height);
+       if (width >= min_size.width && height >= min_size.height)
+         {
+           target.width = width;
+diff --git a/src/core/window.c b/src/core/window.c
+index 717b52e..5c4ee36 100644
+--- a/src/core/window.c
++++ b/src/core/window.c
+@@ -3294,7 +3294,28 @@ meta_window_set_externally_tiled (MetaWindow *window,
+   /* X11 clients read the same state from _GTK_EDGE_CONSTRAINTS */
+   set_net_wm_state (window);
+   meta_window_frame_size_changed (window);
+-  meta_window_queue (window, META_QUEUE_MOVE_RESIZE);
++
++  /* The state changed even when the frame does not (a window already at
++   * its tile's size, such as one that keeps its shape there): a Wayland
++   * client must be configured with it. A window put in a tile is
++   * constrained to the rectangle it was asked into; one let go of stays
++   * where it is until the tiling manager moves it. */
++  if (window->unconstrained_rect_valid && !window->unmanaging)
++    {
++      MtkRectangle rect = tiled ? window->unconstrained_rect :
++                                  meta_window_config_get_rect (window->config);
++
++      meta_window_move_resize (window,
++                               (META_MOVE_RESIZE_MOVE_ACTION |
++                                META_MOVE_RESIZE_RESIZE_ACTION |
++                                META_MOVE_RESIZE_STATE_CHANGED |
++                                META_MOVE_RESIZE_CONSTRAIN),
++                               rect);
++    }
++  else
++    {
++      meta_window_queue (window, META_QUEUE_MOVE_RESIZE);
++    }
+ }
+ 
+ /**
+diff --git a/src/meta/window.h b/src/meta/window.h
+index 32f3cb2..22d121b 100644
+--- a/src/meta/window.h
++++ b/src/meta/window.h
+@@ -122,6 +122,11 @@ void meta_window_set_externally_tiled (MetaWindow *window,
+ META_EXPORT
+ gboolean meta_window_is_externally_tiled (MetaWindow *window);
+ 
++META_EXPORT
++void meta_window_get_frame_rect_in_tile (MetaWindow         *window,
++                                         const MtkRectangle *tile,
++                                         MtkRectangle       *rect);
++
+ META_EXPORT
+ void meta_window_get_buffer_rect (const MetaWindow *window,
+                                   MtkRectangle     *rect);
+diff --git a/src/wayland/meta-window-wayland.c b/src/wayland/meta-window-wayland.c
+index 5c7875f..6f7e25c 100644
+--- a/src/wayland/meta-window-wayland.c
++++ b/src/wayland/meta-window-wayland.c
+@@ -656,10 +656,16 @@ meta_window_wayland_move_resize_internal (MetaWindow                *window,
+       flags & META_MOVE_RESIZE_WAYLAND_STATE_CHANGED)
+     *result |= META_MOVE_RESIZE_RESULT_STATE_CHANGED;
+ 
++  /* A window a tiling manager holds in a tile keeps the tile as the
++   * rectangle it asked for: the size the client commits there (smaller, for a
++   * window that keeps its shape) must not replace it, or the window could
++   * not fill the tile again once it lets go of its shape. */
+   last_acked_configuration = wl_window->last_acked_configuration;
+   if ((last_acked_configuration &&
+        last_acked_configuration->config &&
+-       meta_window_config_is_floating (last_acked_configuration->config)) ||
++       meta_window_config_is_floating (last_acked_configuration->config) &&
++       !(window->externally_tiled &&
++         flags & META_MOVE_RESIZE_WAYLAND_FINISH_MOVE_RESIZE)) ||
+       (can_move_now &&
+        !(flags & META_MOVE_RESIZE_WAYLAND_FINISH_MOVE_RESIZE)))
+     *result |= META_MOVE_RESIZE_RESULT_UPDATE_UNCONSTRAINED;

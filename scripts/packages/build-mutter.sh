@@ -149,6 +149,8 @@ luma_assert_spec_release "$rpmbuild_dir/SPECS/mutter.spec" \
         ./usr/lib64/libmutter-18.so.0.0.0
       grep -aFq "keeps its content at %d:%d" \
         ./usr/lib64/libmutter-18.so.0.0.0
+      grep -aFq "Keeping the shape of %s in its tile" \
+        ./usr/lib64/libmutter-18.so.0.0.0
       grep -aFq "Window stream crop is the window frame" \
         ./usr/lib64/libmutter-18.so.0.0.0
       grep -aFq "Pausing screen cast session %s" \
