@@ -24,7 +24,6 @@
 #include "luma-surface-backdrop.h"
 #include "luma-window-shape.h"
 #include "luma-window-capture.h"
-#include "luma-restore.h"
 #include "luma-save-sheet.h"
 
 /* LumaUI parts (ADR-052): the C twins of luma_appkit's structure_*, action_*

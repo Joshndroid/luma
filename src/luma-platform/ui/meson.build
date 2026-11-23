@@ -20,7 +20,6 @@ ui_headers = files(
   'luma-surface-backdrop.h',
   'luma-window-shape.h',
   'luma-window-capture.h',
-  'luma-restore.h',
   'luma-save-sheet.h',
   'luma-ui.h',
 )
@@ -125,7 +124,6 @@ ui_sources = files(
   'luma-surface-backdrop.c',
   'luma-window-shape.c',
   'luma-window-capture.c',
-  'luma-restore.c',
   'luma-save-sheet.c',
   'luma-ui-init.c',
 )
