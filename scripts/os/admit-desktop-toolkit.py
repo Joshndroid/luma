@@ -19,11 +19,11 @@ a = p.parse_args()
 # new successful matching toolkit cohort with refreshed run/archive receipts.
 # Whole-archive digests are GitHub's retained upload identities, not rebuild hashes.
 artifacts = {
-    'aarch64': (14733963929, '9d5e859e30747857ca751d253ea87af60c26ed8c8676d9fe8eabaa291217b947'),
-    'x86_64': (14733887681, 'c21bd11c575503f4d3fe3e95b63a0635d4f1cbf6c4d712884080d2ff6d95faa9'),
+    'aarch64': (14790669597, '90459561742553a8d12af4b90bba47d3b6e2c9ccfb55d2110e27cbc9ba5e1052'),
+    'x86_64': (14790109863, '8cd53f75919d088b8304cd88f63abc449c3b0c27f81892dbd1a6989895825fd1'),
 }
-run = 44970738814
-source = '5a9576a708425c01169fe03e9d08471333514c2c'
+run = 45112493484
+source = '6159b0c7ea39682355f04444b1a118c3709365c8'
 merge = source
 repo = 'SimplyLuma/luma'
 # Apply the same verified source and consumed-pin checks to the pinned whole
