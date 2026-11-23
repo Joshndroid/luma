@@ -49,6 +49,10 @@ _DEFAULT_RECTS = {
 
 STROKE_POSITIONS = ("inside", "center", "outside")
 
+#: How a scene gives way to the next, and the fade's range in milliseconds.
+TRANSITIONS = ("cut", "fade")
+TRANSITION_MS = (100, 2000)
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
@@ -129,36 +133,136 @@ class Effects:
         return float(math.ceil(reach + self.shadow_blur * 1.5 + max(abs(self.shadow_x), abs(self.shadow_y))) + 1)
 
 
+#: A source's shared settings: a widget's name, what it captures and how it sounds. Everything else
+#: (placement, crop, stacking, visibility, lock and Look) belongs to the widget in its scene.
+SHARED = ("name", "source", "volume_db", "muted", "monitor")
+
+#: Source settings that never make two sources different (what was learnt about the picture).
+_LEARNT = ("size", "sized")
+
+
 @dataclass
-class Widget:
+class Source:
+    """What one or more widgets show or play: a capture and its settings, shared by every scene that
+    uses it. A widget pasted linked into another scene uses the same Source; renaming it, choosing
+    another camera mode or changing its gain changes it in every scene."""
+
     id: str
     kind: str
-    name: str
-    x: float = 0.0
-    y: float = 0.0
-    width: float = 0.0
-    height: float = 0.0
-    visible: bool = True
-    locked: bool = False
-    effects: Effects = field(default_factory=Effects)
+    name: str = ""
+    #: The capture's settings: the portal's restore token, an image path, a camera and its mode, a
+    #: device, and "size" ([width, height] in source pixels) once known.
+    settings: dict = field(default_factory=dict)
     #: Sound: volume in dB, mute, and the monitor ("off", "only": heard here and not sent, "both").
     volume_db: float = 0.0
     muted: bool = False
     monitor: str = "off"
-    #: Source settings: the portal's restore token and stream id, an image path, a device,
-    #: and "size" ([width, height] in source pixels) once known.
-    source: dict = field(default_factory=dict)
+
+    def copy(self, new_id_: str) -> "Source":
+        return Source(new_id_, self.kind, self.name, copy.deepcopy(self.settings), self.volume_db, self.muted,
+                      self.monitor)
+
+    def identity(self) -> tuple | None:
+        """What makes two sources the same one (None: nothing chosen that two widgets could share)."""
+        settings = {k: v for k, v in self.settings.items() if k not in _LEARNT}
+        if self.kind in ("display", "window", "app-audio") and not settings.get("restore-token"):
+            return None
+        if self.kind == "camera" and not settings.get("camera"):
+            return None
+        if self.kind == "image" and not settings.get("path"):
+            return None
+        return (self.kind, self.name, json.dumps(settings, sort_keys=True, default=str), float(self.volume_db),
+                bool(self.muted), self.monitor)
+
+
+@dataclass(init=False)
+class Widget:
+    """A source placed in one scene. ``name``, ``source`` (the capture's settings), ``volume_db``,
+    ``muted`` and ``monitor`` are its Source's (``shared``), the same in every scene linked to it;
+    the rest is this scene's own."""
+
+    id: str
+    kind: str
+    x: float
+    y: float
+    width: float
+    height: float
+    visible: bool
+    locked: bool
+    effects: Effects
     #: Distorted on purpose (a Shift-drag): its box keeps a shape other than the source's.
-    stretched: bool = False
+    stretched: bool
     #: The placement (x, y, width, height) on each canvas format it has been shown in; the
     #: current format's lives in x/y/width/height and is copied here when the format changes.
-    placements: dict = field(default_factory=dict)
+    placements: dict
     #: Groups that are this widget's own on the secondary canvas ("placement": True). A group not
     #: listed is linked: the secondary canvas derives it from the primary one.
-    own: dict = field(default_factory=dict)
+    own: dict
     #: The secondary canvas's own Look values ({"vertical": {"stroke_width": 12}}): a property listed
     #: there is its own; any other follows the primary canvas's Look (``effects``).
-    look: dict = field(default_factory=dict)
+    look: dict
+    shared: Source
+
+    def __init__(self, id: str, kind: str, name: str = "", x: float = 0.0, y: float = 0.0, width: float = 0.0,
+                 height: float = 0.0, visible: bool = True, locked: bool = False, effects: Effects | None = None,
+                 volume_db: float = 0.0, muted: bool = False, monitor: str = "off", source: dict | None = None,
+                 stretched: bool = False, placements: dict | None = None, own: dict | None = None,
+                 look: dict | None = None, shared: Source | None = None) -> None:
+        self.id, self.kind = id, kind
+        self.x, self.y, self.width, self.height = x, y, width, height
+        self.visible, self.locked = visible, locked
+        self.effects = effects if effects is not None else Effects()
+        self.stretched = stretched
+        self.placements = placements if placements is not None else {}
+        self.own = own if own is not None else {}
+        self.look = look if look is not None else {}
+        self.shared = shared if shared is not None else Source(id, kind, name, source if source is not None else {},
+                                                               volume_db, muted, monitor)
+
+    @property
+    def link(self) -> str:
+        """Its source's id: what its capture, its portal share and its errors are known by."""
+        return self.shared.id
+
+    @property
+    def name(self) -> str:
+        return self.shared.name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        self.shared.name = value
+
+    @property
+    def source(self) -> dict:
+        return self.shared.settings
+
+    @source.setter
+    def source(self, value: dict) -> None:
+        self.shared.settings = value
+
+    @property
+    def volume_db(self) -> float:
+        return self.shared.volume_db
+
+    @volume_db.setter
+    def volume_db(self, value: float) -> None:
+        self.shared.volume_db = value
+
+    @property
+    def muted(self) -> bool:
+        return self.shared.muted
+
+    @muted.setter
+    def muted(self, value: bool) -> None:
+        self.shared.muted = value
+
+    @property
+    def monitor(self) -> str:
+        return self.shared.monitor
+
+    @monitor.setter
+    def monitor(self, value: str) -> None:
+        self.shared.monitor = value
 
     @property
     def natural_aspect(self) -> float | None:
@@ -208,6 +312,9 @@ class Project:
     primary: str = "landscape"
     #: The scene Streamy opens on (None: the one last shown).
     startup: str | None = None
+    #: How one scene gives way to the next: "cut" or "fade" over ``transition_ms``.
+    transition: str = "fade"
+    transition_ms: int = 300
 
     # ── Canvas ──
 
@@ -460,10 +567,8 @@ class Project:
 
     def duplicate_scene(self, scene_id: str) -> Scene:
         source = self._require_scene(scene_id)
-        copy_ = Scene(new_id("scene"), f"{source.name} copy",
-                      [copy.deepcopy(w) for w in source.widgets])
-        for w in copy_.widgets:
-            w.id = new_id(w.kind)
+        # The copy's widgets are linked to the same sources: nothing opens twice, nothing asks again.
+        copy_ = Scene(new_id("scene"), f"{source.name} copy", [self._entry(w, linked=True) for w in source.widgets])
         self.scenes.insert(self.scenes.index(source) + 1, copy_)
         return copy_
 
@@ -539,11 +644,85 @@ class Project:
                     w.name = self._next_widget_name(scene, w.kind)
 
     def find_widget(self, widget_id: str) -> tuple[Scene, Widget]:
+        """The widget ``widget_id``; or, given a source's id, a widget using that source (the active
+        scene's first)."""
         for scene in self.scenes:
             w = scene.widget(widget_id)
             if w is not None:
                 return scene, w
+        uses = self.uses(widget_id)
+        if uses:
+            return next(((s, w) for s, w in uses if s.id == self.active), uses[0])
         raise ModelError(f"no widget {widget_id!r}")
+
+    # ── Sources shared between scenes ──
+
+    @property
+    def sources(self) -> dict[str, Source]:
+        """Every source a scene uses, by id (a source no scene uses is gone)."""
+        found: dict[str, Source] = {}
+        for scene in self.scenes:
+            for w in scene.widgets:
+                found.setdefault(w.link, w.shared)
+        return found
+
+    def uses(self, link: str) -> list[tuple[Scene, Widget]]:
+        """Every widget using source ``link``, scene by scene."""
+        return [(scene, w) for scene in self.scenes for w in scene.widgets if w.link == link]
+
+    def other_scenes(self, w: Widget) -> list[Scene]:
+        """The other scenes that use ``w``'s source (linked to it)."""
+        mine = next((s for s in self.scenes if any(x is w for x in s.widgets)), None)
+        seen: list[Scene] = []
+        for scene, _x in self.uses(w.link):
+            if scene is not mine and scene not in seen:
+                seen.append(scene)
+        return seen
+
+    def is_linked(self, w: Widget) -> bool:
+        return bool(self.other_scenes(w))
+
+    def _entry(self, w: Widget, *, linked: bool, kind_name: Scene | None = None) -> Widget:
+        """A new widget entry placed and styled as ``w``: its source shared (``linked``) or a copy of it."""
+        twin = Widget(new_id(w.kind), w.kind, x=w.x, y=w.y, width=w.width, height=w.height, visible=w.visible,
+                      locked=w.locked, effects=copy.deepcopy(w.effects), stretched=w.stretched,
+                      placements=copy.deepcopy(w.placements), own=copy.deepcopy(w.own), look=copy.deepcopy(w.look),
+                      shared=w.shared)
+        if not linked:
+            twin.shared = w.shared.copy(twin.id)
+            # A share of its own: a portal's restore token is single-use (its picker comes up once).
+            twin.source.pop("restore-token", None)
+            if kind_name is not None:
+                twin.name = ""
+                twin.name = self._next_widget_name(kind_name, w.kind)
+        return twin
+
+    def paste_widget(self, scene_id: str, w: Widget, *, linked: bool = True) -> Widget:
+        """``w`` (copied from any scene) on top of scene ``scene_id``, where it was: linked to the same
+        source, or with a source of its own. Its placement and Look start as ``w``'s and are its own."""
+        scene = self._require_scene(scene_id)
+        twin = self._entry(w, linked=linked, kind_name=scene)
+        if any(x is w or (x.x, x.y, x.width, x.height) == (w.x, w.y, w.width, w.height) and x.link == w.link
+               for x in scene.widgets) and w.has_picture:
+            twin.x, twin.y = w.x + 40, w.y + 40  # beside the one it was copied from
+            for fmt in list(twin.placements):
+                if fmt == self.format:
+                    twin.placements[fmt] = [twin.x, twin.y, twin.width, twin.height]
+        scene.widgets.append(twin)
+        return twin
+
+    def unlink(self, widget_id: str) -> Widget:
+        """``widget_id`` keeps its source (and its open capture); every other scene's widget that used it
+        moves to one copy of it, so changes no longer reach across."""
+        _scene, w = self.find_widget(widget_id)
+        others = [x for _s, x in self.uses(w.link) if x is not w]
+        if not others:
+            return w
+        shared = w.shared.copy(new_id(w.kind))
+        shared.settings.pop("restore-token", None)  # single-use: the copy is shared again when shown
+        for x in others:
+            x.shared = shared
+        return w
 
     def remove_widget(self, widget_id: str) -> tuple[Scene, int, Widget]:
         scene, w = self.find_widget(widget_id)
@@ -630,14 +809,20 @@ class Project:
         for scene in self.scenes:
             widgets = []
             for w in scene.widgets:
-                raw = asdict(w)
-                for key in ("x", "y", "width", "height", "placements", "own", "look"):
-                    raw.pop(key)
+                raw = {"id": w.id, "kind": w.kind, "visible": w.visible, "locked": w.locked,
+                       "effects": asdict(w.effects), "stretched": w.stretched, "link": w.link,
+                       # The source's settings again, for a Streamy that reads no "sources".
+                       "name": w.name, "source": copy.deepcopy(w.source), "volume_db": w.volume_db,
+                       "muted": w.muted, "monitor": w.monitor}
                 raw["canvases"] = self._canvas_records(w)
                 widgets.append(raw)
             scenes.append({"id": scene.id, "name": scene.name, "widgets": widgets})
+        sources = [{"id": s.id, "kind": s.kind, "name": s.name, "settings": copy.deepcopy(s.settings),
+                    "volume_db": s.volume_db, "muted": s.muted, "monitor": s.monitor}
+                   for s in self.sources.values()]
         return {"schema": SCHEMA, "format": self.format, "primary": self.primary, "startup": self.startup,
-                "active": self.active, "scenes": scenes}
+                "active": self.active, "scenes": scenes, "sources": sources,
+                "transition": {"kind": self.transition, "ms": self.transition_ms}}
 
     def _canvas_records(self, w: Widget) -> dict:
         records = {}
@@ -662,8 +847,20 @@ class Project:
         project = cls(format=data.get("format", "landscape") if data.get("format") in FORMATS else "landscape",
                       primary=data.get("primary") if data.get("primary") in FORMATS else "landscape")
         effect_names = {f.name for f in fields(Effects)}
-        widget_names = {f.name for f in fields(Widget)} - {"effects", "x", "y", "width", "height", "placements",
-                                                          "own", "look"}
+        widget_names = {"id", "kind", "name", "visible", "locked", "volume_db", "muted", "monitor", "source",
+                        "stretched"}
+        table: dict[str, Source] = {}
+        for raw in data.get("sources") or []:
+            if isinstance(raw, dict) and raw.get("kind") in KINDS and raw.get("id"):
+                table[str(raw["id"])] = Source(str(raw["id"]), raw["kind"], str(raw.get("name") or ""),
+                                               dict(raw.get("settings") or {}), float(raw.get("volume_db", 0.0)),
+                                               bool(raw.get("muted", False)), str(raw.get("monitor") or "off"))
+        transition = data.get("transition")
+        if isinstance(transition, dict):
+            if transition.get("kind") in TRANSITIONS:
+                project.transition = transition["kind"]
+            if isinstance(transition.get("ms"), (int, float)):
+                project.transition_ms = int(_clamp(transition["ms"], *TRANSITION_MS))
         for raw in data.get("scenes", []):
             scene = Scene(str(raw["id"]), str(raw.get("name") or "Scene"))
             for rw in raw.get("widgets", []):
@@ -671,6 +868,12 @@ class Project:
                     continue  # a kind from a newer version
                 effects = Effects(**{k: v for k, v in (rw.get("effects") or {}).items() if k in effect_names})
                 w = Widget(**{k: v for k, v in rw.items() if k in widget_names}, effects=effects.clamped())
+                link = rw.get("link")
+                if link and link in table and table[link].kind == w.kind:
+                    w.shared = table[link]
+                elif link:
+                    w.shared.id = str(link)
+                    table[w.link] = w.shared
                 if isinstance(rw.get("canvases"), dict):
                     project._read_records(w, rw["canvases"])
                 else:
@@ -678,10 +881,29 @@ class Project:
                 project._place(w)
                 scene.widgets.append(w)
             project.scenes.append(scene)
+        if not data.get("sources"):
+            project._merge_identical()
         active = data.get("active")
         project.startup = data.get("startup") if project.scene(data.get("startup")) else None
         project.active = active if project.scene(active) else (project.scenes[0].id if project.scenes else None)
         return project
+
+    def _merge_identical(self) -> None:
+        """A project saved before sources were shared: a source in several scenes, identical in each
+        (a duplicated scene's camera, display or microphone), becomes one source linked across them.
+        Placements and Looks stay each scene's own."""
+        first: dict[tuple, Source] = {}
+        for scene in self.scenes:
+            taken: set[tuple] = set()
+            for w in scene.widgets:
+                key = w.shared.identity()
+                if key is None or key in taken:
+                    continue
+                taken.add(key)
+                if key in first:
+                    w.shared = first[key]
+                else:
+                    first[key] = w.shared
 
     def _read_records(self, w: Widget, records: dict) -> None:
         for fmt, record in records.items():

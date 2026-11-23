@@ -183,6 +183,7 @@ def check(app) -> None:
     outputs(win)
     inspector(win)
     several(win)
+    linked(win)
     unplugged(win)
     win.close()  # the engine stops with the window, before the interpreter goes
     pump(1.0)
@@ -254,6 +255,97 @@ def several(win) -> None:
     assert any(getattr(r, "label", "") == "Delete 2 widgets" for r in win._last_menu if r is not None)
     win.select(None)
     print("several: list and canvas agree, Mixed, one undo step per command")
+
+
+def linked(win) -> None:
+    """Copy a camera, paste it linked into another scene: one capture, the link shows, each scene keeps its
+    own place; Paste as new, Unlink and deleting the last use each do what they say (and undo)."""
+    from luma_streamy.model import FORMATS as FORMATS_ALL
+
+    first = next(sc for sc in win.project.scenes if any(w.kind == "camera" for w in sc.widgets))
+    win.switch_scene(first.id)
+    pump(0.3)
+    cam = next(w for w in first.widgets if w.kind == "camera")
+    link = cam.link  # (an unlink and its undo replace the objects; the ids stay)
+    win.select(cam.id)
+    win.copy_selected()
+    other = win.project.add_scene()  # (new_scene would put the focus in its name field: Ctrl+V types there)
+    win.switch_scene(other.id)
+    pump(0.3)
+    feeds = {k: id(f) for k, f in win.engine.feeds.items()}
+    win.paste()
+    pump_until(lambda: win.engine.branches.get(win.selected) is not None, 3)
+    pasted = win.project.active_scene.widget(win.selected)
+    assert pasted.link == cam.link and pasted.id != cam.id
+    assert {k: id(f) for k, f in win.engine.feeds.items()} == feeds, "the paste opened its camera again"
+    assert win._also_in(pasted) == f"Also in {first.name}", win._also_in(pasted)
+    row = win._widget_rows[pasted.id]
+    assert row.get_tooltip_text() == f"Also in {first.name}"
+    win.project.set_rect(pasted.id, 0, 0, 1920, 1080)
+    assert win.project.find_widget(cam.id)[1].width != 1920, "resizing in one scene moved the other"
+    # Switching between scenes that share it, mid-drag, and pasting there: the previews never hear of a
+    # widget they don't hold (no GLib criticals; they are only on stderr, so stderr is read here).
+    import tempfile as _tempfile
+
+    log = _tempfile.TemporaryFile()
+    saved = os.dup(2)
+    os.dup2(log.fileno(), 2)
+    try:
+        win._canvas_changed(pasted.id, 100, 100, 800, 450)
+        pump(0.2)
+        # A source's new picture size (a reconnect, an unlock) reshapes every scene's widget of it.
+        win._source_size(None, link, 1280, 720)
+        win._source_size(None, link, 1920, 1080)
+        pump(0.2)
+        for target in (first, other, first, other):
+            win.switch_scene(target.id)
+            pump(0.4)
+        win.copy_selected()
+        win.paste()
+        pump(0.4)
+        win.undo()
+        pump(0.3)
+        win.switch_scene(first.id)
+        pump(0.4)
+        win.switch_scene(other.id)
+        pump(0.4)
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+    log.seek(0)
+    criticals = [line for line in log.read().decode(errors="replace").splitlines() if "CRITICAL" in line]
+    assert not criticals, criticals[:5]
+    pasted = win.project.active_scene.widget(pasted.id)
+    win.select(pasted.id)
+    titles = [getattr(r, "label", "") for r in (win._widget_menu(pasted.id, win.arrange) or win._last_menu) if r]
+    assert "Unlink from other scenes" in titles and "Paste as new widget" in titles, titles
+    win.paste(linked=False)
+    pump(0.3)
+    own = win.project.active_scene.widget(win.selected)
+    assert own.link != cam.link and not win.project.is_linked(own)
+    win.unlink_widget(win.project.active_scene.widget(pasted.id))
+    pump(0.3)
+    assert not win.project.is_linked(win.project.active_scene.widget(pasted.id))
+    win.undo()  # linked again
+    pump(0.3)
+    again = win.project.active_scene.widget(pasted.id)
+    assert win.project.is_linked(again)
+    # Delete removes it from this scene only; the source stays while the first scene uses it.
+    win.select(pasted.id)
+    win.delete_selected()
+    pump(0.3)
+    assert link in win.project.sources, (link, list(win.project.sources))
+    assert pump_until(lambda: win.engine.has_source(link), 3), (link, [(k, f.links) for k, f in win.engine.feeds.items()])
+    win.delete_scene(other.id)
+    pump(0.3)
+    win.switch_scene(first.id)
+    pump(0.3)
+    # Each canvas's ⋯ menu builds (its rows name methods that exist).
+    for fmt in FORMATS_ALL:
+        rows = win._canvas_more(fmt)
+        assert rows and all(callable(getattr(r, "on_activate", None)) or r is None or isinstance(r, str)
+                            for r in rows), rows
+    print("linked: paste keeps one capture, places stay each scene's, paste as new, unlink and delete")
 
 
 def inspector(win) -> None:

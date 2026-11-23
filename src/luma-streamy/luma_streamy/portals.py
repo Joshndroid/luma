@@ -890,15 +890,16 @@ class Portals:
         """The engine's question: a PipeWire connection of its own (pipewiresrc owns it) and the node
         (an object.serial, or "path:<id>"). Connections are opened ahead without waiting on the portal;
         when none is ready this says (None, None) and ``on_ready(widget_id)`` follows once one is."""
-        capture = self.captures.get(widget.id)
+        key = getattr(widget, "link", widget.id)  # captures are a source's, shared by its widgets
+        capture = self.captures.get(key)
         if capture is None:
             return None, None
         target = capture.node or (f"path:{capture.path}" if capture.path else None)
         if capture.pool:
             fd = capture.pool.pop()
-            self._refill(widget.id, capture)
+            self._refill(key, capture)
             return fd, target
-        self._refill(widget.id, capture, notify=True)
+        self._refill(key, capture, notify=True)
         return None, None
 
     def _refill(self, widget_id: str, capture: "Capture", notify: bool = False) -> None:

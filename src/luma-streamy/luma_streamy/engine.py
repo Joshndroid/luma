@@ -3,11 +3,17 @@
 
 Python only builds and edits the graph; every frame stays in GStreamer.
 
-- One program pipeline: the active scene's widgets → lumaframe → glvideomixer
-  → tee (preview, and a tap for the encoders), and its sound widgets →
-  audiomixer → tee. Only the active scene's visible widgets capture; a widget
-  that leaves the scene or is hidden is set to NULL and taken out, so its
-  capture stops. Its portal session stays open (no picker when it returns).
+- One program pipeline. Every source a scene uses is captured once (a feed: a
+  camera by its device and mode, anything else by its source id), shared by
+  every widget of every scene that shows it, and kept open while the program
+  runs. Each visible picture widget is a layer per canvas (valve → queue →
+  lumaframe → glvideomixer pad); only the active scene's layers pass pictures
+  and have alpha. Sound feeds go through a gate (volume) into the audiomixer.
+  A scene switch only changes which layers draw: nothing opens or closes.
+- Transitions (cut, fade) are keyframes on the mixer pads' alpha (and the sound
+  gates' volume) on the program clock, so every frame of the preview, the
+  streams and the recordings shows the same step. A picture in both scenes
+  glides from its old place to its new one instead of fading.
 - Outputs (a recording, a stream) are pipelines of their own, fed from the
   taps by appsrc. They exist only while recording or live, and a failure in
   one (a dropped connection) never stops the program or the other output.
@@ -27,13 +33,34 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstBase", "1.0")
-from gi.repository import GLib, GObject, Gst, GstBase  # noqa: E402,F401 (GstBase: Aggregator.peek_next_sample)
+gi.require_version("GstController", "1.0")
+from gi.repository import GLib, GObject, Gst, GstBase, GstController  # noqa: E402,F401 (GstBase: Aggregator.peek_next_sample)
 
 from . import graph  # noqa: E402
 from .graph import ALPHA_FORMATS, ALPHA_FOURCCS, Chain, Element, EncoderChoice, only_alpha, prefer_alpha  # noqa: E402,F401
 from .model import FORMATS, Project, Scene, Widget  # noqa: E402
 
 FADE_MS = 300
+#: A change of scene starts this far ahead (two program frames), so every layer it shows has its first
+#: picture in the mixer by then: the switch is frame-accurate on every canvas, the outputs' too.
+LEAD_NS = 2 * Gst.SECOND // 60
+LEAD_MS = 34
+#: A parked camera has this long to send its next picture before a change of scene starts without it.
+PARKED_WAIT_MS = 250
+#: Mixer pad stacking: each scene's widgets in their order, the shown scene above the one it replaces.
+ZSTEP = 10_000
+
+
+def _smooth(t: float) -> float:
+    """Ease in and out (smoothstep)."""
+    return t * t * (3 - 2 * t)
+
+
+def _fade_out(t: float) -> float:
+    """The outgoing scene's fade: slow at first, under the incoming one's ease (so a picture in the same
+    place in both scenes barely dims), all gone at the end."""
+    e = _smooth(t)
+    return e * e
 
 #: The GL display every program pipeline in this process shares (a gst.gl.GLDisplay context). Each pipeline
 #: making its own would open the same EGLDisplay underneath, and an old program's eglTerminate as its display
@@ -250,6 +277,9 @@ def choose_encoders(codec: str) -> EncoderChoice | None:
 #: A capture that has sent no picture in this long says so ("waiting"). It is not a failure:
 #: a window cast sends nothing until the window redraws, so the stream stays open.
 FIRST_PICTURE_S = 8
+#: A camera whose GPU decoding stops after it showed pictures (its picture size changed) is opened on the
+#: GPU again at most this often; a second stop within it moves it to software decoding.
+GPU_REOPEN_S = 60
 #: A change no frame has shown after this long (its source sends nothing new) is applied directly.
 SETTLE_S = 2.0
 
@@ -300,40 +330,139 @@ def log(text: str) -> None:
 
 
 @dataclass
-class Branch:
-    widget_id: str
+class Feed:
+    """One capture (a source's pictures or sound), shared by every widget that shows it."""
+
+    key: str
+    #: The id its element names carry ("w-<id>-g<n>-…"): the source id of the widget it was opened for.
+    name_id: str
     elements: list[Gst.Element]
-    pad: Gst.Pad | None = None
     picture: bool = True
-    fade: int = 0
+    #: The sound mixer's pad it feeds, and its gate (a volume element faded on the program clock).
+    pad: Gst.Pad | None = None
+    gate: "Animation | None" = None
+    gate_on: bool = True
+    #: A camera's park valve (before decoding): closed while no shown scene uses it.
+    park: Gst.Element | None = None
+    parked: bool = False
+    #: A parked camera passes nothing (its next picture is waited for); a parked screen one picture a
+    #: second (it may send nothing new for long), so a switch shows a recent one at once.
+    waits: bool = False
+    passed: float = 0.0
     shown: bool = False
     watchdog: int = 0
     generation: int = 0
     monitor: list = field(default_factory=list)
     monitor_device: str | None = None
-    #: A picture: its layer on each canvas composited (canvas -> Layer), the widget as last shown,
-    #: its stacking place, and the source's last crop region.
-    layers: dict = field(default_factory=dict)
-    view: Widget | None = None
-    zorder: int = 0
+    #: The source's last crop region (width, height, (x, y, w, h) or None).
     crop: tuple | None = None
     #: A picture that never changes by itself (an image, a card): the preview may rest while only these show.
     still: bool = False
     #: The device it opens (a camera: one stream at a time, see Engine._releasing) and when it started.
     device: str = ""
     started: float = 0.0
-    #: Its newest picture (on the GPU, as its layers take it): a resize draws it again at once
-    #: (Engine._redraw) instead of waiting for the source's next frame, which a still window sends
-    #: only as a keepalive.
+    #: Its newest picture (on the GPU, as its layers take it): a layer that starts drawing (a scene
+    #: switch, a resize) draws it at once instead of waiting for the source's next frame.
     last: Gst.Buffer | None = None
     #: Out of the program: a late probe keeps no picture (its GPU memory would hold a GL context).
     closed: bool = False
-    #: Its source has sent a buffer (what it sends reaches the branch; a picture may not, yet).
+    #: Its source has sent a buffer (what it sends reaches the feed; a picture may not, yet).
     sourced: bool = False
+    #: The widgets drawn or heard from it (widget id -> source id).
+    users: dict = field(default_factory=dict)
+
+    @property
+    def links(self) -> list[str]:
+        """The sources it shows (a camera's feed can serve two sources on the same device)."""
+        return sorted(set(self.users.values())) or [self.name_id]
+
+
+@dataclass
+class Branch:
+    """A widget of one scene drawn (or heard) from its feed: a layer per canvas, placed and styled as
+    that scene has it."""
+
+    widget_id: str
+    feed: Feed
+    scene_id: str | None = None
+    view: Widget | None = None
+    zorder: int = 0
+    #: canvas -> Layer
+    layers: dict = field(default_factory=dict)
+    #: FADE_MS once its first picture has faded in (it shows), else 0.
+    fade: int = 0
+
+    @property
+    def elements(self) -> list[Gst.Element]:
+        return self.feed.elements
+
+    @property
+    def picture(self) -> bool:
+        return self.feed.picture
+
+    @property
+    def shown(self) -> bool:
+        return self.feed.shown
+
+    @property
+    def still(self) -> bool:
+        return self.feed.still
+
+    @property
+    def device(self) -> str:
+        return self.feed.device
+
+    @property
+    def pad(self) -> Gst.Pad | None:
+        return self.feed.pad
+
+    @property
+    def generation(self) -> int:
+        return self.feed.generation
 
     def frame(self, fmt: str = "landscape") -> Gst.Element | None:
         layer = self.layers.get(fmt)
         return layer.frame if layer is not None else None
+
+
+class Animation:
+    """One property animated on the program clock: keyframes in a GstController control source bound
+    to it (absolute values), sampled by its element for every frame (or sample) it produces."""
+
+    def __init__(self, target: Gst.Object, prop: str, value: float) -> None:
+        self.target, self.prop = target, prop
+        self.source = GstController.InterpolationControlSource()
+        self.source.set_property("mode", GstController.InterpolationMode.LINEAR)
+        self.binding = GstController.DirectControlBinding.new_absolute(target, prop, self.source)
+        #: The keyframes set (stream time, value), kept here too: what it is at any time, from Python.
+        self.points: list[tuple[int, float]] = []
+        self.hold(value)
+        target.add_control_binding(self.binding)
+
+    def value_at(self, stream_time: int) -> float:
+        points = self.points
+        if stream_time <= points[0][0]:
+            return points[0][1]
+        for (t0, v0), (t1, v1) in zip(points, points[1:]):
+            if stream_time <= t1:
+                return v0 + (v1 - v0) * (stream_time - t0) / max(1, t1 - t0)
+        return points[-1][1]
+
+    def hold(self, value: float) -> None:
+        self.source.unset_all()
+        self.points = [(0, float(value))]
+        self.source.set(0, float(value))
+
+    def ramp(self, start: int, points: list[tuple[int, float]]) -> None:
+        """From the value it has at ``start`` through ``points`` (stream time, value); the last stays."""
+        begin = self.value_at(start)
+        self.source.unset_all()
+        self.points = [(max(0, start), begin)] + [(max(0, when), float(value)) for when, value in points]
+        for when, value in self.points:
+            self.source.set(when, value)
+
+    def remove(self) -> None:
+        self.target.remove_control_binding(self.binding)
 
 
 @dataclass
@@ -499,11 +628,22 @@ class Output:
 
 @dataclass
 class Layer:
-    """One picture widget drawn on one canvas: queue ! lumaframe ! mixer-<canvas> pad."""
+    """One picture widget drawn on one canvas: valve ! queue ! lumaframe ! mixer-<canvas> pad. The valve
+    passes pictures only while its scene is shown; its pad's alpha is animated (``alpha``)."""
 
     elements: list[Gst.Element]
     pad: Gst.Pad | None = None
     tee_pad: Gst.Pad | None = None
+    alpha: Animation | None = None
+    #: While gliding: the pad's geometry animations (xpos, ypos, width, height), the box path
+    #: (from, to, start, duration, curve) and the box the lumaframe draws at.
+    glide: list = field(default_factory=list)
+    path: tuple | None = None
+    fmt: str = "landscape"
+
+    @property
+    def valve(self) -> Gst.Element:
+        return self.elements[0]
 
     @property
     def frame(self) -> Gst.Element:
@@ -578,7 +718,24 @@ class Engine(GObject.Object):
         #: The canvases shown (the window's panels); outputs keep theirs running too.
         self.shown_canvases: tuple[str, ...] = ("landscape",)
         self.programs: dict[str, Program] = {}
+        #: The open captures, by source key (Engine.source_key), and the widgets drawn from them, by id.
+        self.feeds: dict[str, Feed] = {}
         self.branches: dict[str, Branch] = {}
+        #: Every scene (the window's project): their sources stay open, ready to show. None: the shown one only.
+        self.scenes_of: Callable[[], list[Scene]] | None = None
+        #: How a change of scene shows: ("cut" | "fade", milliseconds).
+        self.transition: tuple[str, int] = ("fade", FADE_MS)
+        self._active_id: str | None = None
+        self._ranks: dict[str | None, int] = {}
+        self._switch_timer = 0
+        #: Where the last change of scene starts on each canvas (stream time), for checks and logs.
+        self.switched_at: dict[str, int] = {}
+        #: Each layer's lumaframe -> its widget's id; pads placed by a glide's controllers, not by _place.
+        self._frames: dict[Gst.Element, str] = {}
+        self._gliding: set[Gst.Pad] = set()
+        self._shown_ids: frozenset = frozenset()
+        #: A change of scene waiting for parked cameras' first pictures: (previous, active, timer, probes).
+        self._pending: tuple | None = None
         #: Picture widgets without a live picture show a card (graph.placeholder_chain) in their place.
         self.placeholders: dict[str, Branch] = {}
         #: ``widget`` as canvas ``fmt`` has it (its placement and Look there); the window's project knows.
@@ -613,6 +770,7 @@ class Engine(GObject.Object):
         self._supersede_probes: set = set()
         #: Cameras the GPU couldn't decode (VA failed to negotiate): decoded in software from then on.
         self._sw_decode: set[str] = set()
+        self._gpu_reopened: dict[str, float] = {}  # widget id: when its GPU decoding was last reopened
         #: Enum properties last set by nick, per (element name, property): a move never re-sets them.
         self._strings: dict[tuple[str, str], str] = {}
         self._teardown = Teardown()
@@ -686,7 +844,8 @@ class Engine(GObject.Object):
         # Every widget already captured gets its layer here.
         for branch in list(self.branches.values()) + list(self.placeholders.values()):
             if branch.picture and branch.view is not None:
-                self._add_layer(branch, fmt, branch.view, branch.zorder)
+                self._add_layer(branch, fmt, branch.view, branch.zorder,
+                                card=self.placeholders.get(branch.widget_id) is branch)
         self.emit("preview-changed", fmt)
 
     def _add_pacer(self, program: Program) -> None:
@@ -797,18 +956,24 @@ class Engine(GObject.Object):
             return
         # Everything goes to NULL with the pipeline, in one state change, before anything is unlinked or
         # dropped: no branch stops on its own while the mixers it feeds are torn down.
-        branches = list(self.branches.values()) + list(self.placeholders.values())
-        self.branches, self.placeholders = {}, {}
-        for branch in branches:
-            branch.closed, branch.last = True, None  # its GPU memory would keep a GL context alive
+        feeds = list(self.feeds.values()) + [b.feed for b in self.placeholders.values()]
+        self.feeds, self.branches, self.placeholders = {}, {}, {}
+        for feed in feeds:
+            feed.closed, feed.last = True, None  # its GPU memory would keep a GL context alive
         self._placeholder_words.clear()
         self._revs.clear()
         self._applied_rev.clear()
-        devices = [b.device for b in branches if b.device]
-        for branch in branches:
-            if branch.watchdog:
-                GLib.source_remove(branch.watchdog)
-                branch.watchdog = 0
+        self._frames.clear()
+        self._gliding.clear()
+        self._active_id, self._ranks = None, {}
+        if self._switch_timer:
+            GLib.source_remove(self._switch_timer)
+            self._switch_timer = 0
+        devices = [f.device for f in feeds if f.device]
+        for feed in feeds:
+            if feed.watchdog:
+                GLib.source_remove(feed.watchdog)
+                feed.watchdog = 0
         for device in devices:
             self._releasing[device] = self._releasing.get(device, 0) + 1
         pipeline = self.pipeline
@@ -958,36 +1123,75 @@ class Engine(GObject.Object):
 
     def show_scene(self, scene: Scene | None, *, skip: set[str] | frozenset = frozenset(),
                    states: dict[str, str] | None = None) -> None:
-        """Capture exactly the visible widgets of ``scene`` (less ``skip``: ones that failed); stop the rest.
+        """Show ``scene``: its visible widgets draw (less ``skip``: widgets or sources that failed).
 
-        A visible picture widget with no live picture (connecting, failed, nothing chosen: ``states``
-        says which, "connecting" by default) shows its placeholder card through its own lumaframe, so its
-        Look shows. The card is the preview's only: while recording or live it is transparent (its pad's
-        alpha 0), so viewers never see it, and nothing moves (widgets are placed, never laid out)."""
+        Every other scene's visible widgets stay ready (``scenes_of``): their sources open and captured
+        once, shared with any scene that shows them, their layers in place but closed and transparent.
+        A change of scene is then only a change of which layers draw (``transition``), never a reopen.
+
+        A visible picture widget of the shown scene with no live picture (connecting, failed, nothing
+        chosen: ``states`` says which, by widget or source id, "connecting" by default) shows its
+        placeholder card through its own lumaframe, so its Look shows. The card is the preview's only:
+        while recording or live it is transparent (its pad's alpha 0), so viewers never see it."""
         if not self.enabled:
             return
         self._scene, self._skip, self._states = scene, set(skip), dict(states or {})
         states = states or {}
-        shown = [w for w in (scene.widgets if scene else []) if w.visible]
+        active = scene.id if scene is not None else None
+        scenes = [scene] if scene is not None else []
+        if self.scenes_of is not None:
+            scenes += [s for s in self.scenes_of() if s is not None and s.id != active]
         composited = bool(self.wanted_canvases())
+
+        def skipped(w: Widget) -> bool:
+            return w.id in skip or w.link in skip
+
         # No canvas composited: pictures capture nothing (the sound still runs, for its meters).
-        wanted = {w.id: w for w in shown if w.id not in skip and (composited or not w.has_picture)}
+        wanted: dict[str, tuple[str, int, Widget]] = {}
+        for s in scenes:
+            for zorder, w in enumerate(s.widgets):
+                if w.visible and not skipped(w) and (composited or not w.has_picture) and w.id not in wanted:
+                    wanted[w.id] = (s.id, zorder, w)
+        shown = [w for w in (scene.widgets if scene else []) if w.visible]
         if not wanted and not self._sent_canvases() and not (composited and shown):
             self._close()  # nothing to show and nothing sent: no pipeline at all
             return
         self._open()
-        # Branches leave before the compositors they feed change.
-        for widget_id in [i for i in self.branches if i not in wanted]:
+        # One feed per source key; a device (a camera) takes one mode at a time: the shown scene's wins.
+        keys: dict[str, str] = {}
+        devices: dict[str, str] = {}
+        for widget_id, (_sid, _z, w) in wanted.items():
+            key = self.source_key(w)
+            device = self._device(w)
+            if device and devices.setdefault(device, key) != key:
+                continue
+            keys[widget_id] = key
+        # Widgets leave (and feeds nobody uses close) before the compositors they feed change.
+        for widget_id in [i for i, b in self.branches.items() if keys.get(i) != b.feed.key]:
             self._remove_branch(widget_id)
         self._sync_programs()
-        for zorder, widget in enumerate(scene.widgets if scene else []):
-            if widget.id not in wanted:
-                continue
-            if widget.id in self.branches:
-                self.update_widget(widget, zorder)
+        previous, switching = self._active_id, self._active_id != active
+        if switching:
+            self._ranks = {active: 2, previous: 1} if previous is not None else {active: 2}
+        self._active_id = active
+        self._shown_ids = frozenset(w.id for w in (scene.widgets if scene else []))
+        for widget_id, key in keys.items():
+            sid, zorder, w = wanted[widget_id]
+            branch = self.branches.get(widget_id)
+            if branch is not None:
+                branch.scene_id = sid
+                self.update_widget(w, zorder)
             else:
-                self._add_branch(widget, zorder)
-        # Placeholders: every shown picture widget whose capture has no picture yet.
+                self._add_branch(w, zorder, sid, key)
+        pending = self._pending
+        if switching and pending is not None:
+            previous = pending[0]  # still on screen: the change waiting for its pictures never started
+            self._cancel_pending()
+        if switching and previous is not None:
+            self._begin_switch(previous, active)
+        elif self._pending is None:
+            self._sync_shown()
+        # Placeholders: every shown picture widget of this scene whose source has no picture yet.
         cards = {}
         for zorder, widget in enumerate(scene.widgets if scene else []):
             if not composited or not widget.visible or not widget.has_picture:
@@ -995,7 +1199,8 @@ class Engine(GObject.Object):
             branch = self.branches.get(widget.id)
             if branch is not None and branch.shown:
                 continue
-            state = states.get(widget.id) or ("failed" if widget.id in skip else "connecting" if branch else "choose")
+            state = states.get(widget.id) or states.get(widget.link) or (
+                "failed" if skipped(widget) else "connecting" if branch else "choose")
             cards[widget.id] = (widget, zorder, graph.placeholder_words(widget, state))
         for widget_id in [i for i in self.placeholders if i not in cards or
                           self._placeholder_words.get(i) != cards[i][2]]:
@@ -1026,10 +1231,21 @@ class Engine(GObject.Object):
     def _idle_check(self) -> None:
         """Nothing captures, shows or is sent: the program goes, so it costs nothing."""
         def idle() -> bool:
-            return not self.branches and not self._sent_canvases() and not self.placeholders and not self.programs
+            return not self.feeds and not self._sent_canvases() and not self.placeholders and not self.programs
 
         if self.pipeline is not None and idle():
             GLib.idle_add(lambda: (self._close() if idle() else None) and False)
+
+
+    def _on(self, branch: Branch) -> bool:
+        """Its scene is the one shown (a card always is)."""
+        return branch.scene_id is None or branch.scene_id == self._active_id
+
+
+    def _z(self, branch: Branch, zorder: int | None = None) -> int:
+        """Its mixer pads' stacking: the shown scene above the one it replaces, above the rest."""
+        index = branch.zorder if zorder is None else zorder
+        return self._ranks.get(branch.scene_id, 0 if branch.scene_id is not None else 2) * ZSTEP + index + 1
 
     # ── Layers: a picture on each canvas ──
 
@@ -1039,48 +1255,80 @@ class Engine(GObject.Object):
         if program is None or fmt in branch.layers or self.pipeline is None:
             return
         view = self.view_of(widget, fmt)
-        prefix = branch.elements[0].get_name().rsplit("-", 1)[0]
-        chain = graph.layer_chain(view, zorder, prefix, fmt)
+        self._generation += 1
+        prefix = f"{'p' if card else 'l'}-{branch.widget_id}-g{self._generation}"
+        chain = graph.layer_chain(view, self._z(branch, zorder), prefix, fmt)
         elements = [make(e) for e in chain.elements]
-        if branch.fade < FADE_MS and not card:
-            elements[-1].set_property("opacity", view.effects.clamped().opacity * branch.fade / FADE_MS)
+        on = self._on(branch)
+        elements[0].set_property("drop", not on)
         for element in elements:
             self.pipeline.add(element)
         link_all(elements)
-        tee = branch.elements[-1]
+        tee = branch.feed.elements[-1]
         tee_pad = tee.request_pad_simple("src_%u")
         pad = program.mixer.request_pad_simple("sink_%u")
         for name, value in chain.pad.items():
             pad.set_property(name, value)
+        layer = Layer(elements, pad, tee_pad, fmt=fmt)
         if card:
             pad.set_property("alpha", 0.0 if self.outputs else 1.0)
-        layer = Layer(elements, pad, tee_pad)
+        else:
+            layer.alpha = Animation(pad, "alpha", 1.0 if on and branch.fade >= FADE_MS else 0.0)
         if elements[-1].get_static_pad("src").link(pad) != Gst.PadLinkReturn.OK:
             log(f"widget {branch.widget_id}: its layer does not link to {fmt}'s mixer")
+        self._frames[elements[-1]] = branch.widget_id
         self._place(elements[-1], pad, view, chain.pad, True)
         tee_pad.link(elements[0].get_static_pad("sink"))
         branch.layers[fmt] = layer
-        if branch.crop is not None and branch.crop[2] is not None:
-            width, height, (x, y, w, h) = branch.crop
+        feed = branch.feed
+        if feed.crop is not None and feed.crop[2] is not None:
+            width, height, (x, y, w, h) = feed.crop
             x, y = min(x, width - 1), min(y, height - 1)
             self._crop_layer(branch, layer, (x, y, min(w, width - x), min(h, height - y)))
-        self._call_async(self.pipeline, lambda _p, items: [e.sync_state_with_parent() for e in reversed(items)], elements)
+
+        def started(_p, items) -> None:
+            for element in reversed(items):
+                element.sync_state_with_parent()
+            # Its source's newest picture at once: a layer of the shown scene draws it on the next frame,
+            # one of another scene is ready (negotiated, its shaders built) for when that scene shows.
+            GLib.idle_add(lambda: self._push_last(branch, layer) and False)
+
+        self._call_async(self.pipeline, started, elements)
+
+
+    def _push_last(self, branch: Branch, layer: Layer) -> None:
+        """Draw the feed's newest picture through ``layer`` now, stamped now."""
+        feed = branch.feed
+        if feed.last is None or feed.closed or self.pipeline is None or branch.layers.get(layer.fmt) is not layer:
+            return
+        clock = self.pipeline.get_clock()
+        if clock is None:
+            return
+        sink = layer.elements[1].get_static_pad("sink")
+        if sink.get_current_caps() is None:
+            return  # not negotiated yet: its first picture comes from the source itself
+        picture = feed.last.copy()  # the same GPU memory, its own timestamps
+        picture.pts = clock.get_time() - self.pipeline.get_base_time()
+        picture.dts = Gst.CLOCK_TIME_NONE
+        # Pushed on this thread: the pad's stream lock keeps it in turn with the source's own pictures.
+        sink.chain(picture)
 
     def _remove_layer(self, branch: Branch, fmt: str) -> None:
         layer = branch.layers.pop(fmt, None)
         if layer is None or self.pipeline is None:
             return
+        self._end_glide(layer)
+        self._frames.pop(layer.frame, None)
+        if layer.alpha is not None:
+            layer.alpha.hold(0.0)  # hidden now: a mixer keeps compositing a pad's last frame until it goes
         self._forget_pad(layer.pad)
         self._stop_then_unlink(layer.elements, layer.elements[0].get_static_pad("sink"),
                                layer.frame.get_static_pad("src") if layer.pad is not None else None)
 
-    def _style_layer(self, layer: Layer, view: Widget, zorder: int, *, fade: int = FADE_MS,
-                     alpha: float | None = None) -> None:
+    def _style_layer(self, layer: Layer, view: Widget, zorder: int, *, alpha: float | None = None) -> None:
         """Move, resize or restyle one layer live (no renegotiation unless its size changed)."""
         frame = layer.frame
         props = graph.frame_props(view)
-        if fade < FADE_MS:
-            props["opacity"] = props["opacity"] * fade / FADE_MS
         changed = False
         for name, value in props.items():
             if frame.find_property(name) is None:
@@ -1111,9 +1359,9 @@ class Engine(GObject.Object):
         for element in elements:
             self.pipeline.add(element)
         link_all(elements)
-        card = Branch(widget.id, elements, None, True, shown=True, generation=self._generation, view=widget,
-                      zorder=zorder, fade=FADE_MS)
-        card.still = True
+        feed = Feed(f"card:{widget.id}", widget.id, elements, True, shown=True, generation=self._generation,
+                    still=True)
+        card = Branch(widget.id, feed, None, widget, zorder, fade=FADE_MS)
         self.placeholders[widget.id] = card
         self._placeholder_words[widget.id] = words
         for fmt in self.programs:
@@ -1128,15 +1376,16 @@ class Engine(GObject.Object):
         if zorder is not None:
             card.zorder = zorder
         for fmt, layer in card.layers.items():
-            self._style_layer(layer, self.view_of(widget, fmt), card.zorder, alpha=0.0 if self.outputs else 1.0)
+            self._style_layer(layer, self.view_of(widget, fmt), self._z(card), alpha=0.0 if self.outputs else 1.0)
 
     def _remove_placeholder(self, widget_id: str) -> None:
         card = self.placeholders.pop(widget_id, None)
         self._placeholder_words.pop(widget_id, None)
         if card is None:
             return
-        self.branches[f"placeholder:{widget_id}"] = card
-        self._remove_branch(f"placeholder:{widget_id}")
+        for fmt in list(card.layers):
+            self._remove_layer(card, fmt)
+        self._drop_feed(card.feed)
 
     def _sync_placeholder_alpha(self) -> None:
         """Sending or not: the cards are the preview's only."""
@@ -1146,7 +1395,8 @@ class Engine(GObject.Object):
                     layer.pad.set_property("alpha", 0.0 if self.outputs else 1.0)
 
     def update_widget(self, widget: Widget, zorder: int | None = None) -> None:
-        """Move, resize or restyle a widget live on every canvas it is drawn on."""
+        """Move, resize or restyle a widget live on every canvas it is drawn on (its source's settings, a
+        camera's mirror or a sound's gain, reach every widget of that source)."""
         self._update_placeholder(widget, zorder)
         branch = self.branches.get(widget.id)
         if branch is None:
@@ -1154,19 +1404,23 @@ class Engine(GObject.Object):
         branch.view = widget
         if zorder is not None:
             branch.zorder = zorder
+        feed = branch.feed
         if branch.picture:
             for fmt, layer in branch.layers.items():
-                self._style_layer(layer, self.view_of(widget, fmt), branch.zorder, fade=branch.fade)
-            flip = next((e for e in branch.elements if e.get_factory().get_name() == "glvideoflip"), None)
+                if layer.glide:
+                    continue  # it lands where it now is when its glide ends (_end_glide)
+                self._style_layer(layer, self.view_of(widget, fmt), self._z(branch))
+            flip = next((e for e in feed.elements if e.get_factory().get_name() == "glvideoflip"), None)
             if flip is not None:
                 Gst.util_set_object_arg(flip, "method", graph.flip_method(widget))
         else:
-            volume = next(e for e in branch.elements if e.get_factory().get_name() == "volume")
+            volume = next(e for e in feed.elements if e.get_name().endswith("-volume"))
             for name, value in graph.volume_props(widget).items():
                 volume.set_property(name, value)
-            if branch.pad is not None:
-                branch.pad.set_property("mute", widget.monitor == "only")
-            self._sync_monitor(branch, widget)
+            if feed.pad is not None:
+                feed.pad.set_property("mute", widget.monitor == "only")
+            if self._feed_on(feed):
+                self._sync_monitor(feed, widget)
 
     def restack(self, scene: Scene) -> None:
         for zorder, widget in enumerate(scene.widgets):
@@ -1176,43 +1430,88 @@ class Engine(GObject.Object):
                 branch.zorder = zorder
                 for layer in branch.layers.values():
                     if layer.pad is not None:
-                        layer.pad.set_property("zorder", zorder)
+                        layer.pad.set_property("zorder", self._z(branch))
+
+
+    def _restack_all(self) -> None:
+        for branch in list(self.branches.values()) + list(self.placeholders.values()):
+            for layer in branch.layers.values():
+                if layer.pad is not None and layer.pad.get_property("zorder") != self._z(branch):
+                    layer.pad.set_property("zorder", self._z(branch))
 
     @staticmethod
     def device_of(widget: Widget) -> str:
         """The device a widget's capture holds alone: a camera (its PipeWire node takes one format at a
         time, so a stream asking a new mode while the last one still holds it gets no picture)."""
         if widget.kind == "camera":
-            return f"camera:{widget.source.get('camera') or widget.id}"
+            return f"camera:{widget.source.get('camera') or widget.link}"
         return ""
 
-    def _add_branch(self, widget: Widget, zorder: int) -> None:
-        device = "" if self.fake and not os.environ.get("STREAMY_FAKE_DEVICES") else self.device_of(widget)
+
+    def _device(self, widget: Widget) -> str:
+        return "" if self.fake and not os.environ.get("STREAMY_FAKE_DEVICES") else self.device_of(widget)
+
+
+    @staticmethod
+    def source_key(widget: Widget) -> str:
+        """What a feed is shared by: a camera by its device and the picture asked of it (any widget of
+        any source on it shares the one stream), anything else by its source."""
+        if widget.kind == "camera" and widget.source.get("camera"):
+            import json
+
+            # The mirror is drawn after the stream (glvideoflip), so it never reopens the camera.
+            asked = {k: widget.source.get(k) for k in ("mode", "scaled", "fake-caps", "fake-image")}
+            return f"camera:{widget.source['camera']}:{json.dumps(asked, sort_keys=True)}"
+        return f"source:{widget.link}"
+
+    def _add_branch(self, widget: Widget, zorder: int, scene_id: str | None = None, key: str | None = None) -> None:
+        key = key or self.source_key(widget)
+        feed = self.feeds.get(key) or self._open_feed(widget, key)
+        if feed is None:
+            return
+        branch = Branch(widget.id, feed, scene_id, widget, zorder, fade=FADE_MS if feed.shown else 0)
+        feed.users[widget.id] = widget.link
+        self.branches[widget.id] = branch
+        if feed.picture:
+            for fmt in self.programs:
+                self._add_layer(branch, fmt, widget, zorder)
+        elif self._feed_on(feed):
+            self._sync_monitor(feed, widget)
+
+
+    def _open_feed(self, widget: Widget, key: str) -> Feed | None:
+        """Open ``widget``'s source: its capture, once, for every widget that shows it."""
+        device = self._device(widget)
         if device and self._releasing.get(device):
             # The last stream on this device is still stopping: this one opens once it has let go
             # (Engine._released shows the scene again), never beside it.
-            return
+            return None
         fd = node = None
         if not self.fake and self.sources is not None and widget.kind in ("display", "window", "camera", "app-audio"):
             fd, node = self.sources(widget)
             if fd is None:
-                return  # not chosen yet: the window asks the portal first
+                return None  # not chosen yet: the window asks the portal first
         self._generation += 1
+        named = Widget(widget.link, widget.kind, shared=widget.shared)  # its elements carry the source's id
         if widget.has_picture:
             hw = widget.kind == "camera" and (not self.fake or bool(widget.source.get("fake-caps"))) and \
-                widget.id not in self._sw_decode and graph.hardware_decode()
-            chain = graph.picture_chain(widget, zorder, fake=self.fake, fd=fd, node=node, generation=self._generation,
+                key not in self._sw_decode and graph.hardware_decode()
+            chain = graph.picture_chain(named, 0, fake=self.fake, fd=fd, node=node, generation=self._generation,
                                         hw_decode=hw)
         else:
-            chain = graph.sound_chain(widget, fake=self.fake, fd=fd, node=node, generation=self._generation)
+            chain = graph.sound_chain(named, fake=self.fake, fd=fd, node=node, generation=self._generation)
             self._ensure_sound()
         elements = [make(e) for e in chain.elements]
         for element in elements:
             self.pipeline.add(element)
         self._link_chain(elements)
-        branch = Branch(widget.id, elements, None, widget.has_picture, generation=self._generation, view=widget,
-                        zorder=zorder, device=device, started=time.monotonic())
-        branch.still = graph.is_still(widget, self.fake)
+        feed = Feed(key, widget.link, elements, widget.has_picture, generation=self._generation, device=device,
+                    started=time.monotonic())
+        feed.still = graph.is_still(widget, self.fake)
+        feed.park = next((e for e in elements if e.get_name().endswith("-park")), None)
+        feed.waits = widget.kind == "camera"
+        if feed.park is not None and not feed.waits:
+            feed.park.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._trickle, weakref.ref(feed))
         if not widget.has_picture:
             target = self.pipeline.get_by_name(chain.target)
             pad = target.request_pad_simple("sink_%u")
@@ -1223,44 +1522,53 @@ class Engine(GObject.Object):
                 for element in elements:
                     self.pipeline.remove(element)
                 log(f"widget {widget.id} failed: its branch does not link to the mixer")
-                self.emit("widget-failed", widget.id, "stopped")
-                return
-            branch.pad = pad
-        self.branches[widget.id] = branch
+                self.emit("widget-failed", widget.link, "stopped")
+                return None
+            feed.pad = pad
+            gate = next(e for e in elements if e.get_name().endswith("-gate"))
+            feed.gate_on = self._uses_shown(widget)
+            feed.gate = Animation(gate, "volume", 1.0 if feed.gate_on else 0.0)
+        self.feeds[key] = feed
         if widget.has_picture:
-            for fmt in self.programs:
-                self._add_layer(branch, fmt, widget, zorder)
-            # Probes hold their branch weakly: a branch held by a probe on its own pads is a cycle through
+            # Probes hold their feed weakly: a feed held by a probe on its own pads is a cycle through
             # GStreamer the collector never sees, and its elements (and their GL objects) would never go.
-            elements[-1].get_static_pad("sink").add_probe(
-                Gst.PadProbeType.BUFFER, self._first_picture, (weakref.ref(branch), widget))
-            if not branch.still:
-                elements[-1].get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._keep_last,
-                                                              weakref.ref(branch))
-        else:
-            self._sync_monitor(branch, widget)
+            elements[-1].get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._first_picture,
+                                                          weakref.ref(feed))
+            elements[-1].get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._keep_last,
+                                                          weakref.ref(feed))
         # State changes run on GStreamer's thread pool: a source that takes its time
         # (a camera opening, a portal stream negotiating) never holds up the window.
         self._call_async(self.pipeline, lambda _pipeline, items: [e.sync_state_with_parent() for e in reversed(items)],
-                                 elements)
+                         elements)
         if widget.has_picture:
-            branch.watchdog = GLib.timeout_add_seconds(FIRST_PICTURE_S, self._no_picture, branch)
+            feed.watchdog = GLib.timeout_add_seconds(FIRST_PICTURE_S, self._no_picture, feed)
         if not self.fake and widget.kind in ("display", "window", "camera"):
             elements[0].get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._source_buffer,
-                                                        {"branch": weakref.ref(branch), "seen": None})
+                                                        {"feed": weakref.ref(feed), "seen": None})
         alpha = next((e for e in elements if e.get_name().endswith("-alpha")), None)
         if alpha is not None:
-            strict = widget.id not in self._no_alpha
+            strict = key not in self._no_alpha
             elements[0].get_static_pad("src").add_probe(Gst.PadProbeType.QUERY_DOWNSTREAM, self._alpha_first,
-                                                        (alpha, strict, widget.id))
+                                                        (alpha, strict, widget.link))
         if os.environ.get("STREAMY_TRACE"):
-            self._trace(branch, elements)
+            self._trace(feed, elements)
+        return feed
+
+
+    def _uses_shown(self, widget: Widget) -> bool:
+        scene = self._scene
+        return scene is not None and any(w.link == widget.link for w in scene.widgets if w.visible)
+
+
+    def _feed_on(self, feed: Feed) -> bool:
+        """A widget of the shown scene uses it."""
+        return any(self._on(self.branches[i]) for i in feed.users if i in self.branches)
 
     @staticmethod
     def _keep_last(_pad: Gst.Pad, info: Gst.PadProbeInfo, ref) -> Gst.PadProbeReturn:
-        branch = ref()
-        if branch is not None and not branch.closed:
-            branch.last = info.get_buffer()
+        feed = ref()
+        if feed is not None and not feed.closed:
+            feed.last = info.get_buffer()
         return Gst.PadProbeReturn.OK
 
     def _redraw(self, frame: Gst.Element) -> None:
@@ -1269,14 +1577,13 @@ class Engine(GObject.Object):
         sink = frame.get_static_pad("sink")
         peer = sink.get_peer() if sink is not None else None
         queue = peer.get_parent_element() if peer is not None else None
-        widget_id = graph.widget_of(frame.get_name())
-        branch = self.branches.get(widget_id) if widget_id else None
-        if queue is None or branch is None or branch.last is None or branch.still or self.pipeline is None:
+        branch = self.branches.get(self._frames.get(frame, ""))
+        if queue is None or branch is None or branch.feed.last is None or branch.still or self.pipeline is None:
             return
         clock = self.pipeline.get_clock()
         if clock is None:
             return
-        picture = branch.last.copy()  # the same GPU memory, its own timestamps
+        picture = branch.feed.last.copy()  # the same GPU memory, its own timestamps
         picture.pts = clock.get_time() - self.pipeline.get_base_time()
         picture.dts = Gst.CLOCK_TIME_NONE
         self._supersede(frame)
@@ -1316,17 +1623,19 @@ class Engine(GObject.Object):
     def _source_buffer(self, pad: Gst.Pad, info: Gst.PadProbeInfo, state: dict) -> Gst.PadProbeReturn:
         """What a capture actually sends: its caps and, for a window cast, the crop region the window
         is in. The first is logged; a crop that changes (the window resized) is applied and reported."""
-        branch = state["branch"]()
-        if branch is None:
+        feed = state["feed"]()
+        if feed is None:
             return Gst.PadProbeReturn.OK
-        branch.sourced = True
+        feed.sourced = True
         buffer = info.get_buffer()
         caps = pad.get_current_caps()
         if buffer is None or caps is None:
             return Gst.PadProbeReturn.OK
         state["n"] = state.get("n", 0) + 1
+        window = feed.elements[0].get_name().startswith("w-window") or any(
+            e.get_name().endswith("-alpha") for e in feed.elements)
         if state["seen"] is not None:
-            if not branch.widget_id.startswith("window"):
+            if not window:
                 return Gst.PadProbeReturn.REMOVE  # only a window's crop region changes as it goes
             if state["n"] % 10:
                 return Gst.PadProbeReturn.OK  # a window resized shows within a third of a second
@@ -1338,11 +1647,11 @@ class Engine(GObject.Object):
             state["seen"] = seen
             if state.get("logged") is None:
                 state["logged"] = True
-                log(f"widget {branch.widget_id}: {caps.to_string()[:160]}; crop meta {crop or 'none'}")
-                if branch.widget_id.startswith("window"):
+                log(f"source {feed.name_id}: {caps.to_string()[:160]}; crop meta {crop or 'none'}")
+                if window:
                     offered = pad.peer_query_caps(None)
-                    log(f"widget {branch.widget_id}: downstream took {offered.to_string()[:600] if offered else '?'}")
-            GLib.idle_add(self._apply_crop, branch, width, height, crop)
+                    log(f"source {feed.name_id}: downstream took {offered.to_string()[:600] if offered else '?'}")
+            GLib.idle_add(self._apply_crop, feed, width, height, crop)
         return Gst.PadProbeReturn.OK
 
     @staticmethod
@@ -1370,23 +1679,29 @@ class Engine(GObject.Object):
             capsfilter.set_property("caps", Gst.Caps.from_string(chosen))
         return Gst.PadProbeReturn.OK
 
-    def _apply_crop(self, branch: Branch, width: int, height: int, crop) -> bool:
+    def _apply_crop(self, feed: Feed, width: int, height: int, crop) -> bool:
         """A window cast's buffers are the size of the cast and the window a crop region inside them
         (GstVideoCropMeta, often on DMABuf the GL upload takes as it is). The region is the picture:
         lumaframe draws only it (content-x/y/width/height), on the GPU, and it is the widget's shape."""
-        if self.branches.get(branch.widget_id) is not branch:
+        if self.feeds.get(feed.key) is not feed:
             return False
-        branch.crop = (width, height, crop)
+        feed.crop = (width, height, crop)
+        size = (width, height)
         if crop is not None:
             x, y, w, h = crop
             x, y = min(x, width - 1), min(y, height - 1)
             w, h = min(w, width - x), min(h, height - y)
-            for layer in branch.layers.values():
-                self._crop_layer(branch, layer, (x, y, w, h))
-            self.emit("source-size", branch.widget_id, w, h)
-        else:
-            self.emit("source-size", branch.widget_id, width, height)
+            for branch in self._branches_of(feed):
+                for layer in branch.layers.values():
+                    self._crop_layer(branch, layer, (x, y, w, h))
+            size = (w, h)
+        for link in feed.links:
+            self.emit("source-size", link, *size)
         return False
+
+
+    def _branches_of(self, feed: Feed) -> list[Branch]:
+        return [self.branches[i] for i in feed.users if i in self.branches and self.branches[i].feed is feed]
 
     def _crop_layer(self, branch: Branch, layer: Layer, rect) -> None:
         frame = layer.frame
@@ -1424,16 +1739,12 @@ class Engine(GObject.Object):
         box = (float(widget.x), float(widget.y), float(widget.width), float(widget.height))
         if pad not in self._applied_rev:
             # Never composited yet: it takes its geometry now (no frame of it to keep in step with).
-            for name, value in zip(self._GEOMETRY, geometry):
-                if pad.get_property(name) != value:
-                    pad.set_property(name, value)
+            self._set_geometry(pad, geometry)
         if frame.find_property("revision") is None:  # an older lumaframe: as it was, not atomic
-            for name, value in zip(self._GEOMETRY, geometry):
-                if pad.get_property(name) != value:
-                    pad.set_property(name, value)
+            self._set_geometry(pad, geometry)
             return
         with self._geom_lock:
-            self._pad_widget[pad] = widget.id
+            self._pad_widget[pad] = self._frames.get(frame, widget.id)
             revs = self._revs.setdefault(pad, {})
             if not changed and revs:
                 latest = max(revs)
@@ -1445,8 +1756,7 @@ class Engine(GObject.Object):
                 geometry = None
         if geometry is not None:
             # The mixer already composites this revision: move the pad now, as a plain move.
-            for name, value in zip(self._GEOMETRY, revs[latest][0]):
-                pad.set_property(name, value)
+            self._set_geometry(pad, revs[latest][0])
             return
         with self._geom_lock:
             self._revision += 1
@@ -1474,8 +1784,8 @@ class Engine(GObject.Object):
             self._watch_timer = GLib.timeout_add(500, self._settle)
 
     def _moving(self) -> bool:
-        """Something on the canvases changes by itself: a live capture (not a still) with a picture."""
-        return any(b.picture and b.layers and not b.still for b in self.branches.values())
+        """Something on the canvases changes by itself: a live capture (not a still) with a picture, shown."""
+        return any(b.picture and b.layers and not b.still and self._on(b) for b in self.branches.values())
 
     def _preview_flow(self, on: bool) -> None:
         for program in self.programs.values():
@@ -1506,9 +1816,7 @@ class Engine(GObject.Object):
                     del revs[old]
                 self._applied[pad] = geometry
                 self._applied_rev[pad] = latest
-            for name, value in zip(self._GEOMETRY, geometry):
-                if pad.get_property(name) != value:
-                    pad.set_property(name, value)
+            self._set_geometry(pad, geometry)
         self._watch_timer = 0
         self._preview_flow(self._moving())
         for program in self.programs.values():
@@ -1544,6 +1852,15 @@ class Engine(GObject.Object):
             self._superseding.pop(pad, None)
             self._supersede_probes.discard(pad)
 
+
+    def _set_geometry(self, pad: Gst.Pad, geometry) -> None:
+        """A pad's place, unless it is gliding (its controller places it frame by frame)."""
+        if pad in self._gliding:
+            return
+        for name, value in zip(self._GEOMETRY, geometry):
+            if pad.get_property(name) != value:
+                pad.set_property(name, value)
+
     def _samples_selected(self, mixer, _segment, pts, _dts, _duration, _info, program: Program) -> None:
         """The mixer's thread, before it composites a frame: each layer's pad takes the geometry of
         the revision its selected buffer was drawn with."""
@@ -1562,7 +1879,7 @@ class Engine(GObject.Object):
         for pad in pads:
             with self._geom_lock:
                 revs = self._revs.get(pad)
-            if revs is None:
+            if revs is None or pad in self._gliding:
                 continue
             sample = mixer.peek_next_sample(pad)
             buffer = sample.get_buffer() if sample is not None else None
@@ -1581,8 +1898,8 @@ class Engine(GObject.Object):
             if applied != entry[0]:
                 for name, value in zip(self._GEOMETRY, entry[0]):
                     pad.set_property(name, value)
-            if widget_id is not None:
-                boxes[widget_id] = entry[1]
+            if widget_id is not None and widget_id in self._shown_ids:
+                boxes[widget_id] = entry[1]  # only the shown scene's: the window outlines those
         with self._geom_lock:
             program.composited.append((pts, boxes))
             del program.composited[:-16]
@@ -1606,7 +1923,7 @@ class Engine(GObject.Object):
             self.emit("frame-shown", fmt, widget_id, *box)
         return False
 
-    def _trace(self, branch: Branch, elements: list) -> None:
+    def _trace(self, feed: Feed, elements: list) -> None:
         """STREAMY_TRACE=1: count pictures at the source and at the tee, every 2 s, on stderr."""
         import sys
 
@@ -1625,54 +1942,72 @@ class Engine(GObject.Object):
             pad.add_probe(Gst.PadProbeType.BUFFER, seen)
 
         def report() -> bool:
-            print("streamy-trace", branch.widget_id, counts, file=sys.stderr, flush=True)
-            return self.branches.get(branch.widget_id) is branch
+            print("streamy-trace", feed.name_id, counts, file=sys.stderr, flush=True)
+            return self.feeds.get(feed.key) is feed
         GLib.timeout_add_seconds(2, report)
 
-    def _no_picture(self, branch: Branch) -> bool:
-        branch.watchdog = 0
-        if self.branches.get(branch.widget_id) is branch and not branch.shown and \
-                branch.widget_id not in self._no_alpha and any(e.get_name().endswith("-alpha") for e in branch.elements):
-            self._fail(branch.widget_id, "format", "no picture with an alpha format")  # opaque, at once
+    def _no_picture(self, feed: Feed) -> bool:
+        feed.watchdog = 0
+        if self.feeds.get(feed.key) is not feed or feed.shown:
             return False
-        if self.branches.get(branch.widget_id) is branch and not branch.shown and branch.sourced and \
-                branch.widget_id not in self._sw_decode and any(e.get_name().endswith("-vapp") for e in branch.elements):
+        if feed.key not in self._no_alpha and any(e.get_name().endswith("-alpha") for e in feed.elements):
+            self._fail(feed, "format", "no picture with an alpha format")  # opaque, at once
+            return False
+        if feed.sourced and feed.key not in self._sw_decode and any(e.get_name().endswith("-vapp") for e in feed.elements):
             # The camera sends, yet nothing decoded on the GPU reached the canvas: the CPU decodes it instead.
-            log(f"widget {branch.widget_id}: the camera sends but GPU decoding showed no picture in "
+            log(f"source {feed.name_id}: the camera sends but GPU decoding showed no picture in "
                 f"{FIRST_PICTURE_S} s; decoding in software")
-            self._sw_decode.add(branch.widget_id)
-            self._remove_branch(branch.widget_id)
-            GLib.idle_add(lambda: self.show_scene(self._scene, skip=self._skip, states=self._states) and False)
+            self._sw_decode.add(feed.key)
+            self._reopen(feed)
             return False
-        if self.branches.get(branch.widget_id) is branch and not branch.shown:
-            log(f"widget {branch.widget_id}: no picture after {FIRST_PICTURE_S} s; the stream stays open")
-            self.emit("widget-waiting", branch.widget_id)
+        log(f"source {feed.name_id}: no picture after {FIRST_PICTURE_S} s; the stream stays open")
+        for link in feed.links:
+            self.emit("widget-waiting", link)
         return False
 
-    def _fail(self, widget_id: str, reason: str, detail: str = "") -> None:
-        branch = self.branches.get(widget_id)
-        if branch is not None and reason in ("format", "stopped") and widget_id not in self._no_alpha and \
-                any(e.get_name().endswith("-alpha") for e in branch.elements):
+
+    def _reopen(self, feed: Feed) -> None:
+        """Take ``feed`` out with every widget on it; the scene shown again opens it afresh."""
+        for branch in self._branches_of(feed):
+            self._remove_branch(branch.widget_id)
+        self._drop_feed(feed)
+        GLib.idle_add(lambda: self.show_scene(self._scene, skip=self._skip, states=self._states) and False)
+
+    def _fail(self, feed: Feed, reason: str, detail: str = "") -> None:
+        if self.feeds.get(feed.key) is not feed:
+            return
+        if reason in ("format", "stopped") and feed.key not in self._no_alpha and \
+                any(e.get_name().endswith("-alpha") for e in feed.elements):
             # The cast offers no format with alpha: take it opaque, at once, rather than fail it.
-            log(f"widget {widget_id}: the window cast offers no alpha format ({detail[:160]}); taken opaque")
-            self._no_alpha.add(widget_id)
-            self._remove_branch(widget_id)
-            GLib.idle_add(lambda: self.show_scene(self._scene, skip=self._skip, states=self._states) and False)
+            log(f"source {feed.name_id}: the window cast offers no alpha format ({detail[:160]}); taken opaque")
+            self._no_alpha.add(feed.key)
+            self._reopen(feed)
             return
-        if branch is not None and reason in ("format", "stopped") and widget_id not in self._sw_decode and \
-                any(e.get_name().endswith("-vapp") for e in branch.elements):
-            log(f"widget {widget_id}: GPU decoding failed ({detail[:160]}); decoding in software")
-            self._sw_decode.add(widget_id)
-            self._remove_branch(widget_id)
-            GLib.idle_add(lambda: self.show_scene(self._scene, skip=self._skip, states=self._states) and False)
+        gpu = reason in ("format", "stopped") and feed.key not in self._sw_decode and \
+            any(e.get_name().endswith("-vapp") for e in feed.elements)
+        if gpu and feed.shown and time.monotonic() - self._gpu_reopened.get(feed.key, -GPU_REOPEN_S) >= GPU_REOPEN_S:
+            # GPU decoding worked until the camera changed its picture size (the decoder's pool keeps the old
+            # size): open it again on the GPU, once a minute at most, rather than move it to the CPU for good.
+            log(f"source {feed.name_id}: GPU decoding stopped after it showed pictures ({detail[:160]}); "
+                f"opening it again on the GPU")
+            self._gpu_reopened[feed.key] = time.monotonic()
+            self._reopen(feed)
             return
-        if widget_id in self.branches:
-            log(f"widget {widget_id} failed: {reason}" + (f": {detail}" if detail else ""))
-            self._remove_branch(widget_id)
-            self.emit("widget-failed", widget_id, reason)
-            self._idle_check()
-            # Once its elements are out, the rest of the program runs on (see _keep_playing).
-            GLib.timeout_add(100, lambda: self._keep_playing() and False)
+        if gpu:
+            log(f"source {feed.name_id}: GPU decoding failed ({detail[:160]}); decoding in software")
+            self._sw_decode.add(feed.key)
+            self._reopen(feed)
+            return
+        log(f"source {feed.name_id} failed: {reason}" + (f": {detail}" if detail else ""))
+        links = feed.links
+        for branch in self._branches_of(feed):
+            self._remove_branch(branch.widget_id)
+        self._drop_feed(feed)
+        for link in links:
+            self.emit("widget-failed", link, reason)
+        self._idle_check()
+        # Once its elements are out, the rest of the program runs on (see _keep_playing).
+        GLib.timeout_add(100, lambda: self._keep_playing() and False)
 
     @staticmethod
     def _link_chain(elements: list[Gst.Element]) -> None:
@@ -1688,61 +2023,364 @@ class Engine(GObject.Object):
             elif not a.link(b):
                 raise EngineError(f"{a.get_name()} does not link to {b.get_name()}")
 
-    def _first_picture(self, _pad, _info, data) -> Gst.PadProbeReturn:
-        ref, widget = data
-        branch = ref()
-        if branch is None:
+    def _first_picture(self, _pad, _info, ref) -> Gst.PadProbeReturn:
+        feed = ref()
+        if feed is None:
             return Gst.PadProbeReturn.REMOVE
-        branch.shown = True
-        GLib.idle_add(self._fade_in, branch, widget)
+        feed.shown = True
+        GLib.idle_add(self._fade_in, feed)
         return Gst.PadProbeReturn.REMOVE
 
-    def _fade_in(self, branch: Branch, widget: Widget) -> bool:
-        if self.branches.get(branch.widget_id) is not branch:
+    def _fade_in(self, feed: Feed) -> bool:
+        """A feed's first picture: its widgets of the shown scene fade in on the program clock (their
+        cards go once they are in); its widgets of other scenes get the picture, ready to show."""
+        if self.feeds.get(feed.key) is not feed:
             return False
-        if branch.device:
-            how = "GPU" if any(e.get_name().endswith("-vapp") for e in branch.elements) else "software"
-            log(f"widget {branch.widget_id}: first picture after {(time.monotonic() - branch.started) * 1000:.0f} ms"
+        if feed.device:
+            how = "GPU" if any(e.get_name().endswith("-vapp") for e in feed.elements) else "software"
+            log(f"source {feed.name_id}: first picture after {(time.monotonic() - feed.started) * 1000:.0f} ms"
                 f" ({how} decode)")
-        self.emit("widget-ready", widget.id)
-        steps = 10
-
-        def step() -> bool:
-            if self.branches.get(branch.widget_id) is not branch:
-                return False
-            branch.fade = min(FADE_MS, branch.fade + FADE_MS // steps)
+        for link in feed.links:
+            self.emit("widget-ready", link)
+        shown = []
+        for branch in self._branches_of(feed):
+            if not self._on(branch):
+                branch.fade = FADE_MS
+                for layer in branch.layers.values():
+                    self._push_last(branch, layer)
+                continue
+            shown.append(branch)
             for fmt, layer in branch.layers.items():
-                target = self.view_of(branch.view or widget, fmt).effects.clamped().opacity
-                layer.frame.set_property("opacity", target * branch.fade / FADE_MS)
-                self._commit(layer.frame, layer.pad)
-            if branch.fade >= FADE_MS:
-                self._remove_placeholder(widget.id)  # the real picture is in: the card goes
-            return branch.fade < FADE_MS
+                start, _now = self._times(fmt)
+                if layer.alpha is not None and start is not None:
+                    layer.alpha.ramp(start, self._curve(start, FADE_MS * Gst.MSECOND, 0.0, 1.0, _smooth))
+                elif layer.alpha is not None:
+                    layer.alpha.hold(1.0)
 
-        GLib.timeout_add(FADE_MS // steps, step)
+        def done() -> bool:
+            for branch in shown:
+                if self.branches.get(branch.widget_id) is branch:
+                    branch.fade = FADE_MS
+                    self._remove_placeholder(branch.widget_id)  # the real picture is in: the card goes
+            return False
+
+        GLib.timeout_add(FADE_MS + LEAD_MS, done)
+        self._sync_parking()  # a camera only another scene shows parks once it has its first picture
         return False
 
-    def _sync_monitor(self, branch: Branch, widget: Widget) -> None:
-        """A sound widget's monitor exists exactly while it is on (and follows its device)."""
-        want = widget.monitor in ("only", "both")
-        device = widget.source.get("monitor-device")
-        if branch.monitor and (not want or device != branch.monitor_device):
-            self._drop_monitor(branch)
-        if not want or branch.monitor or self.pipeline is None:
+
+    def _times(self, fmt: str, lead: int = LEAD_NS) -> tuple[int | None, int | None]:
+        """(stream time ``lead`` ns from now on canvas ``fmt``'s mixer, running time now), or Nones."""
+        program = self.programs.get(fmt)
+        if program is None or self.pipeline is None:
+            return None, None
+        clock = self.pipeline.get_clock()
+        if clock is None:
+            return None, None
+        running = clock.get_time() - self.pipeline.get_base_time()
+        return self._stream_time(program.mixer.get_static_pad("src"), running + lead), running
+
+
+    @staticmethod
+    def _stream_time(pad: Gst.Pad, running: int) -> int:
+        """Running time ``running`` as stream time on ``pad`` (what its element syncs controllers on)."""
+        event = pad.get_sticky_event(Gst.EventType.SEGMENT, 0) if pad is not None else None
+        if event is None:
+            return running
+        segment = event.parse_segment()
+        if segment.format != Gst.Format.TIME:
+            return running
+        position = segment.position_from_running_time(Gst.Format.TIME, running)
+        if position in (-1, Gst.CLOCK_TIME_NONE):
+            return running
+        stream = segment.to_stream_time(Gst.Format.TIME, position)
+        return running if stream in (-1, Gst.CLOCK_TIME_NONE) else stream
+
+
+    @staticmethod
+    def _curve(start: int, duration: int, begin: float, end: float, ease) -> list[tuple[int, float]]:
+        """Keyframes from ``begin`` to ``end`` over ``duration`` ns, one per program frame, eased."""
+        if duration <= 0:
+            return [(start, end)]
+        step = Gst.SECOND // graph.PREVIEW_FPS
+        n = max(1, -(-duration // step))
+        return [(start + duration * i // n, begin + (end - begin) * ease(i / n)) for i in range(1, n + 1)]
+
+
+    def _sync_shown(self) -> None:
+        """No change of scene: each layer passes pictures and shows exactly while its scene is shown."""
+        for branch in self.branches.values():
+            on = self._on(branch)
+            for layer in branch.layers.values():
+                if layer.valve.get_property("drop") == on:
+                    layer.valve.set_property("drop", not on)
+                    if layer.alpha is not None:
+                        layer.alpha.hold(1.0 if on and branch.fade >= FADE_MS else 0.0)
+                    if on:
+                        self._push_last(branch, layer)
+        self._sync_gates(0)
+        self._sync_parking()
+
+
+    def _sync_parking(self) -> None:
+        """A camera no shown scene uses, once it has shown a picture, parks: open, its pictures dropped
+        before decoding. One a shown scene uses passes them."""
+        if self._pending is not None or self._switch_timer:
+            return  # a change of scene under way still draws the cameras it moves between
+        for feed in self.feeds.values():
+            if feed.park is not None and feed.shown:
+                self._set_parked(feed, not self._feed_on(feed))
+
+    @staticmethod
+    def _set_parked(feed: Feed, parked: bool) -> None:
+        if feed.parked == parked:
             return
-        tee = next((e for e in branch.elements if e.get_factory().get_name() == "tee"), None)
+        feed.parked = parked
+        if feed.waits:
+            feed.park.set_property("drop", parked)
+
+    @staticmethod
+    def _trickle(_pad, _info, ref) -> Gst.PadProbeReturn:
+        """A parked screen's pictures: one a second passes, the rest are dropped before the GPU."""
+        feed = ref()
+        if feed is None or not feed.parked:
+            return Gst.PadProbeReturn.OK
+        now = time.monotonic()
+        if now - feed.passed >= 1.0:
+            feed.passed = now
+            return Gst.PadProbeReturn.OK
+        return Gst.PadProbeReturn.DROP
+
+    def _begin_switch(self, previous: str, active: str | None) -> None:
+        """Change scene now, or, when a camera the new scene shows is parked, as soon as it has sent its
+        next picture (at most PARKED_WAIT_MS): the change starts on a frame that has every picture in it."""
+        incoming = [f for f in self.feeds.values() if f.parked and any(b.scene_id == active for b in self._branches_of(f))]
+        for feed in incoming:
+            if not feed.waits:
+                self._set_parked(feed, False)  # a screen: its picture of the last second shows at once
+        parked = [f for f in incoming if f.waits]
+        if not parked:
+            self._switch(previous, active)
+            return
+        waiting = {f.key for f in parked}
+        probes, told = [], set()
+
+        def arrived(_pad, _info, key):
+            # Removed with the change (_cancel_pending), never from here: one id, removed once.
+            if key not in told:
+                told.add(key)
+                GLib.idle_add(ready, key)
+            return Gst.PadProbeReturn.OK
+
+        def ready(key=None) -> bool:
+            pending = self._pending
+            if pending is None or pending[1] != active:
+                return False
+            waiting.discard(key)
+            if key is None or not waiting:
+                self._cancel_pending()
+                self._switch(previous, active)
+            return False
+
+        for feed in parked:
+            sink = feed.elements[-1].get_static_pad("sink")
+            probes.append((sink, sink.add_probe(Gst.PadProbeType.BUFFER, arrived, feed.key)))
+            self._set_parked(feed, False)
+        self._pending = (previous, active, GLib.timeout_add(PARKED_WAIT_MS, ready), probes)
+
+    def _cancel_pending(self) -> None:
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        _previous, _active, timer, probes = pending
+        GLib.source_remove(timer)  # (a timer that fired removed itself first: ready runs once)
+        for pad, probe in probes:
+            pad.remove_probe(probe)
+
+    def _switch(self, previous: str, active: str | None) -> None:
+        """From scene ``previous`` to ``active``, on every canvas at once: a cut, or a fade over
+        ``transition_ms``. The incoming scene's layers draw above the outgoing one's and fade in; the
+        outgoing ones fade out on an ease-in curve, so a picture in both places never dips. A picture
+        shown in both scenes (the same feed) glides from its old place, size and stacking to its new one:
+        its two layers move together and cross-fade between the two Looks."""
+        if self._switch_timer:
+            GLib.source_remove(self._switch_timer)
+            self._switch_timer = 0
+        kind, ms = self.transition
+        duration = int(ms) * Gst.MSECOND if kind == "fade" else 0
+        self._restack_all()
+        incoming = [b for b in self.branches.values() if b.scene_id == active and b.picture]
+        outgoing = [b for b in self.branches.values() if b.scene_id == previous and b.picture]
+        pairs: dict[str, Branch] = {}  # outgoing widget id -> the incoming one showing the same picture
+        if duration:
+            free = list(incoming)
+            for out in outgoing:
+                twin = next((b for b in free if b.feed is out.feed and b.fade >= FADE_MS), None)
+                if twin is not None and out.fade >= FADE_MS:
+                    free.remove(twin)
+                    pairs[out.widget_id] = twin
+        self.switched_at = {}
+        for fmt in self.programs:
+            start, _running = self._times(fmt)
+            if start is None:
+                continue
+            self.switched_at[fmt] = start
+            end = start + duration
+            for branch in incoming:
+                layer = branch.layers.get(fmt)
+                if layer is None:
+                    continue
+                layer.valve.set_property("drop", False)
+                self._push_last(branch, layer)
+                if layer.alpha is None or branch.fade < FADE_MS:
+                    continue  # no picture yet: it fades in when it has one (_fade_in)
+                if duration:
+                    layer.alpha.ramp(start, self._curve(start, duration, layer.alpha.value_at(start), 1.0, _smooth))
+                else:
+                    layer.alpha.ramp(start - 1, [(start, 1.0)])
+            for branch in outgoing:
+                layer = branch.layers.get(fmt)
+                if layer is None or layer.alpha is None:
+                    continue
+                if not duration:
+                    layer.alpha.ramp(start - 1, [(start, 0.0)])
+                elif branch.widget_id in pairs:
+                    # Held under its twin (which fades in over it, in the same place), then gone.
+                    layer.alpha.ramp(start, [(end, layer.alpha.value_at(start)), (end + 1, 0.0)])
+                else:
+                    layer.alpha.ramp(start, self._curve(start, duration, layer.alpha.value_at(start), 0.0, _fade_out))
+            for out_id, twin in pairs.items():
+                out = self.branches[out_id]
+                self._glide(out, twin, fmt, start, duration)
+            for branch in self.branches.values():
+                if branch.scene_id in (previous, active) or not branch.picture:
+                    continue
+                layer = branch.layers.get(fmt)
+                if layer is not None and layer.alpha is not None:
+                    self._end_glide(layer)
+                    layer.alpha.hold(0.0)
+                    layer.valve.set_property("drop", True)
+        self._sync_gates(duration)
+        self._watch()
+
+        def done() -> bool:
+            self._switch_timer = 0
+            for branch in list(self.branches.values()):
+                for layer in branch.layers.values():
+                    if layer.glide:
+                        self._end_glide(layer, branch)
+                if not self._on(branch):
+                    for layer in branch.layers.values():
+                        layer.valve.set_property("drop", True)
+            self._sync_parking()
+            return False
+
+        self._switch_timer = GLib.timeout_add(int(ms if duration else 0) + 2 * LEAD_MS, done)
+
+
+    def _glide(self, out: Branch, twin: Branch, fmt: str, start: int, duration: int) -> None:
+        """``out``'s and ``twin``'s layers on ``fmt`` (the same picture) move together from where ``out``
+        is to where ``twin`` goes, each grown by its own Look's margin at the size it is drawn at."""
+        a, b = out.layers.get(fmt), twin.layers.get(fmt)
+        if a is None or b is None:
+            return
+        va, vb = self.view_of(out.view, fmt), self.view_of(twin.view, fmt)
+        here = a.path and self._box_at(a.path, start)
+        frm = here or (va.x, va.y, va.width, va.height)
+        to = (vb.x, vb.y, vb.width, vb.height)
+        ma, mb = va.effects.clamped().margin, vb.effects.clamped().margin
+        if frm == to and ma == mb:
+            return  # the same place: held, nothing moves
+        path = (frm, to, start, duration)
+        for layer, view, margin in ((a, va, ma), (b, vb, mb)):
+            self._end_glide(layer)
+            layer.path = path
+            own = (max(1.0, float(view.width)), max(1.0, float(view.height)))
+            keys = {name: [] for name in self._GEOMETRY}
+            for when, _t in [(start, 0.0)] + self._curve(start, duration, 0.0, 1.0, lambda t: t):
+                for name, value in zip(self._GEOMETRY, self._pad_rect(self._box_at(path, when), own, margin)):
+                    keys[name].append((when, value))
+            for name in self._GEOMETRY:
+                animation = Animation(layer.pad, name, keys[name][0][1])
+                animation.ramp(start, keys[name][1:])
+                layer.glide.append(animation)
+            self._gliding.add(layer.pad)
+
+
+    @staticmethod
+    def _box_at(path, when: int) -> tuple[float, float, float, float]:
+        frm, to, start, duration = path
+        t = 1.0 if duration <= 0 else max(0.0, min(1.0, (when - start) / duration))
+        e = _smooth(t)
+        return tuple(f + (g - f) * e for f, g in zip(frm, to))
+
+
+    @staticmethod
+    def _pad_rect(box, own: tuple[float, float], margin: float) -> tuple[int, int, int, int]:
+        """The pad a layer drawn at box size ``own`` (plus ``margin``) takes to show its box at ``box``."""
+        x, y, w, h = box
+        mx, my = margin * w / own[0], margin * h / own[1]
+        return int(round(x - mx)), int(round(y - my)), max(1, int(round(w + 2 * mx))), max(1, int(round(h + 2 * my)))
+
+
+    def _end_glide(self, layer: Layer, branch: Branch | None = None) -> None:
+        """A glide is over: the pad's controllers go and it takes its own place again."""
+        if not layer.glide:
+            return
+        for animation in layer.glide:
+            animation.remove()
+        layer.glide, layer.path = [], None
+        self._gliding.discard(layer.pad)
+        branch = branch or next((b for b in self.branches.values() if layer in b.layers.values()), None)
+        if branch is not None and branch.view is not None:
+            view = self.view_of(branch.view, layer.fmt)
+            self._set_geometry(layer.pad, tuple(graph.mixer_pad_props(view, 0)[k] for k in self._GEOMETRY))
+            self._style_layer(layer, view, self._z(branch))
+
+
+    def _sync_gates(self, duration: int) -> None:
+        """Sound is sent while a widget of the shown scene uses it: each gate fades (or cuts) to that."""
+        for feed in self.feeds.values():
+            if feed.gate is None:
+                continue
+            on = self._feed_on(feed)
+            if feed.gate_on == on:
+                continue
+            feed.gate_on = on
+            pad = feed.gate.target.get_static_pad("sink")
+            clock = self.pipeline.get_clock() if self.pipeline is not None else None
+            if clock is None:
+                feed.gate.hold(1.0 if on else 0.0)
+                continue
+            start = self._stream_time(pad, clock.get_time() - self.pipeline.get_base_time() + LEAD_NS)
+            ease = _smooth if on else _fade_out
+            feed.gate.ramp(start, self._curve(start, duration, feed.gate.value_at(start), 1.0 if on else 0.0, ease)
+                           if duration else [(start, 1.0 if on else 0.0)])
+            widget = next((b.view for b in self._branches_of(feed) if self._on(b) and b.view is not None), None)
+            self._sync_monitor(feed, widget)
+
+    def _sync_monitor(self, feed: Feed, widget: Widget | None) -> None:
+        """A sound's monitor exists exactly while it is on and a shown widget uses it (and follows its device)."""
+        want = widget is not None and widget.monitor in ("only", "both")
+        device = widget.source.get("monitor-device") if widget is not None else None
+        if feed.monitor and (not want or device != feed.monitor_device):
+            self._drop_monitor(feed)
+        if not want or feed.monitor or self.pipeline is None:
+            return
+        tee = next((e for e in feed.elements if e.get_factory().get_name() == "tee"), None)
         if tee is None:
             return
-        elements = [make(e) for e in graph.monitor_chain(widget, branch.generation)]
+        named = Widget(feed.name_id, widget.kind, shared=widget.shared)
+        elements = [make(e) for e in graph.monitor_chain(named, feed.generation)]
         for element in elements:
             self.pipeline.add(element)
         link_all(elements)
         tee.link(elements[0])
-        branch.monitor, branch.monitor_device = elements, device
+        feed.monitor, feed.monitor_device = elements, device
         self._call_async(self.pipeline, lambda _p, items: [e.sync_state_with_parent() for e in reversed(items)], elements)
 
-    def _drop_monitor(self, branch: Branch) -> None:
-        elements, branch.monitor = branch.monitor, []
+    def _drop_monitor(self, feed: Feed) -> None:
+        elements, feed.monitor = feed.monitor, []
         if not elements or self.pipeline is None:
             return
         self._stop_then_unlink(elements, elements[0].get_static_pad("sink"))
@@ -1790,28 +2428,41 @@ class Engine(GObject.Object):
         self._call_async(pipeline, stop, elements)
 
     def _remove_branch(self, widget_id: str) -> None:
-        """Take a widget out without waiting. Its data stops at once (a probe drops it before the
-        mixers); its elements go to NULL on GStreamer's thread pool (a stuck source can take its time);
-        only then, back on the main loop, do its pads unlink from the mixers and its elements leave the
-        pipeline. A sound mixer goes only once no stopping branch still feeds it."""
+        """Take a widget out: its layers go; its feed closes once no widget uses it."""
         branch = self.branches.pop(widget_id, None)
-        if branch is not None:
-            branch.closed, branch.last = True, None
-        if branch is None or self.pipeline is None:
+        if branch is None:
             return
-        self._drop_monitor(branch)
-        if branch.watchdog:
-            GLib.source_remove(branch.watchdog)
-            branch.watchdog = 0
         for fmt in list(branch.layers):
             self._remove_layer(branch, fmt)
+        feed = branch.feed
+        feed.users.pop(widget_id, None)
+        if not feed.users and self.feeds.get(feed.key) is feed:
+            self._drop_feed(feed)
+        elif not feed.picture and feed.monitor and not self._feed_on(feed):
+            self._drop_monitor(feed)
+
+
+    def _drop_feed(self, feed: Feed) -> None:
+        """Close a capture without waiting. Its data stops at once (a probe drops it before the mixers);
+        its elements go to NULL on GStreamer's thread pool (a stuck source can take its time); only then,
+        back on the main loop, do its pads unlink and its elements leave the pipeline. A sound mixer goes
+        only once no stopping feed still feeds it."""
+        if self.feeds.get(feed.key) is feed:
+            del self.feeds[feed.key]
+        feed.closed, feed.last = True, None
+        if self.pipeline is None:
+            return
+        self._drop_monitor(feed)
+        if feed.watchdog:
+            GLib.source_remove(feed.watchdog)
+            feed.watchdog = 0
         pipeline = self.pipeline
-        if branch.pad is not None:
-            # Nothing more reaches the sound mixer; the pad stays linked until the branch is NULL.
-            branch.elements[-1].get_static_pad("src").add_probe(
+        if feed.pad is not None:
+            # Nothing more reaches the sound mixer; the pad stays linked until the feed is NULL.
+            feed.elements[-1].get_static_pad("src").add_probe(
                 Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST | Gst.PadProbeType.EVENT_DOWNSTREAM,
                 lambda *_a: Gst.PadProbeReturn.DROP)
-        device = branch.device
+        device = feed.device
         if device:
             self._releasing[device] = self._releasing.get(device, 0) + 1
 
@@ -1821,29 +2472,46 @@ class Engine(GObject.Object):
             GLib.idle_add(drop)
 
         def drop() -> bool:  # on the main loop, every element NULL
-            if branch.pad is not None:
-                last = branch.elements[-1].get_static_pad("src")
-                if last.get_peer() is branch.pad:
-                    last.unlink(branch.pad)
-                mixer = branch.pad.get_parent_element()
+            if feed.gate is not None:
+                feed.gate.remove()
+                feed.gate = None
+            if feed.pad is not None:
+                last = feed.elements[-1].get_static_pad("src")
+                if last.get_peer() is feed.pad:
+                    last.unlink(feed.pad)
+                mixer = feed.pad.get_parent_element()
                 if mixer is not None:
-                    mixer.release_request_pad(branch.pad)
-                branch.pad = None
-            for element in branch.elements:
+                    mixer.release_request_pad(feed.pad)
+                feed.pad = None
+            for element in feed.elements:
                 if element.get_parent() is pipeline:
                     pipeline.remove(element)
-            for element in branch.elements:
+            for element in feed.elements:
                 element.set_locked_state(False)
-            close_fds(source_fds(branch.elements))
+            close_fds(source_fds(feed.elements))
             if device:
                 self._released(device)
-            if not branch.picture and self.pipeline is pipeline:
+            if not feed.picture and self.pipeline is pipeline:
                 self._sync_sound()
             return False
 
-        for element in branch.elements:
+        for element in feed.elements:
             element.set_locked_state(True)  # the pipeline's own state changes leave it alone now
-        self._call_async(pipeline, stop, branch.elements)
+        self._call_async(pipeline, stop, feed.elements)
+
+
+    def reopen(self, link: str | None = None) -> None:
+        """Close source ``link``'s feeds (every source's with None) and every widget drawn from them; the
+        next show_scene opens them afresh (a new mode, a device back, an undo step's settings)."""
+        for feed in [f for f in self.feeds.values() if link is None or link in f.links]:
+            for branch in self._branches_of(feed):
+                self._remove_branch(branch.widget_id)
+            self._drop_feed(feed)
+
+
+    def has_source(self, link: str) -> bool:
+        """Source ``link`` is open (captured for some scene)."""
+        return any(link in f.links for f in self.feeds.values())
 
     def _released(self, device: str) -> bool:
         """A stream on ``device`` has stopped: one waiting for it opens now."""
@@ -1859,7 +2527,7 @@ class Engine(GObject.Object):
     # ── Sound ──
 
     def _needs_sound(self) -> bool:
-        return any(not b.picture for b in self.branches.values()) or bool(self.outputs) or \
+        return any(not f.picture for f in self.feeds.values()) or bool(self.outputs) or \
             bool(self.fanout is not None and self.fanout.wants())
 
     def _ensure_sound(self) -> None:
@@ -1963,12 +2631,33 @@ class Engine(GObject.Object):
                 self.fanout.push_sound(sample)
         else:
             fmt = key[1]
+            self._count_tap(fmt, sample)
             for output in list(self.outputs.values()):
                 if output.fmt == fmt:
                     output.push(output.video_src, sample)
             if self.fanout is not None:
                 self.fanout.push_video(fmt, sample)
         return Gst.FlowReturn.OK
+
+    def _count_tap(self, fmt: str, sample: Gst.Sample) -> None:
+        """Every 5 s, how many pictures canvas ``fmt``'s tap gave and how far their timestamps moved:
+        pictures per wall second and media seconds per wall second (1.0 when the timestamps keep time)."""
+        counts = self.__dict__.setdefault("_tap_counts", {})
+        now = time.monotonic()
+        pts = sample.get_buffer().pts
+        entry = counts.get(fmt)
+        if entry is None:
+            counts[fmt] = [now, pts, 0]
+            return
+        entry[2] += 1
+        span = now - entry[0]
+        if span >= 5:
+            media = (pts - entry[1]) / Gst.SECOND if pts != Gst.CLOCK_TIME_NONE else float("nan")
+            caps = sample.get_caps().get_structure(0)
+            ok, num, den = caps.get_fraction("framerate")
+            log(f"tap {fmt}: {entry[2] / span:.1f} pictures/s, timestamps {media / span:.2f} s per s, "
+                f"caps framerate {num}/{den if ok else '?'}")
+            counts[fmt] = [now, pts, 0]
 
     def start_output(self, kind: str, choice: EncoderChoice, sink: list[Element], *, video_kbps: int,
                      audio_kbps: int = 160, fmt: str | None = None) -> Output:
@@ -2099,6 +2788,12 @@ class Engine(GObject.Object):
 
     # ── Bus ──
 
+    def _feed_named(self, name_id: str | None) -> Feed | None:
+        """The open feed whose elements carry ``name_id`` (a source's id)."""
+        if name_id is None:
+            return None
+        return next((f for f in self.feeds.values() if f.name_id == name_id), None)
+
     def _message(self, _bus, message: Gst.Message) -> None:
         if message.type == Gst.MessageType.STATE_CHANGED and message.src is self.pipeline:
             old, new, _pending = message.parse_state_changed()
@@ -2108,25 +2803,26 @@ class Engine(GObject.Object):
             structure = message.get_structure()
             if structure is not None and structure.get_name() == "level":
                 name = message.src.get_name()
-                widget_id = graph.widget_of(name) if name.endswith("-level") else None
-                if widget_id is not None:
+                feed = self._feed_named(graph.widget_of(name)) if name.endswith("-level") else None
+                if feed is not None:
                     peaks = structure.get_value("peak")
                     left = peaks[0] if peaks else -60.0
                     right = peaks[1] if len(peaks) > 1 else left
-                    self.emit("levels", widget_id, max(-60.0, left), max(-60.0, right))
+                    for link in feed.links:
+                        self.emit("levels", link, max(-60.0, left), max(-60.0, right))
         elif message.type == Gst.MessageType.ERROR:
             error, debug = message.parse_error()
             source = message.src.get_name() if message.src else ""
             widget_id = graph.widget_of(source)
-            branch = self.branches.get(widget_id) if widget_id is not None else None
-            if branch is not None and graph.generation_of(source) not in (None, branch.generation):
-                # A branch already replaced (a new mode, a scene shown again) failing as it stops.
+            feed = self._feed_named(widget_id)
+            if feed is not None and graph.generation_of(source) not in (None, feed.generation):
+                # A feed already replaced (a new mode, a reopen) failing as it stops.
                 log(f"{source}: {error.message} (stopping)")
-            elif branch is not None:
-                # One widget failed (a window closed, a camera unplugged or busy): take it out, keep going.
-                self._fail(widget_id, source_problem(error.message, debug or ""),
+            elif feed is not None:
+                # One source failed (a window closed, a camera unplugged or busy): take it out, keep going.
+                self._fail(feed, source_problem(error.message, debug or ""),
                            f"{error.message} ({(debug or '').splitlines()[0] if debug else ''})")
-            elif widget_id is not None or source.startswith("p-"):
+            elif widget_id is not None or source.startswith(("p-", "l-")):
                 # A widget already out (its second error) or a card: its own words were said; never GStreamer's.
                 log(f"{source}: {error.message}")
             else:

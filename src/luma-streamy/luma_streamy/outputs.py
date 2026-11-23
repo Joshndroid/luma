@@ -35,8 +35,14 @@ RECORD_FINISH_S = 30
 
 
 def log(text: str) -> None:
-    if os.environ.get("STREAMY_DEBUG"):
-        print(f"streamy-outputs: {text}", flush=True)
+    """One line for the journal: every row and encode change is logged, so a dropped stream leaves a trace."""
+    import sys
+
+    print(f"streamy-outputs: {text}", file=sys.stderr, flush=True)
+
+
+#: A live row writes its numbers to the journal this often (seconds).
+STATS_LOG_S = 5
 
 
 def build(spec: Element) -> Gst.Element:
@@ -207,7 +213,8 @@ class Row:
         self.sound_src = sound[0] if sound else None
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             raise OutputError("the destination could not start")
-        log(f"row {self.id}: built {self.kind} {self.target}")
+        log(f"row {self.id}: built {self.kind} {self.target.split('/')[2] if '://' in self.target else self.target} "
+            f"on {video_caps.to_string()[:200]}")
 
     def _count(self, _pad, info) -> Gst.PadProbeReturn:
         if info.type & Gst.PadProbeType.BUFFER_LIST:
@@ -221,12 +228,16 @@ class Row:
 
     def _message(self, _bus, message: Gst.Message) -> None:
         if message.type == Gst.MessageType.EOS:
+            log(f"row {self.id}: end of stream")
             self._teardown()
             self._done()
         elif message.type == Gst.MessageType.ERROR:
             error, debug = message.parse_error()
-            log(f"row {self.id}: {error.message} {debug}")
+            log(f"row {self.id}: error from {message.src.get_name() if message.src else '?'}: {error.message} {debug}")
             self._failed(error.message)
+        elif message.type == Gst.MessageType.WARNING:
+            error, debug = message.parse_warning()
+            log(f"row {self.id}: warning from {message.src.get_name() if message.src else '?'}: {error.message} {debug}")
 
     def _failed(self, message: str) -> None:
         self._teardown()
@@ -242,6 +253,8 @@ class Row:
         self.attempt += 1
         self.stats.reconnects += 1
         delay = backoff(self.attempt)
+        log(f"row {self.id}: failed ({message}); reconnect {self.attempt} in {delay:.1f} s, "
+            f"{self.stats.reconnects} so far")
         self.stats.state, self.stats.words = "reconnecting", f"{words}"
         self.outputs.emit("row-state", self.id, "reconnecting", og.state_words(self.stats))
 
@@ -250,6 +263,7 @@ class Row:
                 self.timer = 0
                 self.need_key = True
             if not self.stopping:
+                log(f"row {self.id}: reconnecting now; waiting for a key frame")
                 self.stats.state = "connecting"
                 self.group.request_key()
                 self.outputs.emit("row-state", self.id, "connecting", og.state_words(self.stats))
@@ -270,7 +284,10 @@ class Row:
             bus.disconnect(self._bus_id)
             self._bus_id = 0
         bus.remove_signal_watch()
+        began = time.monotonic()
         pipeline.set_state(Gst.State.NULL)
+        took = time.monotonic() - began
+        log(f"row {self.id}: torn down in {took * 1000:.0f} ms")
 
     def stop(self) -> None:
         """Finish: EOS through the muxer (a file gets its index), then down."""
@@ -328,8 +345,18 @@ class Row:
                         break
                 ok, rtt = info.get_double("rtt-ms")
                 self.stats.rtt_ms = rtt if ok else None
+        self._log_ticks = getattr(self, "_log_ticks", 0) + 1
+        if self._log_ticks >= STATS_LOG_S:
+            self._log_ticks = 0
+            src = self.video_src
+            level = f"{src.get_property('current-level-buffers')}/{src.get_property('max-buffers')}" if src else "-"
+            log(f"row {self.id}: {self.stats.state}, {self.stats.bitrate_kbps:.0f} kb/s, sent {self.stats.bytes}, "
+                f"network {network}, frames {self.stats.frames}, dropped network {self.stats.dropped_network} "
+                f"encoder {self.group.dropped}, queue {level}, rtt {self.stats.rtt_ms}, "
+                f"reconnects {self.stats.reconnects}, pipeline {'up' if self.pipeline is not None else 'none'}")
         if self.stats.state == "connecting" and self.pipeline is not None and sent > 0 and \
                 (network is None or network > 0):
+            log(f"row {self.id}: live ({sent} bytes in the last second, network {network})")
             self.stats.state = "live"
             self.attempt = 0
             self.outputs.emit("row-state", self.id, "live", og.state_words(self.stats))
@@ -388,6 +415,8 @@ class Encode:
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self._error)
+        bus.connect("message::warning", lambda _b, m: log(
+            f"encode {self.preset.key}: warning from {m.src.get_name() if m.src else '?'}: {m.parse_warning()[0].message}"))
         self.pipeline, self.video_src, self.sound_src = pipeline, video_src, sound_src
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             raise OutputError("the encoder could not start")
@@ -413,6 +442,8 @@ class Encode:
             src = self.video_src
             if src.get_property("current-level-buffers") >= src.get_property("max-buffers"):
                 self.dropped += 1  # the encoder is behind
+                if self.dropped in (1, 10, 100) or self.dropped % 1000 == 0:
+                    log(f"encode {self.preset.key}: the encoder is behind; {self.dropped} pictures dropped")
                 return
             out = fresh(buffer)
             out.pts, out.dts = buffer.pts - self.t0, Gst.CLOCK_TIME_NONE
@@ -452,6 +483,7 @@ class Encode:
 
     def request_key(self) -> None:
         """Ask the encoder for a key frame now (a row joining or reconnecting starts on it)."""
+        log(f"encode {self.preset.key}: key frame requested")
         if self._vout is not None:
             self._vout.send_event(GstVideo.video_event_new_upstream_force_key_unit(Gst.CLOCK_TIME_NONE, True, 0))
 

@@ -123,6 +123,9 @@ class StreamyWindow(AppWindow):
 
         self.engine = engine or Engine(sources=self._source_for)
         self.engine.view_of = lambda widget, fmt: self.project.view_on(widget, fmt)
+        # Every scene's sources stay open, ready: a change of scene reopens nothing.
+        self.engine.scenes_of = lambda: self.project.scenes
+        self.engine.transition = (self.project.transition, self.project.transition_ms)
         if self.portals is not None:
             self.portals.on_cameras = self._cameras_changed
             self.portals.on_ready = lambda _widget_id: self._show_scene()
@@ -237,6 +240,10 @@ class StreamyWindow(AppWindow):
                         shortcut=("Delete",), enabled=lambda: self.selected is not None),
                 Command("widget.hide", "Hide widget", self.toggle_hidden, icon="eye-off", shortcut=("Ctrl", "H"),
                         enabled=lambda: self.selected is not None),
+                Command("edit.copy", "Copy", self.copy_selected, icon="copy", shortcut=("Ctrl", "C")),
+                Command("edit.paste", "Paste", self.paste, icon="clipboard", shortcut=("Ctrl", "V")),
+                Command("edit.paste-new", "Paste as new widget", lambda: self.paste(linked=False), icon="copy-plus",
+                        shortcut=("Ctrl", "Shift", "V")),
                 Command("widget.front", "Bring to front", lambda: self.restack(1), icon="arrow-up",
                         shortcut=("Ctrl", "bracketright"), enabled=lambda: self.selected is not None),
                 Command("widget.back", "Send to back", lambda: self.restack(-1), icon="arrow-down",
@@ -390,8 +397,15 @@ class StreamyWindow(AppWindow):
         w = scene.widget(self.selected) if scene is not None and self.selected else None
         return w is not None and w.has_picture
 
+    def _on_stage(self, widget_id: str) -> bool:
+        """``widget_id`` is a widget of the scene shown (the previews hold only its boxes)."""
+        scene = self.project.active_scene
+        return scene is not None and scene.widget(widget_id) is not None
+
     def _sync_rect(self, w: Widget) -> None:
         """Every preview's box for ``w`` where its canvas has it (a linked placement follows)."""
+        if not self._on_stage(w.id):
+            return  # a linked widget of another scene: its box shows when its scene does
         for fmt, arrange in self.arranges.items():
             view = self.project.view_on(w, fmt)
             arrange.set_item_rect(w.id, view.x, view.y, view.width, view.height)
@@ -807,49 +821,60 @@ class StreamyWindow(AppWindow):
                     widget.source["scaled"] = [1920, 1080]  # a camera with nothing smaller: 1080p, scaled
         return self.portals.source_for(widget)
 
+    def _source_widgets(self, kinds=None, *, visible: bool = False) -> list[Widget]:
+        """One widget per source the project uses (the shown scene's first), of ``kinds``."""
+        seen: dict[str, Widget] = {}
+        scenes = [self.project.active_scene] + [s for s in self.project.scenes if s is not self.project.active_scene]
+        for scene in scenes:
+            for w in scene.widgets if scene is not None else []:
+                if (kinds is None or w.kind in kinds) and (w.visible or not visible) and w.link not in seen:
+                    seen[w.link] = w
+        return list(seen.values())
+
     def _ask_missing_sources(self) -> None:
-        """The scene's sources without a capture reconnect, one at a time: each from its restore token,
-        silently. One that brought up a picker (it took a person's answer) stops the walk; the rest wait
-        for "Share" in the bar. Nothing is asked while the session is locked (cameras, which ask nothing,
-        still open)."""
+        """Every scene's sources without a capture reconnect, one at a time: each from its restore token,
+        silently, so a change of scene finds them open. One that brought up a picker (it took a person's
+        answer) stops the walk; the rest wait for "Share" in the bar. Only the shown scene's sources that
+        need a picker ask (with "Share"); another scene's ask when it is shown. Nothing is asked while
+        the session is locked (cameras, which ask nothing, still open)."""
         scene = self.project.active_scene
         if scene is None or self.fake or self.portals is None:
             return
         # While locked only cameras open: they ask nothing, and they aren't paused by a lock.
         kinds = ("camera",) if getattr(self, "locked", False) else ("display", "window", "camera", "app-audio")
-        wanted = [w for w in scene.widgets if w.kind in kinds and w.visible
-                  and w.id not in self.portals.captures and w.id not in self.widget_errors
-                  and w.id not in getattr(self, "_camera_opening", set())]
+        here = {w.link for w in scene.widgets}
+        wanted = [w for w in self._source_widgets(kinds, visible=True)
+                  if w.link not in self.portals.captures and w.link not in self.widget_errors
+                  and w.link not in getattr(self, "_camera_opening", set())]
         # Only what restores without a picker starts by itself (a camera, a share with its restore token);
         # the rest say "Needs sharing again" and wait for Share in the bar: no picker pops up on its own.
         silent = [w for w in wanted if w.kind == "camera" or w.source.get("restore-token")]
-        later = [w for w in wanted if w not in silent]
+        later = [w for w in wanted if w not in silent and w.link in here]
         for w in later:
-            self.widget_errors[w.id] = "reshare"
+            self.widget_errors[w.link] = "reshare"
         wanted = silent
         if later:
-            self._share_queue = [w.id for w in later] + [i for i in getattr(self, "_share_queue", [])
-                                                          if i not in {w.id for w in later}]
+            self._share_queue = [w.link for w in later] + [i for i in getattr(self, "_share_queue", [])
+                                                          if i not in {w.link for w in later}]
             self._show_scene()
             self.refresh_all()
             GLib.idle_add(lambda: self._offer_share_again() and False)
-        queued = [i for i in getattr(self, "_share_queue", []) if i not in {w.id for w in wanted}]
-        self._auto_queue = [w.id for w in wanted]
+        queued = [i for i in getattr(self, "_share_queue", []) if i not in {w.link for w in wanted}]
+        self._auto_queue = [w.link for w in wanted]
         self._share_queue = queued
         if not getattr(self, "_sharing", None) and self._auto_queue:
             self._share_next(auto=True)
 
     def _share_next(self, *, auto: bool) -> None:
         queue = getattr(self, "_auto_queue", []) if auto else getattr(self, "_share_queue", [])
-        scene = self.project.active_scene
         while queue:
             widget_id = queue.pop(0)
             if not auto:
                 self.widget_errors.pop(widget_id, None)  # its picker now
-            w = scene.widget(widget_id) if scene is not None else None
-            if w is None or w.id in self.portals.captures or not w.visible:
+            w = next((x for x in self._source_widgets() if x.link == widget_id), None)
+            if w is None or w.link in self.portals.captures or not w.visible:
                 continue
-            self._sharing = (w.id, time.monotonic(), auto)
+            self._sharing = (w.link, time.monotonic(), auto)
             self._choose_source(w, restore=True)
             return
         self._sharing = None
@@ -886,7 +911,7 @@ class StreamyWindow(AppWindow):
 
     def _offer_share_again(self) -> None:
         scene = self.project.active_scene
-        waiting = [w for w in (scene.widgets if scene else []) if w.id in self._share_queue]
+        waiting = [w for w in (scene.widgets if scene else []) if w.link in self._share_queue]
         if not waiting:
             return
         kinds = {w.kind for w in waiting}
@@ -957,7 +982,7 @@ class StreamyWindow(AppWindow):
             return
 
         def done(capture) -> None:
-            self.widget_errors.pop(widget.id, None)
+            self.widget_errors.pop(widget.link, None)
             if capture.restore_token:
                 widget.source["restore-token"] = capture.restore_token  # single-use: keep the new one
             if widget.kind == "app-audio" and capture.description:
@@ -972,7 +997,7 @@ class StreamyWindow(AppWindow):
                 self.project.place_natural(widget.id)
             self._changed(structure=True)
             self._show_scene()
-            self._shared_one(widget.id)
+            self._shared_one(widget.link)
 
         def failed(reason: str) -> None:
             # Every ending leaves the widget saying what happened and offering the fix; nothing
@@ -985,15 +1010,15 @@ class StreamyWindow(AppWindow):
             elif reason not in ("timeout", "unavailable", "ended"):
                 reason = "missing"
             widget.source.pop("restore-token", None)  # spent or refused: the next share picks afresh
-            self._widget_failed(None, widget.id, reason)
+            self._widget_failed(None, widget.link, reason)
 
         if widget.kind == "camera":
             if not hasattr(self, "_camera_opening"):
                 self._camera_opening: set[str] = set()
-            self._camera_opening.add(widget.id)
+            self._camera_opening.add(widget.link)
 
             def opened(capture) -> None:
-                self._camera_opening.discard(widget.id)
+                self._camera_opening.discard(widget.link)
                 camera = getattr(capture, "camera", None)
                 if camera is not None:
                     widget.source["camera"] = camera.name  # remembered by its stable node name
@@ -1001,18 +1026,18 @@ class StreamyWindow(AppWindow):
                 done(capture)
 
             def not_opened(reason: str) -> None:
-                self._camera_opening.discard(widget.id)
+                self._camera_opening.discard(widget.link)
                 failed(reason)
 
-            self.portals.camera(widget.id, done=opened, failed=not_opened, name=widget.source.get("camera"))
+            self.portals.camera(widget.link, done=opened, failed=not_opened, name=widget.source.get("camera"))
             return
         token = widget.source.get("restore-token") if restore else None
         if widget.kind == "app-audio":
             self._with_parent(lambda parent: self.portals.app_audio(
-                widget.id, restore_token=token, done=done, failed=failed, parent=parent))
+                widget.link, restore_token=token, done=done, failed=failed, parent=parent))
             return
         self._with_parent(lambda parent: self.portals.screencast(
-            widget.id, window=widget.kind == "window", restore_token=token, done=done, failed=failed,
+            widget.link, window=widget.kind == "window", restore_token=token, done=done, failed=failed,
             parent=parent, cursor=widget.source.get("cursor", True)))
 
     def _show_scene(self) -> None:
@@ -1027,18 +1052,6 @@ class StreamyWindow(AppWindow):
                 except ModelError:
                     pass
         self.engine.show_scene(self.project.active_scene, skip=set(self.widget_errors), states=states)
-        self._close_offscene_sound()
-
-    def _close_offscene_sound(self) -> None:
-        """An app-audio capture lives only while its scene is shown; its restore token brings it back."""
-        if self.portals is None:
-            return
-        scene = self.project.active_scene
-        shown = {w.id for w in scene.widgets} if scene else set()
-        for other in self.project.scenes:
-            for w in other.widgets:
-                if w.kind == "app-audio" and w.id not in shown and w.id in self.portals.captures:
-                    self.portals.close(w.id)
 
     @staticmethod
     def problem_words(w: Widget, reason: str) -> str:
@@ -1117,17 +1130,16 @@ class StreamyWindow(AppWindow):
     def _source_size(self, _engine, widget_id: str, width: int, height: int) -> None:
         """The picture's own size (a window's, inside its cast): the widget keeps its place and width and
         takes that shape, unless it was stretched on purpose."""
-        try:
-            _scene, w = self.project.find_widget(widget_id)
-        except ModelError:
+        uses = [w for _s, w in self.project.uses(widget_id)] or \
+            [w for s in self.project.scenes for w in s.widgets if w.id == widget_id]
+        if not uses or not width or not height or uses[0].source.get("size") == [width, height]:
             return
-        if not width or not height or w.source.get("size") == [width, height]:
-            return
-        w.source["size"] = [width, height]
-        # Fitted inside the box it had on each canvas, centred: it never grows past where it was placed.
-        if self.project.reshape(w, fit=True):
-            self.engine.update_widget(w)
-            self._sync_rect(w)
+        uses[0].source["size"] = [width, height]  # the source's, for every scene that shows it
+        for w in uses:
+            # Fitted inside the box it had on each canvas, centred: it never grows past where it was placed.
+            if self.project.reshape(w, fit=True):
+                self.engine.update_widget(w)
+                self._sync_rect(w)
         self._changed()
         self._refresh_bar()
 
@@ -1173,7 +1185,7 @@ class StreamyWindow(AppWindow):
         else:
             w.source.pop("device", None)
             w.source.pop("device-name", None)
-        self.widget_errors.pop(w.id, None)
+        self.widget_errors.pop(w.link, None)
         self._reconnect(w)
         self._changed(structure=True)
         self.refresh_all()
@@ -1183,22 +1195,22 @@ class StreamyWindow(AppWindow):
         device plugged in again reconnects by itself, with nothing to press."""
         from .engine import log
 
-        shown = {w.id for w in self.project.active_scene.widgets} if self.project.active_scene else set()
+        shown = {w.link for w in self._source_widgets(visible=True)}  # every scene's: they stay open
         changed = False
-        for w in [w for scene in self.project.scenes for w in scene.widgets if w.kind in ("camera", "microphone")]:
-            reason = self.widget_errors.get(w.id)
+        for w in self._source_widgets(("camera", "microphone")):
+            reason = self.widget_errors.get(w.link)
             if self.device_missing(w):
                 # A camera is known gone once its stream failed, or its node is gone from a trusted list
                 # while its stream is open; a microphone's stream never fails (it would hear nothing),
                 # so its absence from the device list is enough.
                 live = w.kind == "camera" and reason is None and self.portals is not None and \
-                    w.id in self.portals.captures
+                    w.link in self.portals.captures
                 if reason in ("missing", "stopped") or live or (reason is None and w.kind == "microphone"):
                     if live:
-                        self.portals.close(w.id)
-                        self.engine._remove_branch(w.id)
-                    self.widget_errors[w.id] = "unplugged"
-                    self.widget_waiting.discard(w.id)
+                        self.portals.close(w.link)
+                        self.engine.reopen(w.link)
+                    self.widget_errors[w.link] = "unplugged"
+                    self.widget_waiting.discard(w.link)
                     log(f"{w.kind} widget {w.name!r}: {self.cause_line(w, 'unplugged')}")
                     changed = True
                 continue
@@ -1206,21 +1218,21 @@ class StreamyWindow(AppWindow):
                 device = self.devices.find("source", w.source["device"])
                 if device is not None and w.source.get("device-name") != device.label:
                     w.source["device-name"] = device.label  # its name, for when it is unplugged
-                if reason is None and w.source["device"] in self.devices.returned and w.id in self.engine.branches:
+                if reason is None and w.source["device"] in self.devices.returned and self.engine.has_source(w.link):
                     # Its device went and came back (a restart recreates it): the stream opens on it
                     # again rather than staying on whatever the sound server moved it to meanwhile.
                     log(f"microphone widget {w.name!r}: {self.source_name(w)} came back; listening to it again")
-                    self.engine._remove_branch(w.id)
+                    self.engine.reopen(w.link)
                     changed = True
             if reason == "unplugged":
                 log(f"{w.kind} widget {w.name!r}: {self.source_name(w)} is back")
-                self.widget_errors.pop(w.id, None)
+                self.widget_errors.pop(w.link, None)
                 changed = True
-                if w.id in shown:
+                if w.link in shown:
                     if w.kind == "camera" and self.portals is not None and not self.fake:
                         self._choose_source(w, restore=True)
                     else:
-                        self.engine._remove_branch(w.id)
+                        self.engine.reopen(w.link)
         if changed:
             self._show_scene()
             self.refresh_all()
@@ -1229,7 +1241,7 @@ class StreamyWindow(AppWindow):
         """The one short line beside Try again: what went wrong, by name."""
         name = self.source_name(w)
         if reason is None:
-            return f"{name} isn't sending a picture" if w.id in self.widget_waiting else None
+            return f"{name} isn't sending a picture" if w.link in self.widget_waiting else None
         return {
             "unshared": "Nothing shared yet",
             "ended": "Sharing was stopped",
@@ -1290,9 +1302,9 @@ class StreamyWindow(AppWindow):
         self.refresh_all()
 
     def retry_widget(self, w: Widget) -> None:
-        self.widget_errors.pop(w.id, None)
+        self.widget_errors.pop(w.link, None)
         if self.portals is not None:
-            self.portals.close(w.id)
+            self.portals.close(w.link)
         self.refresh_all()
         if w.kind in ("display", "window", "camera", "app-audio") and not self.fake:
             # Share again: the picker, not the old choice that just failed.
@@ -1400,18 +1412,21 @@ class StreamyWindow(AppWindow):
             return
         self._restoring = True
         try:
-            before = {w.id for s in self.project.scenes for w in s.widgets}
+            before = {link: self._capture_settings(s) for link, s in self.project.sources.items()}
             self.project = Project.from_dict(data)
             if self.fake:
                 self._fill_fake_sources()
+            self.engine.transition = (self.project.transition, self.project.transition_ms)
+            now = {link: self._capture_settings(s) for link, s in self.project.sources.items()}
             after = {w.id for s in self.project.scenes for w in s.widgets}
-            for gone in before - after:
+            for gone in set(before) - set(now):
                 self.widget_errors.pop(gone, None)
                 self.widget_waiting.discard(gone)
                 if self.portals is not None:
                     self.portals.close(gone)
-            for widget_id in list(self.engine.branches):
-                self.engine._remove_branch(widget_id)  # rebuilt with the step's settings
+            for link in set(before) & set(now):
+                if before[link] != now[link]:
+                    self.engine.reopen(link)  # opened again with the step's settings
             if self.selected and self.selected not in after:
                 self.selected = None
             self.formats.set_current(self.project.format)
@@ -1421,6 +1436,14 @@ class StreamyWindow(AppWindow):
             self._ask_missing_sources()
         finally:
             self._restoring = False
+
+    @staticmethod
+    def _capture_settings(source) -> str:
+        """What a source's capture is opened with (not what was learnt about it, nor how it sounds)."""
+        import json
+
+        return json.dumps({k: v for k, v in source.settings.items() if k not in ("size", "sized", "restore-token")},
+                          sort_keys=True, default=str)
 
     # ── Saving ──
 
@@ -1521,7 +1544,7 @@ class StreamyWindow(AppWindow):
         widgets = list(reversed(scene.widgets)) if scene else []
         for w in widgets:
             # Hidden and muted are the trailing key's to say; the meta names what it can't.
-            problem = self.widget_errors.get(w.id) or ("waiting" if w.id in self.widget_waiting else None)
+            problem = self.widget_errors.get(w.link) or ("waiting" if w.link in self.widget_waiting else None)
             # The trailing key states the widget's one switch: a picture's eye, a sound's speaker. Off
             # (hidden, muted) always shows; on waits for the row (hover, selection, focus), so the list
             # reads calm and every row keeps one height.
@@ -1536,8 +1559,12 @@ class StreamyWindow(AppWindow):
             else:
                 key = RowAction("volume-x" if w.muted else "volume-2", f"Unmute {w.name}" if w.muted else f"Mute {w.name}",
                                 lambda wid=w: self._toggle_mute(wid), quiet=not w.muted)
-            row = SidebarRow(w.name, lead=RowLead.icon(w.icon), title_icon="lock" if w.locked else None, trail=key,
+            also = self._also_in(w)
+            row = SidebarRow(w.name, lead=RowLead.icon(w.icon),
+                             title_icon="lock" if w.locked else "link" if also else None, trail=key,
                              muted=not w.visible or bool(problem))
+            if also:
+                row.set_tooltip_text(also)
             row.widget_id = w.id
             click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
             click.connect("pressed", lambda _g, _n, x, y, wid=w.id, r=row: self._widget_menu(wid, r, x, y))
@@ -1598,10 +1625,12 @@ class StreamyWindow(AppWindow):
                 self._inspector_section("scene", "Scene", self._scene_panel(scene))
             return
         self.inspector_tile.set_title(w.name + (on if w.has_picture else ""))
-        self._inspector_section("source", "Source", self._source_panel(w))
+        # A widget linked to other scenes says which of its settings reach them.
+        linked = self.project.is_linked(w)
+        self._inspector_section("source", "Source", self._source_panel(w), note="All scenes" if linked else None)
         if w.has_picture:
-            self._inspector_section("look", "Look", self._look_panel(w))
-            self._inspector_section("arrange", "Arrange", self._arrange_panel(w))
+            self._inspector_section("look", "Look", self._look_panel(w), note="This scene" if linked else None)
+            self._inspector_section("arrange", "Arrange", self._arrange_panel(w), note="This scene" if linked else None)
         if scroll is not None and keep == self._inspector_for:
             GLib.idle_add(lambda: scroll.get_vadjustment().set_value(offset) and False)
 
@@ -1663,8 +1692,8 @@ class StreamyWindow(AppWindow):
                  PanelRow(f"Delete {len(ids)} widgets", icon="trash-2", danger=True, on_activate=self.delete_selected)]
         return self._panel(*rows)
 
-    def _inspector_section(self, key: str, title: str, content: Gtk.Widget) -> None:
-        heading = self.inspector.add_section(title)
+    def _inspector_section(self, key: str, title: str, content: Gtk.Widget, *, note: str | None = None) -> None:
+        heading = self.inspector.add_section(title, count=note) if note else self.inspector.add_section(title)
         self.inspector.add(content)
         self._inspector_sections[key] = heading
 
@@ -1684,6 +1713,12 @@ class StreamyWindow(AppWindow):
                              on_activate=lambda: self.rename_scene(scene.id)))
         rows.append(PanelSwitch("star", "Opens at startup", active=self.project.startup == scene.id,
                                 on_toggle=lambda _on: self.set_startup(scene.id)))
+        # How every scene gives way to the next (the project's, for streams and recordings too).
+        rows.append(PropertyChoice("Transition", [("cut", "Cut", "scissors"), ("fade", "Fade", "blend")],
+                                   current=self.project.transition, segments=True, on_change=self.set_transition))
+        if self.project.transition == "fade":
+            rows.append(self._number("Fade length", self.project.transition_ms, self.set_transition_ms, unit="ms",
+                                     minimum=100, maximum=2000, step=50, name="transition-ms"))
         if self.project.format != self.project.primary:
             rows.append(PanelRow(f"Reset to match {self._primary_words()}", icon="link-2", closes=False,
                                  on_activate=self.reset_secondary))
@@ -1773,9 +1808,9 @@ class StreamyWindow(AppWindow):
         return camera.modes[0] if camera is not None and camera.modes else None
 
     def _source_panel(self, w: Widget) -> Gtk.Widget:
-        problem = self.widget_errors.get(w.id)
+        problem = self.widget_errors.get(w.link)
         parts: list = []
-        if problem is not None or w.id in self.widget_waiting:
+        if problem is not None or w.link in self.widget_waiting:
             parts.append(TypeLabel(self.problem_words(w, problem) if problem else
                                    f"{self.source_name(w)} is connected but hasn't sent a picture yet.",
                                    role="body", wrap=True))
@@ -1948,7 +1983,7 @@ class StreamyWindow(AppWindow):
         self._checkpoint("Change pointer")
         w.source["cursor"] = bool(on)
         if self.portals is not None:
-            self.portals.close(w.id)
+            self.portals.close(w.link)
             self._choose_source(w, restore=True)  # the same choice again, with or without the pointer
 
     def _set_monitor(self, w: Widget, mode: str) -> None:
@@ -1971,8 +2006,8 @@ class StreamyWindow(AppWindow):
     def _reconnect(self, w: Widget) -> None:
         """A source setting changed: its stream starts again with it."""
         if self.portals is not None and w.kind == "camera":
-            self.portals.close(w.id)
-            self.widget_errors.pop(w.id, None)
+            self.portals.close(w.link)
+            self.widget_errors.pop(w.link, None)
             self._restart_widget(w)
             self._choose_source(w, restore=True)
         else:
@@ -2246,12 +2281,12 @@ class StreamyWindow(AppWindow):
         if self.portals is None:
             return
         self._checkpoint(f"Change {w.name} source")
-        self.portals.close(w.id)
+        self.portals.close(w.link)
         w.source.pop("restore-token", None)
         w.source.pop("sized", None)
-        self.widget_errors.pop(w.id, None)
-        self.widget_waiting.discard(w.id)
-        self.engine._remove_branch(w.id)
+        self.widget_errors.pop(w.link, None)
+        self.widget_waiting.discard(w.link)
+        self.engine.reopen(w.link)
         self.center.fold()
         self._choose_source(w, restore=False)
 
@@ -2285,7 +2320,7 @@ class StreamyWindow(AppWindow):
         dialog.open(self, None, chosen)
 
     def _restart_widget(self, w: Widget) -> None:
-        self.engine._remove_branch(w.id)
+        self.engine.reopen(w.link)
         self._show_scene()
         self._changed(structure=True)
 
@@ -2330,11 +2365,11 @@ class StreamyWindow(AppWindow):
             pick.connect("released", lambda *_a, wid=w: self.select(wid.id))
             strip.add_controller(pick)
             self.mixer_row.append(strip)
-            self._strips[w.id] = strip
+            self._strips[w.link] = strip
         self.dock.refit()
 
     def _volume_moved(self, w: Widget, value: float) -> None:
-        self._checkpoint(f"Change {w.name} gain", key=(w.id, "gain"))
+        self._checkpoint(f"Change {w.name} gain", key=(w.link, "gain"))
         self._set_volume(w, value)
 
     def _monitor_toggled(self, w: Widget, on: bool) -> None:
@@ -2342,9 +2377,9 @@ class StreamyWindow(AppWindow):
         if on == (w.monitor != "off"):
             return
         if on:
-            self._set_monitor(w, self._monitor_last.get(w.id, "both"))
+            self._set_monitor(w, self._monitor_last.get(w.link, "both"))
         else:
-            self._monitor_last[w.id] = w.monitor
+            self._monitor_last[w.link] = w.monitor
             self._set_monitor(w, "off")
 
     def _levels(self, _engine, widget_id: str, left: float, right: float) -> None:
@@ -2405,37 +2440,37 @@ class StreamyWindow(AppWindow):
             return
         from .engine import log
 
-        shown = {w.id for w in self.project.active_scene.widgets if w.visible} if self.project.active_scene else set()
+        shown = {w.link for w in self._source_widgets(visible=True)}  # every scene's: they stay open
         opening = getattr(self, "_camera_opening", set())
         changed = False
-        for w in [w for scene in self.project.scenes for w in scene.widgets if w.kind == "camera"]:
+        for w in self._source_widgets(("camera",)):
             camera = self.portals.cameras.find(w.source.get("camera"))
-            if camera is None or w.id in opening:
+            if camera is None or w.link in opening:
                 continue
-            capture = self.portals.captures.get(w.id)
-            reason = self.widget_errors.get(w.id)
-            recovering = w.id in shown and self._recovering_now(w.id)
+            capture = self.portals.captures.get(w.link)
+            reason = self.widget_errors.get(w.link)
+            recovering = w.link in shown and self._recovering_now(w.link)
             if capture is not None:
                 if capture.node == camera.target:
                     continue
                 why = "is on a new node"
-            elif reason in ("missing", "stopped", "nocamera") and self.portals.last_node.get(w.id) != camera.target:
+            elif reason in ("missing", "stopped", "nocamera") and self.portals.last_node.get(w.link) != camera.target:
                 why = "is on a new node"
             elif reason in ("missing", "stopped", "nocamera", None) and recovering:
                 why = "is back after a restart"
             else:
                 continue
-            state = getattr(self, "_recovering", {}).get(w.id)
+            state = getattr(self, "_recovering", {}).get(w.link)
             if why == "is on a new node" and state is None:
-                self._recover(w.id)
-            state = self._recovering[w.id] if w.id in getattr(self, "_recovering", {}) else None
+                self._recover(w.link)
+            state = self._recovering[w.link] if w.link in getattr(self, "_recovering", {}) else None
             if state is not None:
                 state[1], state[2] = state[1] + 1, time.monotonic()
             log(f"camera widget {w.name!r}: {camera.label} {why}; opening it again")
-            self.widget_errors.pop(w.id, None)
-            self.widget_waiting.discard(w.id)
-            self.portals.close(w.id)
-            self.engine._remove_branch(w.id)
+            self.widget_errors.pop(w.link, None)
+            self.widget_waiting.discard(w.link)
+            self.portals.close(w.link)
+            self.engine.reopen(w.link)
             if w.id in shown:
                 self._choose_source(w, restore=True)
             changed = True
@@ -2449,9 +2484,8 @@ class StreamyWindow(AppWindow):
         self.devices.restart()
         cameras = self.portals.cameras if self.portals is not None else None
         if hasattr(cameras, "reopen"):
-            for w in self.project.active_scene.widgets if self.project.active_scene else []:
-                if w.kind == "camera":
-                    self._recover(w.id)
+            for w in self._source_widgets(("camera",)):
+                self._recover(w.link)
             cameras.reopen(f"{unit} started again")
 
     #: Why the camera list is empty, in words.
@@ -2518,24 +2552,25 @@ class StreamyWindow(AppWindow):
                                              on_activate=self.delete_selected)]
             items.append(SEPARATOR)
         elif w is not None:
-            cause = self.cause_line(w, self.widget_errors.get(w.id))
-            items.append(BarChip(w.name, detail=cause, on_dismiss=self.deselect) if cause else
-                         BarChip(w.name, on_dismiss=self.deselect))
+            cause = self.cause_line(w, self.widget_errors.get(w.link))
+            linked = "link" if self.project.is_linked(w) else None
+            items.append(BarChip(w.name, icon=linked, detail=cause, on_dismiss=self.deselect) if cause else
+                         BarChip(w.name, icon=linked, on_dismiss=self.deselect))
             # Source first: what makes the widget work, its summary as the key's words.
             items.append(BarAction(KINDS[w.kind][1], self.source_summary(w), on_activate=lambda: self._grow("source")))
             if w.has_picture:
                 items.append(BarAction("crop", tooltip="Crop on the canvas",
                                        on_activate=lambda: self.arrange.set_cropping(w.id)))
-            fix = self.fix_words(w, self.widget_errors[w.id]) if w.id in self.widget_errors else None
-            stand_in = self.stand_in(w) if self.widget_errors.get(w.id) == "unplugged" else None
+            fix = self.fix_words(w, self.widget_errors[w.link]) if w.link in self.widget_errors else None
+            stand_in = self.stand_in(w) if self.widget_errors.get(w.link) == "unplugged" else None
             if stand_in is not None:
                 items.append(BarAction("replace", f"Use {stand_in.label}", on_activate=lambda: self.use_stand_in(w)))
             if fix:
                 items.append(BarAction("monitor-up" if w.kind in ("display", "window") else "rotate-ccw", fix,
                                        on_activate=lambda: self.retry_widget(w)))
-            elif w.id in self.widget_waiting:
+            elif w.link in self.widget_waiting:
                 items.append(BarAction("rotate-ccw", "Try again",
-                                       on_activate=lambda: (self.widget_waiting.discard(w.id),
+                                       on_activate=lambda: (self.widget_waiting.discard(w.link),
                                                             self._restart_widget(w))))
             if w.has_picture:
                 switch = BarAction("eye" if not w.visible else "eye-off", "Show" if not w.visible else "Hide",
@@ -2834,7 +2869,7 @@ class StreamyWindow(AppWindow):
                      height: float) -> None:
         """The preview on screen now draws ``widget_id`` here: a dragged widget's outline stays on its picture."""
         if fmt != self.project.format or widget_id not in self._following or \
-                not hasattr(self.arrange, "set_item_shown_rect"):
+                not hasattr(self.arrange, "set_item_shown_rect") or not self._on_stage(widget_id):
             return
         self.arrange.set_item_shown_rect(widget_id, x, y, width, height)
         final = self._following[widget_id]
@@ -2943,11 +2978,8 @@ class StreamyWindow(AppWindow):
         if len(ids) > 1:
             self._checkpoint(f"Delete {len(ids)} widgets")
             for widget_id in ids:
-                self.project.remove_widget(widget_id)
-                self.widget_errors.pop(widget_id, None)
-                self.widget_waiting.discard(widget_id)
-                if self.portals is not None:
-                    self.portals.close(widget_id)
+                _s, _i, removed = self.project.remove_widget(widget_id)
+                self._forget_source(removed.link)
             self.selected, self.selection = None, []
             self._show_scene()
             self._changed(structure=True)
@@ -2959,31 +2991,94 @@ class StreamyWindow(AppWindow):
         self._checkpoint(f"Delete {w.name}")
         _scene, _index, removed = self.project.remove_widget(w.id)
         self.selected = None
-        self.widget_errors.pop(removed.id, None)
-        self.widget_waiting.discard(removed.id)
         self._show_scene()
-        if self.portals is not None:
-            self.portals.close(removed.id)  # its restore token stays in the undo step
+        self._forget_source(removed.link)
         self._changed(structure=True)
         Toast.show(self.host, f"Deleted {removed.name}", kind="deleted", undo=self.undo)
+
+    # ── Copy and paste, linked across scenes ──
+
+    def _also_in(self, w: Widget) -> str:
+        """"Also in Scene 2" (every other scene using its source), or "" when it is in this scene only."""
+        names = [s.name for s in self.project.other_scenes(w)]
+        if not names:
+            return ""
+        return "Also in " + (names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1])
+
+    def copy_selected(self) -> None:
+        """Copy the selection (a field being typed in copies its text)."""
+        text = self._editing_text()
+        if text is not None:
+            text.activate_action("clipboard.copy", None)
+            return
+        ws = self._targets()
+        if ws:
+            # Detached entries on the same sources: a paste links them, wherever and whenever it goes.
+            self._clipboard = [self.project._entry(w, linked=True) for w in ws]
+
+    def _paste_rows(self) -> list:
+        if not getattr(self, "_clipboard", None):
+            return []
+        return [MenuItem("Paste", icon="clipboard", shortcut="Ctrl+V", on_activate=self.paste),
+                MenuItem("Paste as new widget", icon="copy-plus", shortcut="Ctrl+Shift+V",
+                         on_activate=lambda: self.paste(linked=False))]
+
+    def paste(self, linked: bool = True) -> None:
+        """Paste what was copied on top of this scene, where it was: linked to the same sources (nothing
+        opens again; renaming or a new camera mode reach every scene), or each with a source of its own.
+        Its place and Look start as the copy's and are this scene's from then on."""
+        text = self._editing_text()
+        if text is not None:
+            text.activate_action("clipboard.paste", None)
+            return
+        clip, scene = getattr(self, "_clipboard", None), self.project.active_scene
+        if not clip or scene is None:
+            return
+        self._checkpoint(self._count(clip, "Paste", "Paste") if linked else
+                         self._count(clip, "Paste as new", "Paste as new"))
+        pasted = []
+        for entry in clip:
+            current = self.project.sources.get(entry.link)
+            if current is not None and current.kind == entry.kind:
+                entry.shared = current  # the source as it is now (an undo may have rebuilt it)
+            pasted.append(self.project.paste_widget(scene.id, entry, linked=linked).id)
+        self.selected, self.selection = pasted[-1], pasted
+        self._changed(structure=True)
+        self._show_scene()
+        self._ask_missing_sources()
+        if len(pasted) > 1:
+            self.set_selection(pasted)
+
+    def unlink_widget(self, w: Widget) -> None:
+        """This scene's widget keeps its source (and its picture); the other scenes' move to a copy of it."""
+        if not self.project.is_linked(w):
+            return
+        self._checkpoint(f"Unlink {w.name}")
+        self.project.unlink(w.id)
+        self._changed(structure=True)
+        self._show_scene()
+        self._ask_missing_sources()
+
+    def _forget_source(self, link: str) -> None:
+        """A widget left its scene: its source closes once no scene uses it (its restore token stays in
+        the undo step)."""
+        if link in self.project.sources:
+            return
+        self.widget_errors.pop(link, None)
+        self.widget_waiting.discard(link)
+        if self.portals is not None:
+            self.portals.close(link)
 
     def duplicate_selected(self) -> None:
         ws = self._targets()
         scene = self.project.active_scene
         if not ws or scene is None:
             return
-        import copy
-
-        from .model import new_id
-
         self._checkpoint(self._count(ws, "Duplicate", "Duplicate"))
         twins = []
         for w in ws:
-            twin = copy.deepcopy(w)
-            twin.id = new_id(w.kind)
-            twin.name = ""
-            twin.name = self.project._next_widget_name(scene, w.kind)
-            twin.source.pop("restore-token", None)  # a second share: its own picker
+            # A source of its own (a second share: its own picker); a camera's picture is still one stream.
+            twin = self.project._entry(w, linked=False, kind_name=scene)
             if w.has_picture:
                 twin.x, twin.y = w.x + 40, w.y + 40
             scene.widgets.insert(scene.widgets.index(w) + 1, twin)
@@ -3102,6 +3197,13 @@ class StreamyWindow(AppWindow):
                                  on_activate=lambda: self._toggle_mute(w)))
         rows += [MenuItem("Rename", icon="pencil", shortcut="F2", on_activate=lambda: self.rename_widget(w)),
                  MenuItem("Duplicate", icon="copy", on_activate=self.duplicate_selected),
+                 MenuItem("Copy", icon="copy", shortcut="Ctrl+C", on_activate=self.copy_selected),
+                 *self._paste_rows()]
+        also = self._also_in(w)
+        if also:
+            rows.append(MenuItem("Unlink from other scenes", icon="unlink", note=also,
+                                 on_activate=lambda: self.unlink_widget(w)))
+        rows += [
                  MenuItem("Unlock" if w.locked else "Lock", icon="lock-open" if w.locked else "lock",
                           on_activate=self.toggle_lock),
                  None,
@@ -3182,7 +3284,7 @@ class StreamyWindow(AppWindow):
         """Blank space's menu (the canvas, the Widgets panel): the + menu's kinds, from the same commands."""
         from luma_appkit.action_bubble import FloatingMenu
 
-        rows: list = ["Add widget"]
+        rows: list = self._paste_rows() + ([None] if getattr(self, "_clipboard", None) else []) + ["Add widget"]
         for kind in self._addable():
             command = self.commands.get(f"widget.add-{kind}")
             rows.append(MenuItem(command.label.replace("Add ", "").capitalize(), icon=command.icon,
@@ -3294,6 +3396,23 @@ class StreamyWindow(AppWindow):
         FloatingMenu(rows, label=scene.name, title=scene.name).popup(anchor, x=x, y=y)
         self._last_menu = rows  # tests activate each row
 
+    def set_transition(self, kind: str) -> None:
+        if kind == self.project.transition or kind not in ("cut", "fade"):
+            return
+        self._checkpoint("Change transition")
+        self.project.transition = kind
+        self.engine.transition = (self.project.transition, self.project.transition_ms)
+        self._changed(structure=True)
+
+    def set_transition_ms(self, value: float) -> None:
+        ms = int(max(100, min(2000, round(value))))
+        if ms == self.project.transition_ms:
+            return
+        self._checkpoint("Change fade length", key="transition-ms")
+        self.project.transition_ms = ms
+        self.engine.transition = (self.project.transition, self.project.transition_ms)
+        self._changed()
+
     def set_startup(self, scene_id: str) -> None:
         self._checkpoint("Set startup scene")
         self.project.startup = None if self.project.startup == scene_id else scene_id
@@ -3311,6 +3430,11 @@ class StreamyWindow(AppWindow):
             self.switch_scene(scene_id)
 
     def switch_scene(self, scene_id: str) -> None:
+        # A drag's outline belongs to its scene's preview: the next scene's has none of its boxes.
+        for widget_id in list(self._following):
+            if self._on_stage(widget_id) and hasattr(self.arrange, "clear_item_shown_rect"):
+                self.arrange.clear_item_shown_rect(widget_id)
+        self._following.clear()
         self.project.activate(scene_id)
         self.select(None)  # a selection belongs to its scene
         self._show_scene()
@@ -3358,9 +3482,8 @@ class StreamyWindow(AppWindow):
             return
         self._checkpoint(f"Delete {scene.name}")
         index, removed = self.project.remove_scene(scene.id)
-        if self.portals is not None:
-            for w in removed.widgets:
-                self.portals.close(w.id)
+        for w in removed.widgets:
+            self._forget_source(w.link)
         self.switch_scene(self.project.active)
         Toast.show(self.host, f"Deleted {removed.name}", kind="deleted", undo=self.undo)
 
@@ -3368,8 +3491,6 @@ class StreamyWindow(AppWindow):
 
     def _canvas_more(self, fmt: str) -> list:
         """A canvas panel's ⋯: turn it off, and the other canvas on or off ("· Off" while it is off)."""
-        from luma_appkit import MenuItem
-
         rows = []
         for key in sorted(FORMATS, key=lambda k: k != fmt):
             name = canvas_name(key)

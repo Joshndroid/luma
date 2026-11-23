@@ -312,6 +312,12 @@ def picture_chain(widget: Widget, zorder: int, *, fake: bool = False, fd: int | 
     ``hw_decode``)."""
     prefix = branch_prefix(widget, generation)
     elements = _capture_head(widget, prefix, fake, fd, node, hw_decode)
+    if widget.kind in ("camera", "display", "window"):
+        # Parked while no shown scene uses it: the source stays open, its pictures are dropped before
+        # they are decoded, uploaded or converted (its stream stays negotiated). A camera's all of them;
+        # a screen's but one a second (Engine._trickle), so it has a recent picture to show at once.
+        at = next((i for i, e in enumerate(elements) if e.factory == "decodebin"), len(elements))
+        elements.insert(at, Element("valve", f"{prefix}-park", {"drop": False, "drop-mode": "forward-sticky-events"}))
     elements += [
         Element("queue", f"{prefix}-queue", {"max-size-buffers": 2, "leaky": 2}),
         Element("glupload", f"{prefix}-upload"),
@@ -341,8 +347,11 @@ LAYER_LATENCY = {"source-latency": 0}
 
 def layer_chain(widget: Widget, zorder: int, prefix: str, fmt: str) -> Chain:
     """A picture widget drawn on canvas ``fmt``: ``widget`` is placed and styled as that canvas has it.
-    The queue lets one canvas's mixer never hold up another's."""
-    return Chain([Element("queue", f"{prefix}-{fmt}-lqueue", {"max-size-buffers": 1, "max-size-bytes": 0,
+    The valve passes pictures only while the widget's scene is shown (a widget of another scene costs
+    nothing but its place); the queue lets one canvas's mixer never hold up another's."""
+    # Closed, it still passes the stream's caps and segment: the layer stays negotiated, ready to draw.
+    return Chain([Element("valve", f"{prefix}-{fmt}-valve", {"drop": False, "drop-mode": "forward-sticky-events"}),
+                  Element("queue", f"{prefix}-{fmt}-lqueue", {"max-size-buffers": 1, "max-size-bytes": 0,
                                                                "max-size-time": 0, "leaky": 2}),
                   Element("lumaframe", f"{prefix}-{fmt}-frame", {**frame_props(widget), **LAYER_LATENCY})],
                  f"mixer-{fmt}", mixer_pad_props(widget, zorder))
@@ -425,6 +434,8 @@ def sound_chain(widget: Widget, *, fake: bool = False, fd: int | None = None, no
         Element("level", f"{prefix}-level", {"interval": 100_000_000, "post-messages": True}),
         # The monitor (headphones) hangs off this tee only while it is on.
         Element("tee", f"{prefix}-atee", {"allow-not-linked": True}),
+        # Heard in what is sent only while a shown scene uses it: faded on the program clock.
+        Element("volume", f"{prefix}-gate", {"volume": 1.0}),
         Element("queue", f"{prefix}-aqueue", {"max-size-time": 200_000_000, "leaky": 2}),
     ], "audiomixer", {"mute": widget.monitor == "only"})
 

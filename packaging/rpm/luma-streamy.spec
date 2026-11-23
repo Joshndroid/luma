@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.18%{?dist}
+Release:        1.luma.19%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -183,6 +183,19 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.19
+- Every scene's sources stay open: a scene switch reopens nothing and shows
+  no "Connecting" card. A source no shown scene uses is parked (a camera's
+  pictures are dropped before decoding, a screen passes one a second).
+- Scene transitions: Fade (300 ms by default) or Cut, set with nothing
+  selected in the Inspector. Keyframed on the program clock, so streams and
+  recordings fade too; a picture in both scenes glides to its new place.
+- Linked widgets: Paste (Ctrl+V) links a widget into another scene, sharing
+  its source, name and sound while its place and Look stay its own. Paste as
+  new widget, Unlink from other scenes; a link icon marks shared widgets.
+- Duplicate scene links its widgets; older projects link identical sources.
+- The canvas ⋯ menu opens again.
+
 * Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.18
 - Go live appears and goes the moment a stream destination is turned on or
   off, added or removed (the bar followed only the next other event).
