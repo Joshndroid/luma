@@ -351,3 +351,15 @@ Systems, Inc.") and a row that opens Cisco's terms
 rule allows for the active local session, then reads the status again.
 Without luma-openh264 the rows are left out; the Apps page does not wait for
 the status.
+
+`0112-lumaui-settings-list-first-at-phone-width.patch`: the window chose its
+layout once, from the device identity, so a computer's window at phone width
+(a phone shell, a narrow tile, a 400 px VM) kept the two panes, and their
+minimum width held it wider than the screen. On a computer the window now has
+a breakpoint under the phone tier (560 px, or the two panes' own minimum width
+where that is wider): under it the sidebar and the island move into a
+`LumaListFirst` (list, push, Back); wider, `set_frame` lays out the two panes
+as before. Narrowing shows the page the window was on; a window opened narrow
+shows the list unless a page was asked for. A TV keeps its frame.
+`test-luma-window` covers open narrow, push/Back, widen, narrow again and a
+1180 px open.

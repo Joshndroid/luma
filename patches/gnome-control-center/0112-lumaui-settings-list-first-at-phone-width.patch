@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Luma <engineering@projectluma.org>
+Date: Sun, 22 Nov 2026 07:00:00 -0600
+Subject: [PATCH] LumaUI Settings: the list first at phone width on any device
+
+The window picked its layout once, from the device identity: a phone got
+the list first, everything else the two panes. A computer's window at
+phone width (a phone shell, a narrow tile, a 400 px VM) kept the two
+panes, and their minimum width held the window wider than the screen.
+
+On a computer the window now has a breakpoint under the phone tier
+(560 px, or the two panes' own minimum width where that is wider). Under
+it the sidebar and the island move into a LumaListFirst: the list is the
+screen, a pick pushes the page, Back returns. Wider, set_frame lays out
+the two panes as before. Narrowing shows the page the window was on; a
+window opened narrow shows the list unless a page was asked for. A TV
+keeps its frame at any width. The phone identity path is unchanged.
+
+Moving a part that holds the focus keeps the focus in the part on
+screen; GTK's own fallback focused the first sidebar row, and focusing a
+row selects it, which opened another page.
+
+Without a title island the kit's floating back button holds the top
+left, so the page's first row (its title, or a subpage's way up) starts
+after it: the button's width plus the island's gap from its back button
+to its title.
+
+A page's own phone breakpoint draws the page again at once instead of
+queueing it: narrowing a computer's window put the wide page in a
+phone-width bin for a frame, wider than the bin.
+---
+diff --git a/shell/cc-luma-view.c b/shell/cc-luma-view.c
+index b40dc46..3e97e5d 100644
+--- a/shell/cc-luma-view.c
++++ b/shell/cc-luma-view.c
+@@ -1786,9 +1786,23 @@ void cc_luma_view_set_list_handler (GtkWidget *root, CcLumaViewListFunc handler,
+   v->list_handler = handler;
+   v->list_data = data;
+ }
+-/* Phone width changes some pages' anatomy (v70 #w-settings.phone rules). */
+-static void phone_applied (View *v) { if (!v->phone) { v->phone = TRUE; cc_luma_view_queue_refresh (v); } }
+-static void phone_unapplied (View *v) { if (v->phone) { v->phone = FALSE; cc_luma_view_queue_refresh (v); } }
++/* Phone width changes some pages' anatomy (v70 #w-settings.phone rules). The page is drawn again at
++ * once: the breakpoint applies before its bin measures the page, so the bin measures the page for its
++ * width (a queued redraw left a computer's wide page in a phone-width bin for a frame). A drag, an open
++ * menu or a password being typed keeps the queued redraw, as any redraw does. */
++static void phone_changed (View *v, gboolean phone)
++{
++  if (v->phone == phone) return;
++  v->phone = phone;
++  cc_luma_view_queue_refresh (v);
++  if (v->display_dragging || v->joining ||
++      (v->open_menu && luma_floating_menu_get_is_open (LUMA_FLOATING_MENU (v->open_menu))))
++    return;
++  g_clear_handle_id (&v->refresh, g_source_remove);
++  render (v);
++}
++static void phone_applied (View *v) { phone_changed (v, TRUE); }
++static void phone_unapplied (View *v) { phone_changed (v, FALSE); }
+ static void live_write_error (CcLumaFixture *model, const GError *error, GtkWidget *root);
+ static GtkWidget *new_view (CcLumaFixture *model, const char *page, CcLumaLiveLock *live_lock, CcLumaLivePermission *live_permission, GError **error)
+ {
+diff --git a/shell/cc-luma-window.c b/shell/cc-luma-window.c
+index 3566197..a737d9c 100644
+--- a/shell/cc-luma-window.c
++++ b/shell/cc-luma-window.c
+@@ -77,16 +77,24 @@ typedef struct {
+   GtkListBox *list;
+   GHashTable *rows; /* id → LumaNavigationRow */
+   JsonArray *groups; /* CFGRPS: the desktop's sections */
+-  GtkWidget *stack;  /* a phone: the list first (LumaListFirst) */
++  GtkWidget *stack;  /* a phone, or a computer at phone width: the list first (LumaListFirst) */
+   char *shown;       /* the page last shown, so only a new page pushes */
+   gboolean following;
+   gboolean tv;       /* the island carries the TV destinations */
+   GtkWidget *sidebar;
+   char *hardware;    /* which hardware-bound destinations are listed */
++  GtkWidget *window; /* weak */
++  GtkWidget *island;
++  AdwBreakpoint *narrow;  /* a computer: under this width, the list first (the window owns it) */
++  int narrow_below;       /* ...the phone tier, or the two panes' own minimum width if that is wider */
++  guint fit_source;
++  gboolean want_page;     /* narrowing shows the page rather than the list */
+ } Frame;
+ 
+ static void frame_free (Frame *f)
+ {
++  g_clear_handle_id (&f->fit_source, g_source_remove);
++  g_clear_weak_pointer (&f->window);
+   g_clear_object (&f->model);
+   g_clear_object (&f->search_item);
+   g_free (f->shown);
+@@ -248,6 +256,8 @@ static void follow_page (CcLumaShell *shell, const char *page, gpointer data)
+   f->following = FALSE;
+   /* A phone: a page opened by any route but Back (a picked row is pushed by the kit itself, the
+    * account card, a subpage, a panel asked for from outside) shows the page, not the list. */
++  if (f->window && gtk_widget_get_mapped (f->window) && g_strcmp0 (f->shown, page) != 0)
++    f->want_page = TRUE; /* a computer narrowed later shows the page it was on */
+   if (f->stack && g_strcmp0 (f->shown, page) != 0)
+     luma_list_first_show_detail (LUMA_LIST_FIRST (f->stack));
+   g_free (f->shown);
+@@ -411,10 +421,118 @@ static void rebuild_destinations (Frame *f)
+   f->following = FALSE;
+ }
+ 
++/* A computer's window at phone width (a narrow tile, a phone shell, a 400 px VM) is laid out as a phone's:
++ * the list is the screen, a pick pushes the page, Back returns to the list; wider again, the two panes.
++ * The window's breakpoint moves the sidebar and the island before the window lays them out, and lets the
++ * window be that narrow at all: without one, the two panes' minimum width held it wider than the screen. */
++static void detach_part (GtkWidget *part)
++{
++  GtkWidget *parent = gtk_widget_get_parent (part);
++  if (!parent) return;
++  if (GTK_IS_OVERLAY (parent) && gtk_overlay_get_child (GTK_OVERLAY (parent)) == part)
++    gtk_overlay_set_child (GTK_OVERLAY (parent), NULL);
++  else if (GTK_IS_BOX (parent))
++    gtk_box_remove (GTK_BOX (parent), part);
++  else
++    gtk_widget_unparent (part);
++}
++
++static void narrow_showing (LumaListFirst *stack, const char *which, Frame *f)
++{
++  f->want_page = g_str_equal (which, "detail");
++}
++
++static void queue_fit (Frame *f);
++static void place_parts (Frame *f, gboolean narrow)
++{
++  if (!f->window || narrow == (f->stack != NULL)) return;
++  GtkWidget *focus = gtk_root_get_focus (GTK_ROOT (f->window));
++  if (focus) g_object_ref (focus);
++  g_object_ref (f->sidebar);
++  g_object_ref (f->island);
++  detach_part (f->sidebar);
++  detach_part (f->island);
++  if (narrow)
++    {
++      gboolean page = f->want_page;
++      f->stack = luma_list_first_new (f->sidebar, f->island, "Settings");
++      gtk_widget_set_name (f->stack, "cf-list-first");
++      g_signal_connect (f->stack, "showing", G_CALLBACK (narrow_showing), f);
++      luma_application_window_set_body (LUMA_APPLICATION_WINDOW (f->window), f->stack);
++      if (page) luma_list_first_show_detail (LUMA_LIST_FIRST (f->stack));
++    }
++  else
++    {
++      f->stack = NULL; /* set_frame replaces it as the body */
++      luma_application_window_set_frame (LUMA_APPLICATION_WINDOW (f->window), f->sidebar, f->island);
++      queue_fit (f);
++    }
++  /* Moving a part that held the focus makes GTK move it after the next paint, to the first focusable
++   * widget: a sidebar row, and focusing a row selects it, which opened that page. Keep the focus in
++   * the part on screen (where it was, else the page's row, else the page), so GTK has nothing to move. */
++  if (gtk_widget_get_mapped (f->window))
++    {
++      GtkWidget *shown = !f->stack ? NULL
++                         : g_str_equal (luma_list_first_get_showing (LUMA_LIST_FIRST (f->stack)), "detail") ? f->island
++                         : f->sidebar;
++      GtkWidget *row = GTK_WIDGET (gtk_list_box_get_selected_row (f->list));
++      if (!(focus && gtk_widget_get_root (focus) == GTK_ROOT (f->window) &&
++            (!shown || gtk_widget_is_ancestor (focus, shown)) && gtk_widget_grab_focus (focus)) &&
++          !(row && shown != f->island && gtk_widget_grab_focus (row)) && shown != f->sidebar)
++        gtk_widget_child_focus (f->island, GTK_DIR_TAB_FORWARD);
++    }
++  g_clear_object (&focus);
++  g_object_unref (f->island);
++  g_object_unref (f->sidebar);
++}
++
++static void narrow_applied (AdwBreakpoint *breakpoint, Frame *f) { place_parts (f, TRUE); }
++static void narrow_unapplied (AdwBreakpoint *breakpoint, Frame *f) { place_parts (f, FALSE); }
++
++static void set_narrow_below (Frame *f, int below)
++{
++  if (below == f->narrow_below) return;
++  f->narrow_below = below;
++  g_autofree char *condition = g_strdup_printf ("max-width: %dpx", below - 1);
++  adw_breakpoint_set_condition (f->narrow, adw_breakpoint_condition_parse (condition));
++}
++
++/* The two panes switch to the list first under the phone tier, or under their own minimum width where
++ * that is wider (a large text scale), so they are never laid out narrower than they fit. */
++static gboolean fit_narrow (gpointer data)
++{
++  Frame *f = data;
++  f->fit_source = 0;
++  if (!f->window || f->stack || f->tv) return G_SOURCE_REMOVE;
++  int min = 0;
++  gtk_widget_measure (adw_application_window_get_content (ADW_APPLICATION_WINDOW (f->window)),
++                      GTK_ORIENTATION_HORIZONTAL, -1, &min, NULL, NULL, NULL);
++  set_narrow_below (f, MAX (LUMA_TIER_PHONE_BELOW, min + 1));
++  return G_SOURCE_REMOVE;
++}
++
++static void queue_fit (Frame *f)
++{
++  if (!f->fit_source) f->fit_source = g_idle_add (fit_narrow, f);
++}
++
++static void fit_mapped (GtkWidget *window, Frame *f) { queue_fit (f); }
++
+ /* TV posture turned on or off: the island's destinations follow; the page draws again. */
+ static void posture_changed (GObject *context, GParamSpec *pspec, Frame *f)
+ {
+   if (f->tv == (tv_posture () && !phone_form_factor ())) return;
++  if (f->narrow)
++    {
++      /* A TV keeps its frame (luma-tv-frame.c) at any width. */
++      if (!f->tv) adw_breakpoint_set_condition (f->narrow, NULL);
++      else
++        {
++          int below = f->narrow_below;
++          f->narrow_below = 0;
++          set_narrow_below (f, below);
++        }
++    }
+   rebuild_destinations (f);
+   cc_luma_shell_redraw (CC_LUMA_SHELL (f->shell));
+   follow_page (CC_LUMA_SHELL (f->shell), cc_luma_shell_get_page (CC_LUMA_SHELL (f->shell)), f);
+@@ -500,8 +618,22 @@ GtkWidget *cc_luma_window_new (GtkApplication *application, CcLumaFixture *model
+         luma_list_first_show_detail (LUMA_LIST_FIRST (f->stack)); /* asked for a page: open on it */
+     }
+   else
+-    /* Nick, 30 Sep: no hide/show sidebar button on a computer. */
+-    luma_application_window_set_frame (LUMA_APPLICATION_WINDOW (window), sidebar, island);
++    {
++      /* Nick, 30 Sep: no hide/show sidebar button on a computer. */
++      luma_application_window_set_frame (LUMA_APPLICATION_WINDOW (window), sidebar, island);
++      g_set_weak_pointer (&f->window, window);
++      f->island = island;
++      f->want_page = g_getenv ("LUMA_SETTINGS_PAGE") && *g_getenv ("LUMA_SETTINGS_PAGE");
++      g_autofree char *condition = g_strdup_printf ("max-width: %dpx", LUMA_TIER_PHONE_BELOW - 1);
++      f->narrow_below = LUMA_TIER_PHONE_BELOW;
++      f->narrow = adw_breakpoint_new (adw_breakpoint_condition_parse (condition));
++      g_signal_connect (f->narrow, "apply", G_CALLBACK (narrow_applied), f);
++      g_signal_connect (f->narrow, "unapply", G_CALLBACK (narrow_unapplied), f);
++      if (f->tv) adw_breakpoint_set_condition (f->narrow, NULL); /* a TV keeps its frame */
++      adw_application_window_add_breakpoint (ADW_APPLICATION_WINDOW (window), f->narrow);
++      g_signal_connect (window, "map", G_CALLBACK (fit_mapped), f);
++      queue_fit (f);
++    }
+ 
+   g_object_set_data_full (G_OBJECT (window), "cf-frame", f, (GDestroyNotify) frame_free);
+   /* Opening on a page with a text field put a blinking caret in it (About, Sharing): the window starts
+@@ -533,6 +665,7 @@ void
+ cc_luma_window_show_page (GtkWindow *window)
+ {
+   Frame *f = window ? g_object_get_data (G_OBJECT (window), "cf-frame") : NULL;
++  if (f) f->want_page = TRUE;
+   /* follow_page pushes a page only when it changes; the same page asked for again after Back
+    * (gnome-control-center wwan, a second time) must leave the list too. */
+   if (f && f->stack && !g_str_equal (luma_list_first_get_showing (LUMA_LIST_FIRST (f->stack)), "detail"))
+diff --git a/shell/luma-settings.css b/shell/luma-settings.css
+index b0e1828..e8a46b6 100644
+--- a/shell/luma-settings.css
++++ b/shell/luma-settings.css
+@@ -8,6 +8,12 @@
+ .cf-back:hover { background: @luma_hover; color: @luma_ink; }
+ .cf-back image { -gtk-icon-size: 16px; }
+ .cf-head { min-height: 52px; }
++/* List first without a title island (a computer at phone width): the kit's floating ‹ holds the top left,
++ * so the page's first row starts after it, the island's own gap from its ‹ to its title. */
++#cf-list-first box:not(.cf-island-page) > box.cf-head {
++  margin-left: calc(var(--lumaui-list-first-back) + var(--lumaui-title-island-text-padding-start)); }
++#cf-list-first box:not(.cf-island-page) > button.cf-back {
++  margin-left: calc(var(--lumaui-list-first-back) + var(--lumaui-title-island-text-padding-start) - 6px); }
+ /* v71 phone: under the title island the page's first block sits 16 below it (.cfpage > :first-of-type { margin-top: 0 }) */
+ .cf-island-page > .cf-hero:first-child, .cf-island-page > .cf-group:first-child { margin-top: 0; }
+ label.cf-h1 { line-height: 37px; }
+diff --git a/shell/meson.build b/shell/meson.build
+index 4fe77e3..a9e4e4a 100644
+--- a/shell/meson.build
++++ b/shell/meson.build
+@@ -290,6 +290,14 @@ test('luma-settings-identity', identity_test,
+   env: ['GSETTINGS_BACKEND=memory', 'GTK_A11Y=none', 'G_DEBUG=fatal-criticals',
+     'DBUS_SYSTEM_BUS_ADDRESS=unix:path=' + meson.current_build_dir() / 'luma-identity-private-missing'])
+ 
++# The window at phone width on a computer: the list first; wider, the two panes.
++window_test = executable(
++  'test-luma-window', 'test-luma-window.c',
++  include_directories: top_inc,
++  dependencies: shell_deps + [libtestshell_dep],
++  c_args: cflags,
++  link_with: panels_libs)
++
+ fixture_test = executable(
+   'test-luma-fixture',
+   ['test-luma-fixture.c', 'cc-luma-fixture.c', 'cc-luma-bluetooth.c', 'cc-luma-desktop.c', 'cc-luma-discovery.c', 'cc-luma-displays.c', 'cc-luma-sound.c', 'cc-luma-device-options.c', 'cc-luma-privacy.c', 'cc-luma-keyboard.c', 'cc-luma-application-options.c'],
+diff --git a/shell/test-luma-window.c b/shell/test-luma-window.c
+new file mode 100644
+index 0000000..0a4e8f0
+--- /dev/null
++++ b/shell/test-luma-window.c
+@@ -0,0 +1,156 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Settings' window on a computer at phone width: the list first, as on a phone; wider, the two panes. */
++#include "config.h"
++#include <adwaita.h>
++#include <luma-ui.h>
++#include "cc-luma-fixture.h"
++#include "cc-luma-shell.h"
++#include "cc-luma-view.h"
++#include "cc-luma-window.h"
++
++static gboolean done (gpointer data) { *(gboolean *) data = TRUE; return G_SOURCE_REMOVE; }
++static void wait_ms (guint ms)
++{
++  gboolean over = FALSE;
++  g_timeout_add (ms, done, &over);
++  while (!over) g_main_context_iteration (NULL, TRUE);
++}
++
++static GtkListBoxRow *row_for (GtkWidget *root, const char *page)
++{
++  if (GTK_IS_LIST_BOX_ROW (root) && g_strcmp0 (g_object_get_data (G_OBJECT (root), "cf-page"), page) == 0)
++    return GTK_LIST_BOX_ROW (root);
++  for (GtkWidget *c = gtk_widget_get_first_child (root); c; c = gtk_widget_get_next_sibling (c))
++    {
++      GtkListBoxRow *row = row_for (c, page);
++      if (row) return row;
++    }
++  return NULL;
++}
++
++static void pick (GtkWidget *window, const char *page)
++{
++  GtkListBoxRow *row = row_for (window, page);
++  g_assert_nonnull (row);
++  g_signal_emit_by_name (gtk_widget_get_parent (GTK_WIDGET (row)), "row-activated", row);
++  wait_ms (400);
++}
++
++static const char *page_of (GtkWidget *window)
++{
++  return cc_luma_shell_get_page (CC_LUMA_SHELL (g_object_get_data (G_OBJECT (window), "cf-shell")));
++}
++
++static GtkWidget *body_of (GtkWidget *window)
++{
++  return luma_application_window_get_body (LUMA_APPLICATION_WINDOW (window));
++}
++
++static void resize (GtkWidget *window, int width)
++{
++  gtk_window_set_default_size (GTK_WINDOW (window), width, 844);
++  wait_ms (500);
++}
++
++static void assert_list_first (GtkWidget *window, const char *showing)
++{
++  GtkWidget *body = body_of (window);
++  g_assert_true (LUMA_IS_LIST_FIRST (body));
++  g_assert_true (luma_list_first_get_phone (LUMA_LIST_FIRST (body)));
++  g_assert_cmpstr (luma_list_first_get_showing (LUMA_LIST_FIRST (body)), ==, showing);
++}
++
++static void assert_two_panes (GtkWidget *window)
++{
++  GtkWidget *body = body_of (window);
++  GtkWidget *sidebar = gtk_widget_get_ancestor (GTK_WIDGET (row_for (window, "wifi")), LUMA_TYPE_NAVIGATION_SIDEBAR);
++  GtkWidget *island = gtk_widget_get_ancestor (g_object_get_data (G_OBJECT (window), "cf-shell"), LUMA_TYPE_ISLAND);
++  g_assert_false (LUMA_IS_LIST_FIRST (body));
++  g_assert_true (gtk_widget_get_parent (sidebar) == body);
++  g_assert_true (gtk_widget_get_parent (island) == body);
++  g_assert_true (gtk_widget_get_mapped (sidebar));
++  g_assert_true (gtk_widget_get_mapped (island));
++}
++
++static GtkWidget *open_window (GtkApplication *app, CcLumaFixture *model, int width)
++{
++  GtkWidget *view = cc_luma_view_new (model, "wifi", NULL);
++  g_assert_nonnull (view);
++  GtkWidget *window = cc_luma_window_new (app, model, view);
++  gtk_window_set_default_size (GTK_WINDOW (window), width, 844);
++  gtk_window_present (GTK_WINDOW (window));
++  wait_ms (800);
++  return window;
++}
++
++static GtkApplication *app;
++
++static void narrow_computer (void)
++{
++  g_autoptr (GError) error = NULL;
++  g_autoptr (CcLumaFixture) model = cc_luma_fixture_load (g_getenv ("LUMA_SETTINGS_TEST_FIXTURE"), &error);
++  g_assert_no_error (error);
++
++  /* Opened at phone width: the list is the screen. */
++  GtkWidget *window = open_window (app, model, 400);
++  int min = 0;
++  /* The window may be as narrow as a phone: its content asks for no more than the screen has. */
++  gtk_widget_measure (adw_application_window_get_content (ADW_APPLICATION_WINDOW (window)),
++                      GTK_ORIENTATION_HORIZONTAL, -1, &min, NULL, NULL, NULL);
++  g_assert_cmpint (min, <=, 400);
++  assert_list_first (window, "list");
++
++  /* A pick pushes its page; Back returns to the list. */
++  pick (window, "sound");
++  assert_list_first (window, "detail");
++  g_assert_cmpstr (page_of (window), ==, "sound");
++  luma_list_first_show_list (LUMA_LIST_FIRST (body_of (window)));
++  wait_ms (400);
++  assert_list_first (window, "list");
++  pick (window, "apps");
++  assert_list_first (window, "detail");
++  g_assert_cmpstr (page_of (window), ==, "apps");
++
++  /* Wider: the two panes, on the same page. */
++  resize (window, 1180);
++  assert_two_panes (window);
++  g_assert_cmpstr (page_of (window), ==, "apps");
++  pick (window, "wifi");
++  g_assert_cmpstr (page_of (window), ==, "wifi");
++
++  /* Narrow again: the page it was on, Back to the list. */
++  resize (window, 400);
++  assert_list_first (window, "detail");
++  g_assert_cmpstr (page_of (window), ==, "wifi");
++  luma_list_first_show_list (LUMA_LIST_FIRST (body_of (window)));
++  wait_ms (400);
++  assert_list_first (window, "list");
++
++  /* A tiled half of a small screen keeps both panes. */
++  resize (window, 720);
++  assert_two_panes (window);
++  gtk_window_destroy (GTK_WINDOW (window));
++  wait_ms (100);
++
++  /* A computer's window opens with both panes. */
++  window = open_window (app, model, 1180);
++  assert_two_panes (window);
++  gtk_window_destroy (GTK_WINDOW (window));
++  wait_ms (100);
++}
++
++int main (int argc, char **argv)
++{
++  g_test_init (&argc, &argv, NULL);
++  g_unsetenv ("LUMA_FORM_FACTOR");
++  g_unsetenv ("LUMA_SETTINGS_PAGE");
++  g_setenv ("LUMA_DEVICE_CLASS", "desktop", TRUE);
++  g_setenv ("LUMA_POSTURE", "desktop", TRUE);
++  app = gtk_application_new ("org.luma.Settings.WindowTest", G_APPLICATION_NON_UNIQUE);
++  g_assert_true (g_application_register (G_APPLICATION (app), NULL, NULL));
++  luma_init ();
++  g_test_add_func ("/settings/window/narrow-computer", narrow_computer);
++  int status = g_test_run ();
++  g_object_unref (app);
++  return status;
++}
