@@ -24,8 +24,9 @@ its state::
             return window
 
 `AppWindow.save_state()` returns a dict of JSON values for the window;
-`AppWindow.documents()` lists its open documents. Without Luma's shell,
-nothing is saved and `restore()` returns False.
+`AppWindow.documents()` lists its open documents. Without Luma's shell, or
+on a platform older than API level 15, nothing is saved and `restore()`
+returns False.
 """
 import json
 
@@ -56,11 +57,18 @@ def _save_window(_restore, window, dict_):
                                     bool(document.get("dirty")), document.get("unsaved"))
 
 
+def available() -> bool:
+    """Whether the loaded LumaUI has LumaRestore (API level 15)."""
+    return hasattr(LumaUI, "Restore")
+
+
 def enable(application, open_window, save=None, restore_app=None):
     """Take part in session snapshots. `open_window(key, state)` re-creates a
     window from its key and the dict its `save_state()` returned; `save()`
     may return a dict of app state, which `restore_app(reason, state)` gets
     back before the windows."""
+    if not available():
+        return None
     handle = LumaUI.Restore.get_default(application)
     if getattr(handle, "_luma_enabled", False):
         return handle
@@ -78,9 +86,9 @@ def enable(application, open_window, save=None, restore_app=None):
 def restore(application) -> bool:
     """In `activate`: re-create the windows the shell saved for this app.
     True when it did, so `activate` opens nothing else."""
-    return bool(LumaUI.Restore.get_default(application).restore())
+    return available() and bool(LumaUI.Restore.get_default(application).restore())
 
 
 def reason(application) -> str:
     """"restore", "continue", "recover" or "none"."""
-    return LumaUI.Restore.get_default(application).get_reason()
+    return LumaUI.Restore.get_default(application).get_reason() if available() else "none"

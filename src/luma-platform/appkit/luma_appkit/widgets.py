@@ -2133,11 +2133,14 @@ class AppWindow(Adw.ApplicationWindow):
         """The key the app finds this window by again after a restart or on
         another device (API level 15; `luma_appkit.restore`). Set it before
         the window is first shown (C: luma_window_set_restore_key)."""
-        return LumaUI.window_get_restore_key(self)
+        getter = getattr(LumaUI, "window_get_restore_key", None)
+        return getter(self) if getter else None
 
     @restore_key.setter
     def restore_key(self, key: str | None) -> None:
-        LumaUI.window_set_restore_key(self, key)
+        setter = getattr(LumaUI, "window_set_restore_key", None)
+        if setter:
+            setter(self, key)
 
     def save_state(self) -> dict:
         """What this window needs to be the same again, as JSON values. The
