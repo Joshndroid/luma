@@ -134,3 +134,22 @@ logged "tile-refused" (or held a remembered window until its timeout). They
 now compare with `meta_window_get_frame_rect_in_tile()`, the frame Mutter
 gives the window in that tile; on a Mutter without it the tile itself, as
 before. Tested by `tests/mutter/window-shape/run.sh OUT luma tilingshell`.
+`0022-drag-selects-whole-zones-of-the-current-layout.patch`: a drag shows,
+selects and drops into whole zones of the layout selected now for the monitor
+under the pointer. Each workspace keeps its own drawn layout, but upstream
+redrew only the active workspace's when the selection or the layouts changed,
+so every other workspace (and every workspace after layout memory restored a
+monitor's layout) dragged into the layout it had when the Shell started. One
+accessor (`_lumaLayoutFor`) now looks the layout up whenever a workspace's
+zones are used and redraws them if the selection changed; a change mid-drag
+drops the old selection. Selecting no longer reshapes zones: upstream cut
+every zone a selection crossed into undecorated pieces (no gaps, no corner
+radius) that later hit tests and drops reused, and spanning mixed the
+selection's cell (inside the outer gap) with the drawn zones, leaving 16 px
+slivers. The selection is now the zone under the pointer, or while spanning
+the smallest box of whole zones from the zone where spanning started to it,
+and selecting only hides the zones it covers. Leaving a monitor forgets its
+selection and span start. The stage handlers a drag connects are released
+when it ends (upstream leaked two per drag and monitor, each running on every
+input event), and a drag starts from the real pointer rather than the last
+touch seen before it. Tested by `tests/tiling-shell/cross-monitor/run.sh`.

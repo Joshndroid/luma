@@ -8,7 +8,7 @@
 
 Name:           gnome-shell-extension-tiling-shell
 Version:        17.3
-Release:        1.luma.29%{?dist}
+Release:        1.luma.30%{?dist}
 Summary:        Advanced tiling window management for GNOME Shell
 License:        GPL-3.0-or-later
 URL:            https://github.com/domferr/tilingshell
@@ -36,6 +36,7 @@ Patch15:        0018-independent-window-spacing-and-resize.patch
 Patch16:        0019-rebuild-selection-after-monitor-reentry.patch
 Patch17:        0020-window-preview-drag.patch
 Patch18:        0021-luma-shaped-windows-sit-in-their-tile.patch
+Patch19:        0022-drag-selects-whole-zones-of-the-current-layout.patch
 BuildArch:      noarch
 BuildRequires:  glib2
 BuildRequires:  nodejs
@@ -72,6 +73,7 @@ find . -type f -exec chmod 0644 {} +
 %patch -P 16 -p1
 %patch -P 17 -p1
 %patch -P 18 -p1
+%patch -P 19 -p1
 cp %{SOURCE1} ../LICENSE
 install -m 0644 %{SOURCE2} schemas/
 
@@ -83,6 +85,12 @@ glib-compile-schemas source/schemas
 find source -name '*.js' -print0 | xargs -0 -n1 node --check
 grep -qF 'beginWindowPreviewDrag(window)' source/extension.js
 grep -qF 'lumaPreviewWindowAt(window, x, y)' source/components/tilingsystem/tilingManager.js
+# A drag picks whole zones of the layout selected now, on every workspace,
+# and never cuts a zone (0022).
+grep -qF '_lumaLayoutFor(ws) {' source/components/tilingsystem/tilingManager.js
+test -z "$(grep -F '_workspaceTilingLayout.get(currentWs)' source/components/tilingsystem/tilingManager.js)"
+grep -qF 'lumaWholeZones(rect) {' source/components/tilingsystem/tilingLayout.js
+test -z "$(grep -F '_subtractRectangles' source/components/tilingsystem/tilingLayout.js)"
 glib-compile-schemas --strict --dry-run source/schemas
 node %{SOURCE3} source
 # The Luma defaults apply: no panel button, an outer gap on every edge; the

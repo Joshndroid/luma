@@ -1,0 +1,602 @@
+From: Luma Developers
+Subject: [PATCH] Drag selection: whole zones of the current layout
+
+--- a/components/tilingsystem/tilingLayout.js
++++ b/components/tilingsystem/tilingLayout.js
+@@ -4,11 +4,9 @@ import TilePreview from "../tilepreview/tilePreview.js";
+ import LayoutWidget from "../layout/LayoutWidget.js";
+ import {
+   buildRectangle,
+-  buildTileGaps,
+   isPointInsideRect,
+   squaredEuclideanDistance
+ } from "../../utils/ui.js";
+-import TileUtils from "../../components/layout/TileUtils.js";
+ import GlobalState from "../../utils/globalState.js";
+ import { KeyBindingsDirection } from "../../keybindings.js";
+ const _DynamicTilePreview = class _DynamicTilePreview extends TilePreview {
+@@ -117,170 +115,74 @@ const _TilingLayout = class _TilingLayout extends LayoutWidget {
+     return currPointerPos.x >= preview.x && currPointerPos.x <= preview.x + preview.width && currPointerPos.y >= preview.y && currPointerPos.y <= preview.y + preview.height;
+   }
+ 
+-  getTileBelow(currPointerPos, reset) {
+-    let found = this._previews.find(
+-      (preview) => this._isHovered(currPointerPos, preview.rect)
++  // Luma: a drag selects whole zones of this layout and never reshapes one.
++  // Zones keep the rectangle they were drawn with; selecting only hides the
++  // zones the selection covers. (Upstream cut the zones a selection crossed
++  // into new, undecorated pieces and kept them, so later hit tests and drops
++  // landed in pieces of an earlier selection.)
++  getTileBelow(currPointerPos, _reset) {
++    const found = this._previews.find(
++      (preview) => preview.canRestore && this._isHovered(currPointerPos, preview.originalRect)
+     );
+-    if (!found || !found.canRestore && reset) {
+-      found = this._previews.find(
+-        (preview) => preview.canRestore && this._isHovered(currPointerPos, preview.originalRect)
+-      );
++    return found ? found.originalRect.copy() : void 0;
++  }
++
++  // The smallest rectangle of whole zones that contains `rect`.
++  lumaWholeZones(rect) {
++    const overlaps = (a, b) => Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x) > 1 && Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y) > 1;
++    let result = rect.copy();
++    for (let changed = true; changed; ) {
++      changed = false;
++      for (const preview of this._previews) {
++        if (!preview.canRestore) continue;
++        const zone = preview.originalRect;
++        if (!overlaps(zone, result)) continue;
++        const grown = result.union(zone);
++        if (!grown.equal(result)) {
++          result = grown;
++          changed = true;
++        }
++      }
+     }
+-    if (!found) return void 0;
+-    if (reset && found.originalRect) return found.originalRect;
+-    return found.rect;
++    return result;
++  }
++
++  _lumaInside(zone, rect) {
++    return zone.x >= rect.x - 1 && zone.y >= rect.y - 1 && zone.x + zone.width <= rect.x + rect.width + 1 && zone.y + zone.height <= rect.y + rect.height + 1;
+   }
+ 
+   unhoverAllTiles() {
+-    const newPreviewsArray = [];
++    this._lumaDropPieces();
+     this._previews.forEach((preview) => {
+-      if (preview.restore(true)) {
+-        newPreviewsArray.push(preview);
+-        preview.open(void 0, true);
+-      } else {
+-        this.remove_child(preview);
+-        preview.destroy();
+-      }
++      preview.restore(true);
++      preview.open(void 0, true);
+     });
+-    this._previews = newPreviewsArray;
+   }
+ 
+-  hoverTilesInRect(rect, reset) {
+-    const newPreviewsArray = [];
++  // Hide the zones the selection covers and show every other zone where it
++  // was drawn. `rect` is grown to whole zones first.
++  hoverTilesInRect(rect, _reset) {
++    this._lumaDropPieces();
++    const selection = this.lumaWholeZones(rect);
+     this._previews.forEach((preview) => {
+-      const [hasIntersection, rectangles] = this._subtractRectangles(
+-        preview.rect,
+-        rect
+-      );
+-      if (hasIntersection) {
+-        if (rectangles.length > 0) {
+-          let maxIndex = 0;
+-          for (let i = 0; i < rectangles.length; i++) {
+-            if (rectangles[i].area() > rectangles[maxIndex].area())
+-              maxIndex = i;
+-          }
+-          for (let i = 0; i < rectangles.length; i++) {
+-            if (i === maxIndex) continue;
+-            const currRect = rectangles[i];
+-            const gaps = buildTileGaps(
+-              currRect,
+-              this._innerGaps,
+-              this._outerGaps,
+-              this._containerRect
+-            ).gaps;
+-            const innerPreview = new DynamicTilePreview(
+-              {
+-                parent: this,
+-                rect: currRect,
+-                gaps,
+-                tile: TileUtils.build_tile(
+-                  currRect,
+-                  this._containerRect
+-                )
+-              },
+-              false
+-            );
+-            innerPreview.open();
+-            this.set_child_above_sibling(innerPreview, preview);
+-            newPreviewsArray.push(innerPreview);
+-          }
+-          preview.open(
+-            rectangles[maxIndex].union(
+-              preview.rect.intersect(rect)[1]
+-            ),
+-            false
+-          );
+-          preview.open(rectangles[maxIndex], true);
+-          newPreviewsArray.push(preview);
+-        } else {
+-          preview.close();
+-          newPreviewsArray.push(preview);
+-        }
+-      } else if (reset) {
+-        if (preview.restore(true)) {
+-          preview.open(void 0, true);
+-          newPreviewsArray.push(preview);
+-        } else {
+-          this.remove_child(preview);
+-          preview.destroy();
+-        }
+-      } else {
+-        preview.open(void 0, true);
+-        newPreviewsArray.push(preview);
+-      }
++      preview.restore(false);
++      if (this._lumaInside(preview.originalRect, selection)) preview.close();
++      else preview.open(void 0, true);
+     });
+-    this._previews = newPreviewsArray;
++    return selection;
+   }
+ 
+-  /*
+-          Given the source rectangle (made by A, B, C, D and Hole), subtract the hole and obtain A, B, C and D.
+-          Edge cases:
+-              - The hole may not be inside the source rect (i.e there is no interstaction).
+-              It returns false and an array with the source rectangle only
+-              - The hole intersects the source rectangle, it returns true and an array with A, B, C and D rectangles.
+-              Some of A, B, C and D may not be returned if they don't exist
+-              - The hole is equal to the source rectangle, it returns true and an empty array since A, B, C and D
+-              rectangles do not exist
+-  
+-          Example:
+-          -------------------------
+-          |          A            |
+-          |-----------------------|
+-          |  B  |   hole    |  C  |
+-          |-----------------------|
+-          |          D            |
+-          -------------------------
+-      */
+-  _subtractRectangles(sourceRect, holeRect) {
+-    const [hasIntersection, intersection] = sourceRect.intersect(holeRect);
+-    if (!hasIntersection) return [false, [sourceRect]];
+-    if (intersection.area() >= sourceRect.area() * 0.98) return [true, []];
+-    const results = [];
+-    const heightA = intersection.y - sourceRect.y;
+-    if (heightA > 0) {
+-      results.push(
+-        buildRectangle({
+-          x: sourceRect.x,
+-          y: sourceRect.y,
+-          width: sourceRect.width,
+-          height: heightA
+-        })
+-      );
+-    }
+-    const widthB = intersection.x - sourceRect.x;
+-    if (widthB > 0 && intersection.height > 0) {
+-      results.push(
+-        buildRectangle({
+-          x: sourceRect.x,
+-          y: intersection.y,
+-          width: widthB,
+-          height: intersection.height
+-        })
+-      );
+-    }
+-    const widthC = sourceRect.x + sourceRect.width - intersection.x - intersection.width;
+-    if (widthC > 0 && intersection.height > 0) {
+-      results.push(
+-        buildRectangle({
+-          x: intersection.x + intersection.width,
+-          y: intersection.y,
+-          width: widthC,
+-          height: intersection.height
+-        })
+-      );
+-    }
+-    const heightD = sourceRect.y + sourceRect.height - intersection.y - intersection.height;
+-    if (heightD > 0) {
+-      results.push(
+-        buildRectangle({
+-          x: sourceRect.x,
+-          y: intersection.y + intersection.height,
+-          width: sourceRect.width,
+-          height: heightD
+-        })
+-      );
+-    }
+-    return [true, results];
++  _lumaDropPieces() {
++    const kept = [];
++    this._previews.forEach((preview) => {
++      if (preview.canRestore) {
++        kept.push(preview);
++      } else {
++        if (preview.get_parent() === this) this.remove_child(preview);
++        preview.destroy();
++      }
++    });
++    this._previews = kept;
+   }
+ 
+   // enlarge the side of the direction and search a tile that contains that point
+--- a/components/tilingsystem/tilingManager.js
++++ b/components/tilingsystem/tilingManager.js
+@@ -8,7 +8,6 @@ import {
+   getMonitorScalingFactor,
+   getScalingFactorOf,
+   getWindows,
+-  isPointInsideRect,
+   isTileOnContainerBorder,
+   squaredEuclideanDistance
+ } from "../../utils/ui.js";
+@@ -146,26 +145,8 @@ class TilingManager {
+     this._edgeTilingManager.monitorIndex = this._monitor.index;
+     const monitorScalingFactor = this._enableScaling ? getMonitorScalingFactor(monitor.index) : void 0;
+     this._workspaceTilingLayout = /* @__PURE__ */ new Map();
+-    for (let i = 0; i < global.workspaceManager.get_n_workspaces(); i++) {
+-      const ws = global.workspaceManager.get_workspace_by_index(i);
+-      if (!ws) continue;
+-      const innerGaps = buildMargin(Settings.get_inner_gaps());
+-      const outerGaps = lumaOuterGaps(monitor.index);
+-      const layout = GlobalState.get().getSelectedLayoutOfMonitor(
+-        monitor.index,
+-        ws.index()
+-      );
+-      this._workspaceTilingLayout.set(
+-        ws,
+-        new TilingLayout(
+-          layout,
+-          innerGaps,
+-          outerGaps,
+-          this._workArea,
+-          monitorScalingFactor
+-        )
+-      );
+-    }
++    for (let i = 0; i < global.workspaceManager.get_n_workspaces(); i++)
++      this._lumaLayoutFor(global.workspaceManager.get_workspace_by_index(i));
+     this._tilingSuggestionsLayout = new TilingLayoutWithSuggestions(
+       buildMargin(Settings.get_inner_gaps()),
+       lumaOuterGaps(monitor.index),
+@@ -194,28 +175,12 @@ class TilingManager {
+     this._signals.connect(
+       Settings,
+       Settings.KEY_SETTING_SELECTED_LAYOUTS,
+-      () => {
+-        const ws = global.workspaceManager.get_active_workspace();
+-        if (!ws) return;
+-        const layout = GlobalState.get().getSelectedLayoutOfMonitor(
+-          this._monitor.index,
+-          ws.index()
+-        );
+-        this._workspaceTilingLayout.get(ws)?.relayout({ layout });
+-      }
++      () => this._lumaSyncLayouts()
+     );
+     this._signals.connect(
+       GlobalState.get(),
+       GlobalState.SIGNAL_LAYOUTS_CHANGED,
+-      () => {
+-        const ws = global.workspaceManager.get_active_workspace();
+-        if (!ws) return;
+-        const layout = GlobalState.get().getSelectedLayoutOfMonitor(
+-          this._monitor.index,
+-          ws.index()
+-        );
+-        this._workspaceTilingLayout.get(ws)?.relayout({ layout });
+-      }
++      () => this._lumaSyncLayouts()
+     );
+     this._signals.connect(Settings, Settings.KEY_INNER_GAPS, () => {
+       const innerGaps = buildMargin(Settings.get_inner_gaps());
+@@ -262,28 +227,12 @@ class TilingManager {
+     this._signals.connect(
+       global.workspaceManager,
+       "active-workspace-changed",
+-      () => {
+-        const ws = global.workspaceManager.get_active_workspace();
+-        if (this._workspaceTilingLayout.has(ws)) return;
+-        const monitorScalingFactor = this._enableScaling ? getMonitorScalingFactor(this._monitor.index) : void 0;
+-        const layout = GlobalState.get().getSelectedLayoutOfMonitor(
+-          this._monitor.index,
+-          ws.index()
+-        );
+-        const innerGaps = buildMargin(Settings.get_inner_gaps());
+-        const outerGaps = lumaOuterGaps(this._monitor.index);
+-        this._debug("created new tiling layout for active workspace");
+-        this._workspaceTilingLayout.set(
+-          ws,
+-          new TilingLayout(
+-            layout,
+-            innerGaps,
+-            outerGaps,
+-            this._workArea,
+-            monitorScalingFactor
+-          )
+-        );
+-      }
++      () => this._lumaLayoutFor(global.workspaceManager.get_active_workspace())
++    );
++    this._signals.connect(
++      global.workspaceManager,
++      "workspaces-reordered",
++      () => this._lumaSyncLayouts()
+     );
+     this._signals.connect(
+       global.workspaceManager,
+@@ -342,7 +291,7 @@ class TilingManager {
+     const isMaximized = window.maximizedHorizontally || window.maximizedVertically;
+     if (spanFlag && isMaximized) return false;
+     const currentWs = window.get_workspace();
+-    const tilingLayout = this._workspaceTilingLayout.get(currentWs);
++    const tilingLayout = this._lumaLayoutFor(currentWs);
+     if (!tilingLayout) return false;
+     const windowRectCopy = window.get_frame_rect().copy();
+     const extWin = window;
+@@ -434,6 +383,8 @@ class TilingManager {
+       this._movingWindowTimerId = null;
+     }
+     this._signals.disconnect();
++    this._lumaDragSignals?.disconnect();
++    this._lumaDragSignals = null;
+     this._isGrabbingWindow = false;
+     this._snapAssistingInfo.update(void 0);
+     this._edgeTilingManager.abortEdgeTiling();
+@@ -553,7 +504,7 @@ class TilingManager {
+         continue;
+       if (window.windowType !== Meta.WindowType.NORMAL || window._lumaReflowKey === key)
+         continue;
+-      const layout = this._workspaceTilingLayout.get(window.get_workspace());
++      const layout = this._lumaLayoutFor(window.get_workspace());
+       if (!layout)
+         continue;
+       window._lumaReflowMoves = (window._lumaReflowMoves ?? []).filter((t) => now - t < LUMA_REFLOW_WINDOW);
+@@ -669,10 +620,51 @@ class TilingManager {
+       window._lumaTileGoneId = 0;
+     }
+   }
++  // Luma: the layout this monitor shows on `ws`, looked up from the current
++  // selection every time it is used. Every workspace has its own drawn
++  // layout; upstream only redrew the active workspace's when the selection or
++  // the layouts changed, so the other workspaces kept dragging into the
++  // layout they had when the Shell started (or a monitor's former layout
++  // after the monitors changed).
++  _lumaLayoutFor(ws) {
++    if (!ws) return void 0;
++    const layout = GlobalState.get().getSelectedLayoutOfMonitor(this._monitor.index, ws.index());
++    let tilingLayout = this._workspaceTilingLayout.get(ws);
++    if (!tilingLayout) {
++      tilingLayout = new TilingLayout(
++        layout,
++        buildMargin(Settings.get_inner_gaps()),
++        lumaOuterGaps(this._monitor.index),
++        this._workArea,
++        this._enableScaling ? getMonitorScalingFactor(this._monitor.index) : void 0
++      );
++      this._workspaceTilingLayout.set(ws, tilingLayout);
++    } else if (tilingLayout.layout !== layout && tilingLayout.relayout({ layout })) {
++      // The zones under a drag changed: drop the selection made in the old ones.
++      this._lumaResetDragState();
++    }
++    return tilingLayout;
++  }
++
++  _lumaSyncLayouts() {
++    for (const ws of [...this._workspaceTilingLayout.keys()])
++      this._lumaLayoutFor(ws);
++  }
++
++  // Forget everything a drag picked on this monitor: the next motion picks
++  // again from the zones under the pointer.
++  _lumaResetDragState() {
++    this._lumaSelection = null;
++    this._lumaSpanAnchor = null;
++    this._lastCursorPos = null;
++    this._wasTilingSystemActivated = false;
++    this._wasSpanMultipleTilesActivated = false;
++  }
++
+   // Preview drags keep the real window and its assignment unchanged until drop.
+   lumaPreviewWindowAt(window, x, y) {
+     if (this._isGrabbingWindow || !window.get_compositor_private()) return null;
+-    const layout = this._workspaceTilingLayout.get(window.get_workspace());
++    const layout = this._lumaLayoutFor(window.get_workspace());
+     if (!layout) return null;
+     if (!layout.showing) layout.openAbove(window);
+     const rect = layout.getTileBelow({ x, y }, true);
+@@ -680,20 +672,28 @@ class TilingManager {
+       this._selectedTilesPreview.close(true);
+       return null;
+     }
+-    layout.hoverTilesInRect(rect, true);
+-    this.openSelectionTilePreview(rect, true, true, window);
+-    return this._lumaCellTile(rect);
++    const selection = layout.hoverTilesInRect(rect);
++    this.openSelectionTilePreview(selection, true, true, window);
++    return this._lumaCellTile(selection);
+   }
+   lumaCloseWindowPreview(window) {
+-    this._workspaceTilingLayout.get(window.get_workspace())?.close();
++    this._lumaLayoutFor(window.get_workspace())?.close();
+     this._selectedTilesPreview.close(true);
+   }
+ 
+   _onWindowGrabBegin(window, grabOp) {
+     this._lumaReleaseTile(window);
+     if (this._isGrabbingWindow) return;
++    // Luma: a drag starts with nothing picked, whatever an earlier drag or
++    // preview left behind, and from the real pointer: a touch seen before
++    // this drag must not steer it (the touch pointer is shared and its last
++    // position used to survive every drag).
++    this._lumaResetDragState();
++    this._lumaDragSignals?.disconnect();
++    this._lumaDragSignals = new SignalHandling();
++    TouchPointer.get().reset();
+     TouchPointer.get().updateWindowPosition(window.get_frame_rect());
+-    this._signals.connect(
++    this._lumaDragSignals.connect(
+       global.stage,
+       "touch-event",
+       (_source, event) => {
+@@ -701,7 +701,7 @@ class TilingManager {
+         TouchPointer.get().onTouchEvent(x, y);
+       }
+     );
+-    this._signals.connect(
++    this._lumaDragSignals.connect(
+       global.stage,
+       "captured-event",
+       (_source, event) => {
+@@ -720,7 +720,7 @@ class TilingManager {
+       }
+     );
+     if (Settings.ENABLE_BLUR_SNAP_ASSISTANT || Settings.ENABLE_BLUR_SELECTED_TILEPREVIEW) {
+-      this._signals.connect(window, "position-changed", () => {
++      this._lumaDragSignals.connect(window, "position-changed", () => {
+         if (Settings.ENABLE_BLUR_SELECTED_TILEPREVIEW) {
+           this._selectedTilesPreview.get_effect("blur")?.queue_repaint();
+         }
+@@ -768,14 +768,13 @@ class TilingManager {
+       return GLib.SOURCE_REMOVE;
+     }
+     const currentWs = window.get_workspace();
+-    const tilingLayout = this._workspaceTilingLayout.get(currentWs);
++    const tilingLayout = this._lumaLayoutFor(currentWs);
+     if (!tilingLayout) return GLib.SOURCE_REMOVE;
+     this._edgeTilingManager.workspaceIndex = currentWs.index();
+     if (!window.allows_resize() || !window.allows_move() || !this._isPointerInsideThisMonitor(window)) {
+-      // Closing the preview invalidates the cached selection. Re-entering at
+-      // the same coordinates must rebuild it, even without modifier changes.
+-      this._lastCursorPos = null;
+-      this._wasTilingSystemActivated = false;
++      // Luma: away from this monitor nothing of it is shown or picked; coming
++      // back starts from the zones under the pointer.
++      this._lumaResetDragState();
+       tilingLayout.close();
+       this._selectedTilesPreview.close(true);
+       this._snapAssist.close(true);
+@@ -840,6 +839,8 @@ class TilingManager {
+     this._lumaSecondaryHeld = lumaSecondaryHeld;
+     this._lumaControlHeld = lumaControlHeld;
+     if (this._lumaTilingSuspended) {
++      this._lumaSelection = null;
++      this._lumaSpanAnchor = null;
+       tilingLayout.close();
+       this._selectedTilesPreview.close(true);
+       this._snapAssist.close(true);
+@@ -868,6 +869,8 @@ class TilingManager {
+     this._wasTilingSystemActivated = showTilingSystem;
+     this._wasSpanMultipleTilesActivated = isSpanMultiTilesActivated;
+     if (!showTilingSystem) {
++      this._lumaSelection = null;
++      this._lumaSpanAnchor = null;
+       if (tilingLayout.showing) {
+         tilingLayout.close();
+         this._selectedTilesPreview.close(true);
+@@ -903,32 +906,32 @@ class TilingManager {
+     if (this._snapAssistingInfo.isSnapAssisting) {
+       this._selectedTilesPreview.close(true);
+       this._snapAssistingInfo.update(void 0);
++      this._lumaSelection = null;
+     }
+-    if (!changedSpanMultipleTiles && isPointInsideRect(currPointerPos, this._selectedTilesPreview.rect))
++    // Luma: the selection is whole zones of this monitor's layout, in the
++    // layout's own coordinates: the zone under the pointer or, while
++    // spanning, every zone in the box from the zone spanning started on to
++    // it. Over a gap between zones the selection stays as it was.
++    const zone = tilingLayout.getTileBelow(currPointerPos);
++    if (!zone) return GLib.SOURCE_CONTINUE;
++    if (!allowSpanMultipleTiles || !this._lumaSpanAnchor)
++      this._lumaSpanAnchor = zone;
++    const wanted = allowSpanMultipleTiles ? this._lumaSpanAnchor.union(zone) : zone;
++    if (this._lumaSelection && this._selectedTilesPreview.showing && tilingLayout.lumaWholeZones(wanted).equal(this._lumaSelection))
+       return GLib.SOURCE_CONTINUE;
+-    let selectionRect = tilingLayout.getTileBelow(
+-      currPointerPos,
+-      changedSpanMultipleTiles && !allowSpanMultipleTiles
+-    );
+-    if (!selectionRect) return GLib.SOURCE_CONTINUE;
+-    selectionRect = selectionRect.copy();
+-    if (allowSpanMultipleTiles && this._selectedTilesPreview.showing) {
+-      selectionRect = selectionRect.union(
+-        this._selectedTilesPreview.rect
+-      );
+-    }
+-    tilingLayout.hoverTilesInRect(selectionRect, !allowSpanMultipleTiles);
+-    this.openSelectionTilePreview(selectionRect, true, true, window);
++    this._lumaSelection = tilingLayout.hoverTilesInRect(wanted);
++    this.openSelectionTilePreview(this._lumaSelection, true, true, window);
+     return GLib.SOURCE_CONTINUE;
+   }
+ 
+   _onWindowGrabEnd(window) {
+     this._isGrabbingWindow = false;
+     this._grabStartPosition = null;
+-    this._signals.disconnect(window);
++    this._lumaDragSignals?.disconnect();
++    this._lumaDragSignals = null;
+     TouchPointer.get().reset();
+     const currentWs = window.get_workspace();
+-    const tilingLayout = this._workspaceTilingLayout.get(currentWs);
++    const tilingLayout = this._lumaLayoutFor(currentWs);
+     if (tilingLayout) tilingLayout.close();
+     const desiredWindowRect = buildRectangle({
+       x: this._selectedTilesPreview.innerX,
+@@ -939,7 +942,7 @@ class TilingManager {
+     const selectedTilesRect = this._selectedTilesPreview.rect.copy();
+     this._selectedTilesPreview.close(true);
+     this._snapAssist.close(true);
+-    this._lastCursorPos = null;
++    this._lumaResetDragState();
+     if (this._lumaTilingSuspended) {
+       this._lumaTilingSuspended = false;
+       this._snapAssistingInfo.update(void 0);
+@@ -1064,7 +1067,7 @@ class TilingManager {
+     }
+     const scaledRect = this._lumaInCells(TileUtils.apply_props(tile, this._lumaCellArea));
+     const currentWs = global.workspaceManager.get_active_workspace();
+-    const tilingLayout = this._workspaceTilingLayout.get(currentWs);
++    const tilingLayout = this._lumaLayoutFor(currentWs);
+     if (!tilingLayout) return;
+     this._selectedTilesPreview.get_parent()?.set_child_above_sibling(this._selectedTilesPreview, null);
+     this.openSelectionTilePreview(scaledRect, false, true, void 0);
+@@ -1073,7 +1076,7 @@ class TilingManager {
+ 
+   openSelectionTilePreview(position, isAboveLayout, ease, window) {
+     const currentWs = global.workspaceManager.get_active_workspace();
+-    const tilingLayout = this._workspaceTilingLayout.get(currentWs);
++    const tilingLayout = this._lumaLayoutFor(currentWs);
+     if (!tilingLayout) return;
+     // Luma: a drawn tile reaches into the outer gap at the screen's edges;
+     // the preview shows the cell itself, so what it shows is where the
+@@ -1166,7 +1169,7 @@ class TilingManager {
+ 
+   _easeWindowRectFromTile(tile, window, skipAnimation = false) {
+     const currentWs = window.get_workspace();
+-    const tilingLayout = this._workspaceTilingLayout.get(currentWs);
++    const tilingLayout = this._lumaLayoutFor(currentWs);
+     if (!tilingLayout) return;
+     const cellArea = this._lumaCellArea;
+     const scaledRect = this._lumaInCells(TileUtils.apply_props(tile, cellArea), cellArea);
