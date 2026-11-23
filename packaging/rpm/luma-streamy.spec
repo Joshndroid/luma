@@ -6,7 +6,7 @@
 
 Name:           luma-streamy
 Version:        0.1.0
-Release:        1.luma.21%{?dist}
+Release:        1.luma.22%{?dist}
 Summary:        Stream and record your screen, windows and camera
 # The app: Apache-2.0. gst-lumaframe: MPL-2.0. Vendored crates (Cargo.lock):
 # gstreamer-rs and glib-rs (MIT OR Apache-2.0, MIT), memchr (Unlicense OR
@@ -147,6 +147,9 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 300 python3 -B tests/engine_st
 # Every scene's sources stay open: a switch reopens nothing, a cut shows on the first output frame,
 # a fade reaches full alpha in its time and a picture in both scenes glides; a parked camera shows.
 PYTHONPATH=%{buildroot}%{python3_sitelib} STREAMY_FAKE_SOURCES=1 timeout 180 python3 -B tests/engine_scenes.py
+# Per-destination picture size and frame rate (a 60 fps feed recorded at 360p60 and its own size at
+# 30 fps) and a live bitrate change; skipped where no H.264 encoder or ffprobe is installed.
+PYTHONPATH=%{buildroot}%{python3_sitelib} timeout 120 python3 -B tests/outputs_quality.py $PWD/quality-out
 # The installed app opens on drawn stand-in sources and renders its window
 # at phone and desktop widths. The first try waits 15 s: on a loaded builder
 # the window can take that long to map while llvmpipe composites the scene.
@@ -189,6 +192,25 @@ gtk4-update-icon-cache --force --quiet %{_datadir}/icons/hicolor >/dev/null 2>&1
 %{_libdir}/gstreamer-1.0/libgstlumavideofx.so
 
 %changelog
+* Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.22
+- Each destination sets what it sends: picture size (the canvas's own, 720p
+  or 480p), 30 or 60 fps, video bitrate and sound bitrate; the recording
+  also sets its codec. Defaults come from the platform. Rows with different
+  settings get their own encode; a smaller picture is scaled once per
+  encode, on the GPU before a VA encoder. Each encode paces itself to its
+  own frame rate, and a canvas's tap runs at its fastest encode's rate.
+- Automatic bitrate (on by default for streams): an encode steps its
+  bitrate down by a quarter while its rows fall behind (pictures waiting or
+  dropped for the network), to a quarter of the row's at most, and climbs
+  back slowly once they keep up. Rows sharing an encode follow the worst
+  connected one. The row reads "Live · 3.2 of 6 Mb/s"; Stats shows it,
+  seconds waiting and stalls. Every step is logged.
+- A live stream whose bytes stop going out for 10 s is torn down and
+  reconnected, instead of waiting for the server to drop it.
+- While live, bitrate and automatic bitrate change at once on a row's own
+  encode; picture size, frame rate and sound apply on the next Go live, as
+  the editor says.
+
 * Sun Nov 22 2026 Project Luma <maintainers@projectluma.org> - 0.1.0-1.luma.21
 - A widget added to a running canvas (a scene, the other canvas turned on)
   never stops its source: its layer is fed only once it runs, and a redrawn

@@ -181,7 +181,8 @@ class StatsPanel(Gtk.Box):
                 widget.set_subtitle(destination_words(stats))
                 spark.set_values(stats.history[-og.HISTORY:])
                 spark.set_tone("danger" if stats.state in ("reconnecting", "error") else
-                               "danger" if stats.dropped_network or stats.dropped_encoder else "accent")
+                               "danger" if stats.dropped_network or stats.dropped_encoder else
+                               "warning" if stats.lowered else "accent")
         self.destinations.keep(keys)
         self.destinations.set_visible(bool(keys))
 
@@ -233,13 +234,19 @@ def destination_words(stats: og.RowStats) -> str:
     if stats.state != "live":
         return og.state_words(stats) + (f" · {stats.reconnects} reconnects" if stats.reconnects else "")
     parts = [og.format_rate(stats.bitrate_kbps)]
+    if stats.lowered:
+        parts.append(f"lowered to {og.format_rate(stats.encode_kbps)} of {og.format_rate(stats.target_kbps)} "
+                     f"for the network")
+    if stats.backlog_s >= 0.5:
+        parts.append(f"{stats.backlog_s:.1f} s waiting")
     dropped = stats.dropped_network + stats.dropped_encoder
     if dropped:
         parts.append(f"{dropped} dropped ({stats.dropped_network} network, {stats.dropped_encoder} encoder)")
     if stats.rtt_ms is not None:
         parts.append(f"RTT {stats.rtt_ms:.0f} ms")
     if stats.reconnects:
-        parts.append(f"{stats.reconnects} reconnect{'s' if stats.reconnects > 1 else ''}")
+        stalls = f", {stats.stalls} after a stall" if stats.stalls else ""
+        parts.append(f"{stats.reconnects} reconnect{'s' if stats.reconnects > 1 else ''}{stalls}")
     return " · ".join(parts)
 
 

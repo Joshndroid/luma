@@ -181,6 +181,7 @@ def check(app) -> None:
     assert sized["landscape"][1] < before["landscape"][1], (sized, before)
     print("a dragged seam holds", sized)
     outputs(win)
+    output_editor(win)
     inspector(win)
     several(win)
     linked(win)
@@ -456,6 +457,113 @@ def outputs(win) -> None:
     win.dest_panel._changed()
     print("bar: Go live & record while Recording goes with Go live")
     win.center.show_bar = show_bar
+
+
+def output_editor(win) -> None:
+    """A destination's editor sets what it sends (picture size, frame rate, video bitrate, automatic
+    bitrate, sound) and stores it; the platform's values store as its defaults; the recording's editor also
+    sets its codec. While live, a bitrate change goes to the outputs at once and the rest waits."""
+    panel = win.dest_panel
+    row = next((r for r in win.dest_store.rows if r.is_stream), None) or win.dest_store.add("restream")
+    panel.edit(row.id)
+    pump(0.2)
+    fields = panel.editor_output
+    labels = [label for label, _w in fields.fields]
+    assert labels == ["Picture", "Bitrate", "Sound"], labels
+    assert fields.auto is not None and fields.auto.get_active() == row.auto_bitrate
+    assert [b for b in walk(panel.editor) if b is fields.video], "the bitrate isn't in the editor"
+    fields.size.set_current("720")
+    fields.fps.set_current("60")
+    fields.video.set_value(3500)
+    fields.auto.set_active(False)
+    fields.audio.set_current("192")
+    panel.editor.primary.on_activate()
+    pump(0.2)
+    saved = win.dest_store.get(row.id)
+    assert (saved.size, saved.fps, saved.video_kbps, saved.auto_bitrate, saved.audio_kbps) == (720, 60, 3500, False, 192), \
+        saved
+    from luma_streamy.destinations_panel import quality_words
+
+    assert quality_words(saved) == "3.5 Mb/s · 720p60", quality_words(saved)
+    from luma_streamy.destinations import DestinationStore
+
+    again = DestinationStore.load(win.dest_store.path).get(row.id)
+    assert (again.size, again.fps, again.video_kbps) == (720, 60, 3500), again
+    # The platform's own values store as "the platform's default" (0), so they follow it.
+    panel.edit(row.id)
+    pump(0.2)
+    fields = panel.editor_output
+    video, audio, _size, _fps = saved.defaults
+    fields.size.set_current("0")
+    fields.fps.set_current("30")
+    fields.video.set_value(video)
+    fields.audio.set_current(str(audio))
+    fields.auto.set_active(True)
+    panel.editor.primary.on_activate()
+    pump(0.2)
+    saved = win.dest_store.get(row.id)
+    assert (saved.size, saved.fps, saved.video_kbps, saved.audio_kbps, saved.auto_bitrate) == (0, 0, 0, 0, True), saved
+    print("destination editor: picture, frame rate, bitrates and automatic bitrate stored; defaults follow the platform")
+    # The recording: codec and picture too, no automatic bitrate.
+    rec = next(r for r in win.dest_store.rows if not r.is_stream)
+    was = (rec.codec, rec.size)
+    panel.edit(rec.id)
+    pump(0.2)
+    assert panel.editor_output.auto is None, "a recording has no automatic bitrate"
+    codec = panel.editor_codec
+    codec.set_current("av1")
+    panel.editor_output.size.set_current("480")
+    panel.editor.primary.on_activate()
+    pump(0.2)
+    rec = win.dest_store.get(rec.id)
+    assert (rec.codec, rec.size) == ("av1", 480), (rec.codec, rec.size)
+    rec.codec, rec.size = was
+    win.dest_store.update(rec)
+    print("recording editor: codec and picture size stored")
+    # Live: the bitrate goes to the outputs now; picture and frame rate wait for the next Go live.
+    calls = []
+    outputs = win.outputs
+    saved_calls = (outputs.set_video_kbps, outputs.set_auto, outputs.sharing)
+    toasts = []
+    from luma_appkit import Toast
+
+    show = Toast.show
+    try:
+        outputs.set_video_kbps = lambda rid, kbps: calls.append(("video", rid, kbps)) or True
+        outputs.set_auto = lambda rid, on: calls.append(("auto", rid, on)) or True
+        outputs.sharing = lambda rid: []
+        Toast.show = staticmethod(lambda host, text, **kw: toasts.append(text))
+        panel.states[row.id] = ("live", "Live")
+        panel.edit(row.id)
+        pump(0.2)
+        assert "next Go live" in panel.editor.summary.get_label(), panel.editor.summary.get_label()
+        panel.editor_output.video.set_value(2500)
+        panel.editor_output.fps.set_current("60")
+        panel.editor.primary.on_activate()
+        pump(0.2)
+        assert calls == [("video", row.id, 2500)], calls
+        assert any("frame rate applies on the next Go live" in t for t in toasts), toasts
+        # Sharing its encode: the editor says so and nothing changes live.
+        calls.clear()
+        outputs.sharing = lambda rid: [r.id for r in win.dest_store.rows if r.id != rid][:1]
+        outputs.set_video_kbps = lambda rid, kbps: calls.append(("video", rid, kbps)) or False
+        panel.edit(row.id)
+        pump(0.2)
+        assert "sharing its encode" in panel.editor.summary.get_label(), panel.editor.summary.get_label()
+        panel.editor_output.video.set_value(2000)
+        panel.editor.primary.on_activate()
+        pump(0.2)
+        assert any("bitrate" in t and "next Go live" in t for t in toasts), toasts
+    finally:
+        outputs.set_video_kbps, outputs.set_auto, outputs.sharing = saved_calls
+        Toast.show = show
+        panel.states.pop(row.id, None)
+        win.center.fold()
+    row = win.dest_store.get(row.id)
+    row.video_kbps = row.fps = 0
+    win.dest_store.update(row)
+    panel.refresh()
+    print("destination editor while live: bitrate now, frame rate on the next Go live; a shared encode waits")
 
 
 class _Monitor:

@@ -96,7 +96,11 @@ STREAMY_FAKE_SOURCES=1 GST_PLUGIN_PATH=<lumaframe build> \
 ```
 
 `tests/outputs_smoke.py` sends one encode to several RTMP and SRT rows and two
-recordings (run it against a local mediamtx). `tests/panels_shot.py` renders
+recordings (run it against a local mediamtx). `tests/outputs_network.py` puts
+a throttling TCP proxy between one stream row and a local mediamtx (with
+`readTimeout: 60s`): automatic bitrate steps down and back up, and a stalled
+connection is reconnected after 10 s. `tests/outputs_quality.py` records a
+60 fps feed at 360p60 and at its own size at 30 fps. `tests/panels_shot.py` renders
 the three panels with fixture rows (`PANELS_SHOT`, `PANELS_WIDTH`,
 `PANELS_OPEN`) and `tests/panels_conform.py` checks its boxes.
 

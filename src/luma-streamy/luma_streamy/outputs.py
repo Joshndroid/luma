@@ -5,7 +5,10 @@ The engine hands this module the program's raw pictures (NV12, per canvas) and s
 48 kHz stereo) from its taps; ``Outputs`` encodes each (canvas, preset) once and tees the encoded
 samples to every row that shares it. Each row is its own pipeline (output_graph.py has the shapes),
 so a row that loses its connection reconnects alone (2 s, ×1.5, at most 15 min) and joins again on
-the next key frame, which it asks the encoder for. A recording finishes cleanly: EOS drains its
+the next key frame, which it asks the encoder for. A live stream whose bytes stop going out for
+og.STALL_S is reconnected by Streamy rather than waiting for the server to drop it, and an encode with
+automatic bitrate (og.RateControl) steps its bitrate down while its rows fall behind and back up once
+they keep up. A recording finishes cleanly: EOS drains its
 encoder, then its muxer writes the file's index.
 
 Samples arrive on GStreamer threads; every state change (build, teardown, reconnect) runs on the
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import collections
 import os
+import re
 import threading
 import time
 from typing import Callable
@@ -55,9 +59,24 @@ ENCODER_REBASE_MIN = 500_000_000
 #: put out seconds after it went in, and takes the sound from that picture on, not from when it starts.
 SOUND_BACKLOG_NS = 5 * 1_000_000_000
 
-#: Pictures closer together than this (ns) are over the encode's rate: 3/4 of a frame at og.FPS, so a
-#: jittery 30 fps source keeps every picture and a 60 fps one keeps every other.
-MIN_FRAME_GAP = 3 * 10**9 // (4 * og.FPS)
+def min_frame_gap(fps: int) -> int:
+    """Pictures closer together than this (ns) are over an encode's rate: 3/4 of a frame at ``fps``, so a
+    jittery source at that rate keeps every picture and one at twice the rate keeps every other."""
+    return 3 * 10**9 // (4 * fps)
+
+
+MIN_FRAME_GAP = min_frame_gap(og.FPS)
+
+
+def at_rate(caps: Gst.Caps, fps: int) -> Gst.Caps:
+    """``caps`` declaring ``fps``: an encoder spends its CBR budget per declared frame, so the encode's
+    input says the rate it is paced to, whatever the tap handed over."""
+    text = caps.to_string()
+    if "framerate=" in text:
+        text = re.sub(r"framerate=\(fraction\)[0-9]+/[0-9]+", f"framerate=(fraction){fps}/1", text)
+    else:
+        text += f", framerate=(fraction){fps}/1"
+    return Gst.Caps.from_string(text)
 
 
 def counted(counts: dict, key: str, text: str) -> None:
@@ -146,6 +165,13 @@ class Row:
         self._drops: dict[str, int] = {}
         self._sound_seen = False
         self._sound_last: int | None = None  # the newest sound pts pushed in
+        #: Stall watch: the network counter last seen, when it last moved, and the pictures in by then.
+        self._net_last: int | None = None
+        self._net_moved = time.monotonic()
+        self._frames_moved = 0
+        self._dropped_seen = 0
+        self.stats.target_kbps = self.stats.encode_kbps = group.current_kbps
+        self.stats.auto = group.rate is not None
 
     @property
     def is_stream(self) -> bool:
@@ -239,7 +265,7 @@ class Row:
         pipeline = Gst.Pipeline.new(f"streamy-row-{self.id}")
         tail = [build(e) for e in og.row_sink(self.id, self.kind, self.target, codec=codec,
                                               container=self.container)]
-        head = [build(e) for e in og.row_head(self.id, "video")]
+        head = [build(e) for e in og.row_head(self.id, "video", self.group.preset.fps)]
         adapter = [build(e) for e in og.video_adapter(self.id, self.kind, codec)]
         for element in head + adapter + tail:
             pipeline.add(element)
@@ -428,6 +454,38 @@ class Row:
 
     # ── Stats (main loop, ≤1 Hz) ──
 
+    def backlog(self) -> float:
+        """Seconds of pictures waiting to go out: in the row's queue, then its appsrc."""
+        pipeline, src = self.pipeline, self.video_src
+        if pipeline is None or src is None:
+            return 0.0
+        queue = pipeline.get_by_name(f"row-{self.id}-videoq")
+        waiting = queue.get_property("current-level-time") / Gst.SECOND if queue is not None else 0.0
+        return waiting + src.get_property("current-level-buffers") / self.group.preset.fps
+
+    def health(self) -> og.Health:
+        """The last second's network, for the encode's automatic bitrate."""
+        dropped = self.stats.dropped_network - self._dropped_seen
+        self._dropped_seen = self.stats.dropped_network
+        return og.Health(self.stats.backlog_s, dropped, self.stats.state == "live" and self.pipeline is not None)
+
+    def _watch_stall(self, progress: int, now: float) -> bool:
+        """A live stream whose bytes stopped going out for og.STALL_S while pictures still came in is torn
+        down and reconnected now (the server took ~40 s to drop it); whether it was."""
+        if not self.is_stream or self.stats.state != "live" or self.pipeline is None or progress != self._net_last:
+            self._net_last, self._net_moved, self._frames_moved = progress, now, self.stats.frames
+            return False
+        still = now - self._net_moved
+        if still < og.STALL_S or self.stats.frames <= self._frames_moved:
+            return False
+        self.stats.stalls += 1
+        log(f"row {self.id}: stalled: nothing went out for {still:.0f} s (sent {self.stats.bytes}, network "
+            f"{progress}, {self.stats.frames - self._frames_moved} pictures in since, queue "
+            f"{self.stats.backlog_s:.1f} s); reconnecting, {self.stats.stalls} stalls so far")
+        self._net_last = None
+        self._failed(f"stalled: nothing went out for {still:.0f} s")
+        return True
+
     def tick(self) -> None:
         now = time.monotonic()
         span = max(1e-3, now - self._last_tick)
@@ -449,6 +507,12 @@ class Row:
                         break
                 ok, rtt = info.get_double("rtt-ms")
                 self.stats.rtt_ms = rtt if ok else None
+                ok, acked = info.get_uint64("out-bytes-acked")
+                if ok and network is not None:
+                    self._unacked = network - acked
+        self.stats.backlog_s = self.backlog()
+        if self._watch_stall(network if network is not None else self.stats.bytes, now):
+            return
         self._log_ticks = getattr(self, "_log_ticks", 0) + 1
         if self._log_ticks >= STATS_LOG_S:
             self._log_ticks = 0
@@ -456,8 +520,11 @@ class Row:
             level = f"{src.get_property('current-level-buffers')}/{src.get_property('max-buffers')}" if src else "-"
             log(f"row {self.id}: {self.stats.state}, {self.stats.bitrate_kbps:.0f} kb/s, sent {self.stats.bytes}, "
                 f"network {network}, frames {self.stats.frames}, dropped network {self.stats.dropped_network} "
-                f"encoder {self.group.dropped}, queue {level}, rtt {self.stats.rtt_ms}, "
-                f"reconnects {self.stats.reconnects}, pipeline {'up' if self.pipeline is not None else 'none'}")
+                f"encoder {self.group.dropped}, queue {level} ({self.stats.backlog_s:.2f} s), "
+                f"unacked {getattr(self, '_unacked', None)}, rtt {self.stats.rtt_ms}, "
+                f"bitrate {self.group.current_kbps}/{self.group.target_kbps}{' auto' if self.group.rate else ''}, "
+                f"reconnects {self.stats.reconnects}, stalls {self.stats.stalls}, "
+                f"pipeline {'up' if self.pipeline is not None else 'none'}")
         if self.stats.state == "connecting" and self.pipeline is not None and sent > 0 and \
                 (network is None or network > 0):
             log(f"row {self.id}: live ({sent} bytes in the last second, network {network})")
@@ -480,8 +547,15 @@ class Encode:
         self.sound_caps: Gst.Caps | None = None
         self.t0: int | None = None
         self.dropped = 0
-        self.paced = 0  # pictures over FPS, dropped by timestamp before the encoder
+        self.paced = 0  # pictures over the preset's fps, dropped by timestamp before the encoder
+        self._min_gap = min_frame_gap(preset.fps)
         self._last_pts: int | None = None
+        #: The dict key Outputs holds this encode under (it moves when a live bitrate change re-keys it).
+        self.slot = preset
+        #: The video bitrate as set, the encoder's now, and its automatic bitrate (None: fixed).
+        self.target_kbps = self.current_kbps = preset.video_kbps
+        self.rate: og.RateControl | None = og.RateControl(preset.video_kbps) if preset.auto else None
+        self.scaled_to: str | None = None
         self.stopping = False
         self._eos: set[str] = set()
         self._lock = threading.Lock()
@@ -498,16 +572,34 @@ class Encode:
         self._backlog_lock = threading.Lock()
 
     def _build(self, caps: Gst.Caps) -> None:
+        caps = at_rate(caps, self.preset.fps)
+        structure = caps.get_structure(0)
+        ok_w, width = structure.get_int("width")
+        ok_h, height = structure.get_int("height")
+        source = (width, height) if ok_w and ok_h else None
+        gpu = self.choice.video.startswith("va") and Gst.ElementFactory.find("vapostproc") is not None
+        try:
+            self._build_with(caps, source, gpu)
+        except OutputError as error:
+            if not gpu or not self.preset.size:
+                raise
+            log(f"encode {self.preset.key}: scaling on the GPU failed ({error}); scaling on the CPU")
+            self._build_with(caps, source, False)
+
+    def _build_with(self, caps: Gst.Caps, source: tuple[int, int] | None, gpu: bool) -> None:
         pipeline = Gst.Pipeline.new(f"streamy-encode-{self.preset.key}")
         video_src = Gst.ElementFactory.make("appsrc", "encode-video")
         for name, value in (("is-live", True), ("format", Gst.Format.TIME), ("do-timestamp", False),
                             ("max-buffers", 8), ("block", False), ("caps", caps)):
             video_src.set_property(name, value)
-        video = [build(e) for e in og.encode_video(self.choice, self.preset)]
+        specs = og.encode_video(self.choice, self.preset, source, gpu_scale=gpu)
+        video = [build(e) for e in specs]
         pipeline.add(video_src)
         for element in video:
             pipeline.add(element)
         link_all([video_src] + video)
+        scale = next((e for e in specs if e.name.endswith("-size") or e.name.endswith("-i420")), None)
+        self.scaled_to = scale.props["caps"] if scale is not None and "width=" in scale.props["caps"] else None
         video[-1].connect("new-sample", self._encoded, "video")
         video[-1].connect("eos", self._encoded_eos, "video")
         self._encoder = next(e for e in video if e.get_name().endswith("-encoder"))
@@ -535,7 +627,9 @@ class Encode:
         self.pipeline, self.video_src, self.sound_src = pipeline, video_src, sound_src
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             raise OutputError("the encoder could not start")
-        log(f"encode {self.preset.key}: {self.choice.video} + {self.choice.audio}")
+        log(f"encode {self.preset.key}: {self.choice.video} + {self.choice.audio}, {self.preset.fps} fps, "
+            f"{self.target_kbps} kb/s{' (automatic)' if self.rate is not None else ''}"
+            f"{f', scaled to {self.scaled_to}' if self.scaled_to else ''}")
 
     # Raw in (GStreamer threads: the engine's taps)
 
@@ -556,18 +650,20 @@ class Encode:
                 # The program was rebuilt (its clock starts again): carry on from the last picture sent, so
                 # the encoder and every row see time keep going instead of dropping everything as "before t0".
                 sent = self._last_pts - self.t0
-                self.t0 = buffer.pts - sent - Gst.SECOND // og.FPS
+                self.t0 = buffer.pts - sent - Gst.SECOND // self.preset.fps
                 self._last_pts = None
                 log(f"encode {self.preset.key}: the program restarted; timestamps carry on from {sent / Gst.SECOND:.1f} s")
             if buffer.pts < self.t0:
                 return
-            # The encode is FPS: a picture closer than ~3/4 of a frame to the last one kept is dropped here,
-            # by timestamp, whatever rate the program's tap hands over (it gave its 60 fps canvas rate
-            # through, which doubled every bitrate: CBR spends its budget per declared frame).
-            if self._last_pts is not None and buffer.pts - self._last_pts < MIN_FRAME_GAP:
+            # The encode is its preset's fps: a picture closer than ~3/4 of a frame to the last one kept is
+            # dropped here, by timestamp, whatever rate the program's tap hands over (the tap runs at the
+            # fastest encode of its canvas; it once gave its 60 fps canvas rate through, which doubled every
+            # bitrate: CBR spends its budget per declared frame).
+            if self._last_pts is not None and buffer.pts - self._last_pts < self._min_gap:
                 self.paced += 1
                 if self.paced == 1:
-                    log(f"encode {self.preset.key}: pictures arrive faster than {og.FPS} fps; keeping {og.FPS}")
+                    log(f"encode {self.preset.key}: pictures arrive faster than {self.preset.fps} fps; "
+                        f"keeping {self.preset.fps}")
                 return
             self._last_pts = buffer.pts
             src = self.video_src
@@ -681,15 +777,68 @@ class Encode:
         if self._vout is not None:
             self._vout.send_event(GstVideo.video_event_new_upstream_force_key_unit(Gst.CLOCK_TIME_NONE, True, 0))
 
-    def set_bitrate(self, kbps: int) -> None:
+    def _bitrate_property(self) -> tuple[str, int] | None:
+        """The encoder's bitrate property and its unit (bits a second per kb/s), if it changes while it runs."""
         encoder = self._encoder
         if encoder is None:
-            return
+            return None
         name = encoder.get_factory().get_name()
-        if name == "svtav1enc":
-            encoder.set_property("target-bitrate", kbps)
-        else:
-            encoder.set_property("bitrate", kbps * (1000 if name == "openh264enc" else 1))
+        prop, unit = ("target-bitrate", 1) if name == "svtav1enc" else ("bitrate", 1000 if name == "openh264enc" else 1)
+        spec = encoder.find_property(prop)
+        if spec is None or not spec.flags & Gst.PARAM_MUTABLE_PLAYING:
+            return None
+        return prop, unit
+
+    def set_bitrate(self, kbps: int) -> bool:
+        """The encoder's bitrate now (kb/s); whether this encoder takes it while it runs."""
+        found = self._bitrate_property()
+        if found is None:
+            return False
+        prop, unit = found
+        self._encoder.set_property(prop, kbps * unit)
+        self.current_kbps = kbps
+        return True
+
+    def retarget(self, kbps: int) -> bool:
+        """The rows' bitrate changed while live; whether the encoder took it."""
+        if self._bitrate_property() is None:
+            return False
+        old = self.target_kbps
+        self.target_kbps = kbps
+        start = self.rate.retarget(kbps, time.monotonic()) if self.rate is not None else kbps
+        self.set_bitrate(start)
+        log(f"encode {self.preset.key}: bitrate set to {kbps} kb/s (was {old})")
+        return True
+
+    def set_auto(self, on: bool) -> bool:
+        """Automatic bitrate on or off while live; whether the encoder can follow it."""
+        if on == (self.rate is not None):
+            return True
+        if on and self._bitrate_property() is None:
+            return False
+        self.rate = og.RateControl(self.target_kbps) if on else None
+        if not on:
+            self.set_bitrate(self.target_kbps)
+        log(f"encode {self.preset.key}: automatic bitrate {'on' if on else 'off'} at {self.target_kbps} kb/s")
+        return True
+
+    def adapt(self, now: float) -> None:
+        """Once a second: automatic bitrate follows the worst of the encode's rows (og.RateControl)."""
+        if self.rate is None or self._encoder is None:
+            return
+        if self._bitrate_property() is None:
+            log(f"encode {self.preset.key}: automatic bitrate off: {self._encoder.get_factory().get_name()} "
+                f"can't change its bitrate while it runs")
+            self.rate = None
+            return
+        rows = {row.id: row.health() for row in list(self.rows.values()) if row.is_stream}
+        step = self.rate.update(rows, now)
+        if step is None:
+            return
+        kbps, why = step
+        old = self.current_kbps
+        self.set_bitrate(kbps)
+        log(f"encode {self.preset.key}: automatic bitrate {old} -> {kbps} kb/s of {self.target_kbps}: {why}")
 
     def _error(self, _bus, message: Gst.Message) -> None:
         error, debug = message.parse_error()
@@ -706,6 +855,12 @@ class Encode:
         if not srcs:
             self._drained()
             return
+        # Its rows say Finishing now (the engine's tap follows the encodes left), not once a slow encoder
+        # has drained.
+        for row in list(self.rows.values()):
+            if not row.stopping and row.stats.state != "finishing":
+                row.stats.state = "finishing"
+                self.outputs.emit("row-state", row.id, "finishing", og.state_words(row.stats))
         for src in srcs:
             src.emit("end-of-stream")
         GLib.timeout_add_seconds(RECORD_FINISH_S, lambda: self._drained() and False)
@@ -771,7 +926,9 @@ class Outputs(GObject.Object):
         if choice.audio is None and not record:
             raise OutputError("No AAC encoder is installed")
         if record:
-            preset = Preset(preset.canvas, choice.codec, preset.video_kbps, preset.audio_kbps)
+            import dataclasses
+
+            preset = dataclasses.replace(preset, codec=choice.codec, auto=False)
         with self._lock:
             encode = self.encodes.get(preset)
             if encode is None or encode.stopping:
@@ -822,8 +979,8 @@ class Outputs(GObject.Object):
                 close = encode
             else:
                 close = None
-            if not encode.rows and self.encodes.get(encode.preset) is encode:
-                del self.encodes[encode.preset]
+            if not encode.rows and self.encodes.get(encode.slot) is encode:
+                del self.encodes[encode.slot]
         if close is not None:
             close.close()
 
@@ -842,6 +999,48 @@ class Outputs(GObject.Object):
     def wants(self) -> set[str]:
         """The canvases whose pictures an encode needs now (the engine opens those taps only)."""
         return {p.canvas for p, e in list(self.encodes.items()) if not e.stopping}
+
+    def fps(self, canvas: str) -> int:
+        """The rate canvas ``canvas``'s tap hands over: its fastest encode's (each encode paces to its own)."""
+        return max([e.preset.fps for e in list(self.encodes.values()) if e.preset.canvas == canvas and
+                    not e.stopping] or [og.FPS])
+
+    # ── Live changes (the row's editor) ──
+
+    def sharing(self, row_id: str) -> list[str]:
+        """The other rows on row ``row_id``'s encode."""
+        row = self.rows.get(row_id)
+        return [r for r in row.group.rows if r != row_id] if row is not None else []
+
+    def set_video_kbps(self, row_id: str, kbps: int) -> bool:
+        """Row ``row_id``'s bitrate now, while live; False when it waits for the next Go live (the row
+        shares its encode, or the encoder can't change it while it runs)."""
+        row = self.rows.get(row_id)
+        if row is None or self.sharing(row_id) or not row.group.retarget(kbps):
+            return False
+        self._rekey(row.group, video_kbps=kbps)
+        row.stats.target_kbps, row.stats.encode_kbps = kbps, row.group.current_kbps
+        return True
+
+    def set_auto(self, row_id: str, on: bool) -> bool:
+        """Row ``row_id``'s automatic bitrate now, while live (False: on the next Go live)."""
+        row = self.rows.get(row_id)
+        if row is None or not row.is_stream or self.sharing(row_id) or not row.group.set_auto(on):
+            return False
+        self._rekey(row.group, auto=on)
+        row.stats.auto, row.stats.encode_kbps = on, row.group.current_kbps
+        return True
+
+    def _rekey(self, encode: Encode, **changes) -> None:
+        """A row that starts later with the changed settings joins this encode."""
+        import dataclasses
+
+        with self._lock:
+            new = dataclasses.replace(encode.slot, **changes)
+            if self.encodes.get(encode.slot) is encode and new not in self.encodes:
+                del self.encodes[encode.slot]
+                self.encodes[new] = encode
+                encode.slot = new
 
     def push_video(self, canvas: str, sample: Gst.Sample) -> None:
         for preset, encode in list(self.encodes.items()):
@@ -868,6 +1067,12 @@ class Outputs(GObject.Object):
         for row in list(self.rows.values()):
             row.stats.dropped_encoder = row.group.dropped
             row.tick()
+        now = time.monotonic()
+        for encode in list(self.encodes.values()):
+            encode.adapt(now)
+        for row in list(self.rows.values()):
+            row.stats.target_kbps, row.stats.encode_kbps = row.group.target_kbps, row.group.current_kbps
+            row.stats.auto = row.group.rate is not None
         self.emit("tick")
         if not self.rows:
             self._tick = 0

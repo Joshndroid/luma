@@ -561,26 +561,39 @@ def tap_sound() -> list[Element]:
                                              "sync": False, "async": False})]
 
 
-def video_encoder_chain(choice: EncoderChoice, bitrate_kbps: int, prefix: str) -> list[Element]:
-    """NV12 pictures to an encoded stream: CBR, a key frame every 2 s, no B-frames."""
-    gop = 2 * FPS
+def video_encoder_chain(choice: EncoderChoice, bitrate_kbps: int, prefix: str, *, fps: int = FPS,
+                        scale: tuple[int, int] | None = None, gpu_scale: bool = False) -> list[Element]:
+    """NV12 pictures to an encoded stream: CBR, a key frame every 2 s, no B-frames. ``scale`` (width,
+    height) scales the pictures first: before a VA encoder on the GPU with ``gpu_scale`` (vapostproc
+    uploads and scales in one pass and hands the encoder its surfaces), else on the CPU (in the software
+    encoders' own conversion)."""
+    gop = 2 * fps
     f = choice.video
+    size = f",width={scale[0]},height={scale[1]},pixel-aspect-ratio=1/1" if scale else ""
     if f.startswith("va"):
-        head = []  # VA encoders take NV12 from system memory and upload it themselves
+        if scale and gpu_scale:
+            head = [Element("vapostproc", f"{prefix}-scale"),
+                    Element("capsfilter", f"{prefix}-size",
+                            {"caps": f"video/x-raw(memory:VAMemory),format=NV12{size}"})]
+        elif scale:
+            head = [Element("videoscale", f"{prefix}-scale"),
+                    Element("capsfilter", f"{prefix}-size", {"caps": f"video/x-raw,format=NV12{size}"})]
+        else:
+            head = []  # VA encoders take NV12 from system memory and upload it themselves
         props = {"rate-control": "cbr", "bitrate": bitrate_kbps, "key-int-max": gop}
         if "h26" in f:
             props["b-frames"] = 0
     elif f == "svtav1enc":
-        head = [Element("videoconvert", f"{prefix}-convert"),
-                Element("capsfilter", f"{prefix}-i420", {"caps": "video/x-raw,format=I420"})]
+        head = [Element("videoconvertscale" if scale else "videoconvert", f"{prefix}-convert"),
+                Element("capsfilter", f"{prefix}-i420", {"caps": f"video/x-raw,format=I420{size}"})]
         # Real-time: the fastest preset, rate-controlled to the bitrate (crf off), a key frame every
         # 2 s. SVT-AV1's CBR needs its low-delay structure, which stalls in GStreamer 1.28, so this
         # is its bitrate-targeted VBR, which AV1 destinations (enhanced RTMP, files) take.
         props = {"preset": SVTAV1_PRESET, "target-bitrate": bitrate_kbps, "crf": -1,
                  "intra-period-length": gop - 1}
     else:
-        head = [Element("videoconvert", f"{prefix}-convert"),
-                Element("capsfilter", f"{prefix}-i420", {"caps": "video/x-raw,format=I420"})]
+        head = [Element("videoconvertscale" if scale else "videoconvert", f"{prefix}-convert"),
+                Element("capsfilter", f"{prefix}-i420", {"caps": f"video/x-raw,format=I420{size}"})]
         props = {"bitrate": bitrate_kbps * 1000, "rate-control": "bitrate", "gop-size": gop,
                  "complexity": "low", "usage-type": "screen"}
     parse = "h264parse" if choice.codec == "h264" else "av1parse"

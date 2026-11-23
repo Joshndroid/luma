@@ -15,17 +15,27 @@ from pathlib import Path
 from .model import FORMATS, atomic_write
 
 #: key: (label, ingest (empty: the platform shows its own; it is pasted with the key), how it connects,
-#: icon, video kbps, audio kbps)
-PLATFORMS: dict[str, tuple[str, str, str, str, int, int]] = {
-    "twitch": ("Twitch", "rtmps://live.twitch.tv/app", "key", "twitch", 6000, 160),
-    "youtube": ("YouTube", "rtmps://a.rtmps.youtube.com/live2", "key", "youtube", 8000, 160),
-    "kick": ("Kick", "", "key", "kick", 6000, 160),
-    "tiktok": ("TikTok", "", "key", "tiktok", 6000, 128),
-    "x": ("X", "rtmp://va.pscp.tv:80/x", "key", "x", 6000, 128),
-    "restream": ("Restream", "rtmp://live.restream.io/live", "key", "restream", 6000, 160),
-    "custom": ("Custom", "", "key", "server", 6000, 160),
-    "record": ("Recording", "", "file", "circle", 12000, 192),
+#: icon, video kbps, audio kbps, picture size (the short side in pixels; 0 = the canvas's own), fps)
+PLATFORMS: dict[str, tuple[str, str, str, str, int, int, int, int]] = {
+    "twitch": ("Twitch", "rtmps://live.twitch.tv/app", "key", "twitch", 6000, 160, 0, 30),
+    "youtube": ("YouTube", "rtmps://a.rtmps.youtube.com/live2", "key", "youtube", 8000, 160, 0, 30),
+    "kick": ("Kick", "", "key", "kick", 6000, 160, 0, 30),
+    "tiktok": ("TikTok", "", "key", "tiktok", 6000, 128, 0, 30),
+    "x": ("X", "rtmp://va.pscp.tv:80/x", "key", "x", 6000, 128, 0, 30),
+    "restream": ("Restream", "rtmp://live.restream.io/live", "key", "restream", 6000, 160, 0, 30),
+    "custom": ("Custom", "", "key", "server", 6000, 160, 0, 30),
+    "record": ("Recording", "", "file", "circle", 12000, 192, 0, 30),
 }
+
+#: Picture sizes a row can scale its canvas down to (the short side: 720 = 1280×720 landscape, 720×1280
+#: vertical). 0 is the canvas's own size.
+SIZES = (720, 480)
+#: Frame rates an output sends at.
+RATES = (30, 60)
+#: Sound bitrates (kb/s) an output offers.
+AUDIO_KBPS = (128, 160, 192, 256)
+#: The video bitrate's range (kb/s).
+VIDEO_KBPS_MIN, VIDEO_KBPS_MAX = 500, 50000
 
 #: Platforms that sign in (OAuth) instead of taking a pasted key; the key then comes from the platform.
 SIGN_IN = ("twitch", "youtube")
@@ -49,6 +59,13 @@ class Destination:
     #: Per-row overrides (0 = the platform's default).
     video_kbps: int = 0
     audio_kbps: int = 0
+    #: The picture's short side in pixels (0 = the platform's default, which is the canvas's own size; a
+    #: size at or above the canvas's is its own size).
+    size: int = 0
+    #: Frames a second (0 = the platform's default).
+    fps: int = 0
+    #: A stream lowers its bitrate while the network can't keep up, and climbs back once it can.
+    auto_bitrate: bool = True
     #: The signed-in account's display name (OAuth platforms), shown on the row.
     account: str = ""
     #: A recording's folder ("" = Videos/Streamy).
@@ -84,12 +101,53 @@ class Destination:
     def icon(self) -> str:
         return PLATFORMS[self.platform][3]
 
-    def preset(self) -> tuple[str, str, int, int]:
-        """What an encode for this row is: (canvas, codec, video kbps, audio kbps). Rows with one preset
-        share it. A recording's codec "" is resolved when its encoder is chosen."""
-        _label, _ingest, _how, _icon, video, audio = PLATFORMS[self.platform]
+    @property
+    def defaults(self) -> tuple[int, int, int, int]:
+        """The platform's (video kbps, audio kbps, size, fps)."""
+        return PLATFORMS[self.platform][4:8]
+
+    def output(self) -> tuple[int, int, int, int, bool]:
+        """What this row sends: (video kbps, audio kbps, size (0 = the canvas's own), fps, automatic bitrate),
+        the platform's defaults where the row has none of its own."""
+        video, audio, size, fps = self.defaults
+        size = self.size or size
+        if size >= canvas_short_side(self.canvas):
+            size = 0
+        return (self.video_kbps or video, self.audio_kbps or audio, size, self.fps or fps,
+                self.auto_bitrate and self.is_stream)
+
+    def preset(self) -> tuple[str, str, int, int, int, int, bool]:
+        """What an encode for this row is: (canvas, codec, video kbps, audio kbps, size, fps, automatic
+        bitrate), output_graph.Preset's fields. Rows with one preset share it. A recording's codec "" is
+        resolved when its encoder is chosen."""
         codec = self.codec or ("h264" if self.is_stream else "")
-        return self.canvas, codec, self.video_kbps or video, self.audio_kbps or audio
+        return (self.canvas, codec) + self.output()
+
+
+def canvas_short_side(canvas: str) -> int:
+    _label, width, height = FORMATS.get(canvas, FORMATS["landscape"])
+    return min(width, height)
+
+
+def output_size(canvas: str, size: int) -> tuple[int, int]:
+    """The picture a row sends: canvas ``canvas`` scaled so its short side is ``size`` (0 or at least the
+    canvas's own: the canvas's size), both sides even."""
+    _label, width, height = FORMATS.get(canvas, FORMATS["landscape"])
+    return scaled(width, height, size)
+
+
+def scaled(width: int, height: int, size: int) -> tuple[int, int]:
+    """``width`` × ``height`` scaled down so its short side is ``size`` (0, or at least the short side: as it
+    is), both sides even (NV12 and every encoder take even sides)."""
+    short = min(width, height)
+    if not size or size >= short:
+        return width, height
+    return tuple(max(2, int(round(n * size / short / 2)) * 2) for n in (width, height))
+
+
+def size_label(canvas: str, size: int) -> str:
+    """A picture size in words: 1080p, 720p."""
+    return f"{size or canvas_short_side(canvas)}p"
 
 
 def new(platform: str, canvas: str = "landscape") -> Destination:

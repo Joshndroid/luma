@@ -2694,6 +2694,7 @@ class Engine(GObject.Object):
                 program.tap = self._attach_tap(("video", fmt), program.tee, [make(e) for e in graph.tap_video(fmt)])
             if program.tap:
                 program.tap[0].set_property("drop", fmt not in sent)
+                self._tap_rate(fmt)
         if sent and not self._sound_tap and self._sound:
             self._sound_tap = self._attach_tap("sound", self.pipeline.get_by_name("sound"),
                                                [make(e) for e in graph.tap_sound()])
@@ -2705,6 +2706,22 @@ class Engine(GObject.Object):
             # A canvas an output starts taking captures its pictures; one kept only for an output that
             # ended goes now.
             self.show_scene(self._scene, skip=self._skip, states=self._states)
+
+    def _tap_rate(self, fmt: str) -> None:
+        """Canvas ``fmt``'s tap hands over its fastest encode's rate (outputs.Outputs.fps: 30 or 60);
+        each encode paces itself to its own."""
+        rate = getattr(self.fanout, "fps", None)
+        fps = max(graph.FPS, rate(fmt) if rate is not None else graph.FPS)
+        caps = self.pipeline.get_by_name(f"tap-fps-{fmt}")
+        if caps is None:
+            return
+        current = caps.get_property("caps")
+        ok, num, den = current.get_structure(0).get_fraction("framerate") if current is not None and \
+            current.get_size() else (False, 0, 1)
+        if ok and den and num // den == fps:
+            return
+        caps.set_property("caps", Gst.Caps.from_string(f"video/x-raw(memory:GLMemory),framerate={fps}/1"))
+        log(f"tap {fmt}: {fps} fps")
 
     # Older names.
     def _ensure_taps(self) -> None:

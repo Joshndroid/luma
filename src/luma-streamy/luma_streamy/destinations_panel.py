@@ -4,7 +4,10 @@
 A row shows the platform's logo, the account or name, the canvas it takes (a chip that switches
 it), an on/off switch and its status in words. Adding and editing happen in the action bar's editor:
 Twitch and YouTube sign in (accounts.py); Kick, TikTok, Restream and Custom take a server and a stream key;
-the recording takes a format, a canvas and a folder. Keys and sign-ins live in the keyring (Secret
+the recording takes a format, a codec, a canvas and a folder. Every row also sets what it sends: picture
+size (the canvas's own or smaller) and frame rate, video bitrate (with automatic bitrate for a stream)
+and sound bitrate. While live, a bitrate change applies at once; picture, frame rate and sound apply on
+the next Go live (a new encode would reconnect the row, and platforms take a restarted stream badly). Keys and sign-ins live in the keyring (Secret
 schema org.projectluma.Streamy.Destination, attributes account = the row's id, kind).
 
     panel = DestinationsPanel(store, center=window.center, host=window.host, outputs=outputs)
@@ -23,7 +26,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from luma_appkit import (  # noqa: E402
-    ActionCenter, ActionEditor, AppIcon, BarAction, IconOnlyButton, ModeSwitch, NavigationList,
+    ActionCenter, ActionEditor, AppIcon, BarAction, IconOnlyButton, ModeSwitch, NavigationList, NumericField,
     PanelHeading, PanelRow, RowLead, SidebarRow, Switch, TextButton, Toast,
 )
 from luma_appkit.action_bubble import FloatingMenu, MenuItem  # noqa: E402
@@ -31,7 +34,10 @@ from luma_appkit.bar_panel import panel_list  # noqa: E402
 
 from . import accounts  # noqa: E402
 from . import output_graph as og  # noqa: E402
-from .destinations import PLATFORMS, Destination, DestinationStore  # noqa: E402
+from .destinations import (  # noqa: E402
+    AUDIO_KBPS, PLATFORMS, RATES, SIZES, VIDEO_KBPS_MAX, VIDEO_KBPS_MIN, Destination, DestinationStore,
+    canvas_short_side, size_label,
+)
 from .model import FORMATS  # noqa: E402
 
 SECRET_SCHEMA = "org.projectluma.Streamy.Destination"
@@ -39,6 +45,58 @@ KEY, SIGN_IN = "stream-key", "oauth"
 CANVAS_ICONS = {"landscape": "rectangle-horizontal", "vertical": "smartphone"}
 #: What "Add" offers, in order.
 ADDABLE = ("twitch", "youtube", "kick", "tiktok", "x", "restream", "custom")
+#: A recording's codec choices ("auto": output_graph.RECORD_ORDER).
+RECORD_CODECS = (("auto", "Auto"), ("h264", "H.264"), ("av1", "AV1"))
+#: While live, said in the editor's header.
+LIVE_NOTE = "Live: bitrate changes now; picture, frame rate and sound on the next Go live"
+
+
+class OutputFields:
+    """What a row sends, as editor fields: Picture (size and frame rate), Bitrate (video, and automatic
+    for a stream) and Sound. ``values()`` reads them back as the row's own settings (0 = the platform's
+    default)."""
+
+    def __init__(self, row: Destination, *, on_change: Callable[[], None] | None = None) -> None:
+        self.row = row
+        video, audio, size, fps, auto = row.output()
+        self.defaults = row.defaults
+        changed = (lambda *_a: on_change()) if on_change is not None else None
+        sizes = [0] + [s for s in SIZES if s < canvas_short_side(row.canvas)]
+        self.size = ModeSwitch([(str(s), size_label(row.canvas, s)) for s in sizes], current=str(size),
+                               label="Picture size", compact=True, on_change=changed)
+        self.fps = ModeSwitch([(str(r), f"{r} fps") for r in RATES], current=str(fps if fps in RATES else RATES[0]),
+                              label="Frame rate", compact=True, on_change=changed)
+        picture = Gtk.Box(spacing=8)
+        picture.append(self.size)
+        picture.append(self.fps)
+        self.video = NumericField("Video", unit="kb/s", step=500, minimum=VIDEO_KBPS_MIN, maximum=VIDEO_KBPS_MAX)
+        self.video.set_value(video)
+        self.video.update_property([Gtk.AccessibleProperty.LABEL], ["Video bitrate"])
+        if changed is not None:
+            self.video.connect("value-changed", changed)
+        bitrate = Gtk.Box(spacing=12)
+        bitrate.append(self.video)
+        self.auto = None
+        if row.is_stream:
+            self.auto = Switch(active=row.auto_bitrate, label="Automatic bitrate: lower it while the network "
+                               "can't keep up", on_toggle=changed and (lambda _on: changed()))
+            bitrate.append(self.auto)
+            words = Gtk.Label(label="Automatic", xalign=0)
+            words.add_css_class("dim-label")
+            bitrate.append(words)
+        choices = sorted(set(AUDIO_KBPS) | {audio})
+        self.audio = ModeSwitch([(str(k), f"{k} kb/s") for k in choices], current=str(audio),
+                                label="Sound bitrate", compact=True, on_change=changed)
+        self.fields = [("Picture", picture), ("Bitrate", bitrate), ("Sound", self.audio)]
+
+    def values(self) -> dict:
+        video, audio, size, fps = self.defaults
+        chosen = {"video_kbps": int(self.video.get_value()), "audio_kbps": int(self.audio.current),
+                  "size": int(self.size.current), "fps": int(self.fps.current)}
+        out = {key: 0 if value == default else value
+               for (key, value), default in zip(chosen.items(), (video, audio, size, fps))}
+        out["auto_bitrate"] = self.auto.get_active() if self.auto is not None else self.row.auto_bitrate
+        return out
 
 
 def logos_dir() -> Path:
@@ -190,7 +248,7 @@ class DestinationsPanel(Gtk.Box):
                 return f"Recording · {_clock(time.monotonic() - since)}{size}"
             return words
         if not row.is_stream:
-            return f"{row.container.upper()} · {_home(row.folder or str(recordings_dir()))}"
+            return f"{row.container.upper()} · {quality_words(row)} · {_home(row.folder or str(recordings_dir()))}"
         if not row.enabled:
             return "Skipped when going live"
         if row.signs_in and not row.account and not self.key_for(row):
@@ -199,7 +257,7 @@ class DestinationsPanel(Gtk.Box):
             return "Needs a server"
         if not self.key_for(row) and row.ingest.startswith(("rtmp://", "rtmps://")) and row.platform != "custom":
             return "Needs a stream key"
-        return "Ready"
+        return f"Ready · {quality_words(row)}"
 
     def record_with_live(self) -> bool:
         """The Recording row's "Record whenever I go live"."""
@@ -333,6 +391,9 @@ class DestinationsPanel(Gtk.Box):
         if row.is_stream:
             fields += [("Server", server), ("Stream key", key)]
         fields.append(("Canvas", canvas))
+        editor_box: dict = {}
+        output = OutputFields(row, on_change=lambda: self._live_note(row, editor_box.get("editor")))
+        fields += output.fields
 
         def save() -> None:
             server_text = server.get_text().strip()
@@ -350,6 +411,7 @@ class DestinationsPanel(Gtk.Box):
             target = row if row.id else self.store.add(row.platform, candidate.canvas)
             for field in ("name", "canvas", "server"):
                 setattr(target, field, getattr(candidate, field))
+            self._apply_output(target, output.values())
             self.store.update(target)
             if not (row.signs_in and mode["value"] == "signin"):
                 self._store_key(target, key.get_text().strip())
@@ -368,8 +430,10 @@ class DestinationsPanel(Gtk.Box):
 
         editor = ActionEditor(row.label if row.id else f"Add {label}", "radio-tower", modes=modes,
                               mode=mode["value"] if modes else None, on_mode=on_mode if modes else None,
-                              summary="Stream keys are kept in your keyring", fields=fields, body=body,
-                              primary=BarAction("check", "Save" if row.id else "Add", on_activate=save))
+                              summary=self._summary(row, "Stream keys are kept in your keyring"), fields=fields,
+                              body=body, primary=BarAction("check", "Save" if row.id else "Add", on_activate=save))
+        editor_box["editor"] = editor
+        self.editor, self.editor_output = editor, output
         self.center.set_editor(editor)
         self.center.grow()
         if modes:
@@ -475,6 +539,10 @@ class DestinationsPanel(Gtk.Box):
                              label="Format", compact=True)
         canvas = ModeSwitch([(k, canvas_label(k), CANVAS_ICONS[k]) for k in FORMATS], current=row.canvas,
                             label="Canvas", compact=True)
+        codec = ModeSwitch(list(RECORD_CODECS), current=row.codec or "auto", label="Codec", compact=True)
+        self.editor_codec = codec
+        editor_box: dict = {}
+        output = OutputFields(row, on_change=lambda: self._live_note(row, editor_box.get("editor")))
         folder = {"path": row.folder or str(recordings_dir())}
         pick = TextButton(Path(folder["path"]).name or folder["path"], icon="folder")
 
@@ -497,17 +565,60 @@ class DestinationsPanel(Gtk.Box):
         def save() -> None:
             row.container = formats.current if hasattr(formats, "current") else row.container
             row.canvas = canvas.current if hasattr(canvas, "current") else row.canvas
+            row.codec = "" if codec.current == "auto" else codec.current
             row.folder = "" if folder["path"] == str(recordings_dir()) else folder["path"]
+            self._apply_output(row, output.values())
             self.store.update(row)
             self.center.fold()
             self.refresh()
             self._changed()
 
-        editor = ActionEditor("Recording", "circle-dot", summary="MKV survives a crash; MP4 plays everywhere",
-                              fields=[("Format", formats), ("Canvas", canvas), ("Folder", pick)],
+        editor = ActionEditor("Recording", "circle-dot",
+                              summary=self._summary(row, "MKV survives a crash; MP4 plays everywhere"),
+                              fields=[("Format", formats), ("Codec", codec), ("Canvas", canvas)] + output.fields +
+                              [("Folder", pick)],
                               body=Gtk.Box(visible=False), primary=BarAction("check", "Save", on_activate=save))
+        editor_box["editor"] = editor
+        self.editor, self.editor_output = editor, output
         self.center.set_editor(editor)
         self.center.grow()
+
+    # ── What a row sends ──
+
+    def _summary(self, row: Destination, idle: str) -> str:
+        """The editor's header line: what it says when idle, or how a change applies while live."""
+        if not row.id or not self._live(row.id):
+            return idle
+        others = self.outputs.sharing(row.id) if self.outputs is not None else []
+        if others:
+            names = ", ".join(r.label for r in self.store.rows if r.id in others)
+            return f"Live, sharing its encode with {names}: changes apply on the next Go live"
+        return LIVE_NOTE
+
+    def _live_note(self, row: Destination, editor: ActionEditor | None) -> None:
+        if editor is not None and row.id and self._live(row.id):
+            editor.set_summary(self._summary(row, ""))
+
+    def _apply_output(self, row: Destination, values: dict) -> None:
+        """Store the row's output settings; while it is live, bitrate and automatic bitrate change now when
+        its encode is its own, the rest (and everything on a shared encode) on the next Go live."""
+        before = row.output()
+        for name, value in values.items():
+            setattr(row, name, value)
+        after = row.output()
+        if not row.id or not self._live(row.id) or self.outputs is None or before == after:
+            return
+        later = []
+        if after[0] != before[0] and not self.outputs.set_video_kbps(row.id, after[0]):
+            later.append("bitrate")
+        if after[4] != before[4] and not self.outputs.set_auto(row.id, after[4]):
+            later.append("automatic bitrate")
+        later += [words for i, words in ((2, "picture size"), (3, "frame rate"), (1, "sound bitrate"))
+                  if after[i] != before[i]]
+        if later:
+            said = later[0] if len(later) == 1 else f"{', '.join(later[:-1])} and {later[-1]}"
+            Toast.show(self.host, f"{row.label}: {said} {'applies' if len(later) == 1 else 'apply'} on the next "
+                       f"Go live", kind="saved")
 
     def remove(self, row: Destination) -> None:
         if self._live(row.id) and self.outputs is not None:
@@ -592,6 +703,12 @@ class DestinationsPanel(Gtk.Box):
     def live_canvases(self) -> set[str]:
         """Canvases some live row takes (their chips carry the red dot)."""
         return {r.canvas for r in self.store.rows if self._live(r.id)}
+
+
+def quality_words(row: Destination) -> str:
+    """What a row sends, in words: 6 Mb/s · 1080p30."""
+    video, _audio, size, fps, _auto = row.output()
+    return og.video_words(video, size_label(row.canvas, size), fps)
 
 
 def _show_file(path: str, widget: Gtk.Widget) -> None:
