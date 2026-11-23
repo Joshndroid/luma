@@ -111,6 +111,19 @@ class HuskyProfile(unittest.TestCase):
                                 "AllowHybridSleep=no"])
         self.assertNotIn("no-sleep", init)
 
+    def test_idle_suspend_on_battery_only(self):
+        init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
+        build = (ROOT / "scripts/mobile/husky/build-boot.sh").read_text()
+        self.assertIn('"$here/initramfs/luma-husky-power.dconf"', build)
+        self.assertIn("for db in luma gdm; do", init)
+        self.assertIn("/sysroot/etc/dconf/db/$db.d/20-luma-husky-power", init)
+        dconf = (ROOT / "scripts/mobile/husky/initramfs/luma-husky-power.dconf").read_text()
+        keys = [line for line in dconf.splitlines() if line and not line.startswith("#")]
+        self.assertEqual(keys, ["[org/gnome/settings-daemon/plugins/power]",
+                                "sleep-inactive-battery-type='suspend'",
+                                "sleep-inactive-battery-timeout=120",
+                                "sleep-inactive-ac-type='nothing'"])
+
     def test_unused_vendor_module_requests_are_masked(self):
         init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
         self.assertIn("for name in fuse-overlayfs open-vm-tools fwupd-i2c i2c-tools", init)

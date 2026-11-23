@@ -1,0 +1,14 @@
+# Husky's power defaults, loaded after Luma's shared handheld defaults
+# (10-luma-handheld) for the signed-in session and the login screen alike.
+#
+# The shared handheld defaults never suspend on idle, because suspend drops
+# the Fairphone's Qualcomm modem.  Husky does not have that modem, and its
+# suspend to idle resumes on the power key with Wi-Fi, Bluetooth, audio and
+# the sensors back.  So on battery, suspend two minutes after the last input,
+# a minute after the screen blanks.  On a charger or a computer it stays
+# awake, as before.  Both remain changeable in Settings -> Power.
+
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-battery-type='suspend'
+sleep-inactive-battery-timeout=120
+sleep-inactive-ac-type='nothing'

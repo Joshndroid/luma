@@ -229,6 +229,14 @@ mkdir -p /sysroot/etc/dconf/db/luma.d
 cmp -s /luma/handheld/luma-shell-handheld.dconf "$dconf_dst" ||
 	cp /luma/handheld/luma-shell-handheld.dconf "$dconf_dst" ||
 	say "could not install the handheld dconf defaults"
+# Husky's own power defaults on top, for the session and the login screen:
+# on battery, suspend to idle after two minutes without input.
+for db in luma gdm; do
+	power_dst=/sysroot/etc/dconf/db/$db.d/20-luma-husky-power
+	cmp -s /luma/handheld/luma-husky-power.dconf "$power_dst" ||
+		cp /luma/handheld/luma-husky-power.dconf "$power_dst" ||
+		say "could not install husky's power defaults ($db)"
+done
 cat > /run/systemd/system/luma-husky-dconf-update.service <<'EOF'
 [Unit]
 Description=Luma husky: compile the dconf system databases

@@ -113,6 +113,7 @@ install -D -m 0644 "$mali_fw" "$work/root/lib/firmware/arm/mali/arch11.8/mali_cs
 install -m 0644 "$luma/config/mobile/luma-shell-handheld.dconf" \
 	"$luma/config/mobile/luma-greeter-handheld.dconf" \
 	"$luma/config/mobile/logind-handheld.conf" "$work/root/luma/handheld/"
+install -m 0644 "$here/initramfs/luma-husky-power.dconf" "$work/root/luma/handheld/"
 install -m 0644 "$luma/config/mobile/display-geometry/google-husky.json" \
 	"$work/root/luma/handheld/display-geometry.json"
 install -m 0755 "$here/mesa/90-luma-husky-gpu" "$work/root/luma/mesa/"
