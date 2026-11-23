@@ -56,6 +56,10 @@ class HuskyProfile(unittest.TestCase):
         checked = re.search(r"for k in (.*?); do", spec, re.S).group(1).replace("\\", " ").split()
         self.assertEqual(checked, loaded)
         self.assertIn('INSTALL_MOD_PATH="$out/modules" INSTALL_MOD_STRIP=1 modules_install', build)
+        # The initramfs copies come from that signed tree; stripping after
+        # signing would drop the signature and taint the kernel.
+        self.assertNotIn("llvm-strip", build)
+        self.assertIn("Module signature appended", build)
 
     def test_identity_partitions_are_preserved(self):
         preserve = set(load("device.toml")["install"]["preserve"])

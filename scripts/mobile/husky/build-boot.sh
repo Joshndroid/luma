@@ -166,15 +166,19 @@ grep -qx 'CONFIG_CMDLINE_FORCE=y' "$obj/.config" || {
 k -j"$(nproc)" exynos/google/zuma-husky.dtb
 k -j"$(nproc)" vmlinux
 k -j"$(nproc)" modules
-for m in $modules; do
-	install -m 0644 "$obj/$m.ko" "$work/root/luma/modules/"
-done
-# Debug info is most of each module's size (as INSTALL_MOD_STRIP=1 does).
-llvm-strip --strip-debug "$work"/root/luma/modules/*.ko
-# Every module of this build, stripped and signed, for kernel-modules-luma-husky
-# (scripts/packages/build-kernel-modules-luma-husky.sh --build "$out").
+# Every module of this build, stripped of debug info and then signed, for
+# kernel-modules-luma-husky (scripts/packages/build-kernel-modules-luma-husky.sh
+# --build "$out"). The initramfs takes its modules from there: stripping a
+# module after the build signed it drops the signature, and the kernel then
+# loads it unsigned and taints itself.
 rm -rf "$out/modules"
 k INSTALL_MOD_PATH="$out/modules" INSTALL_MOD_STRIP=1 modules_install
+for m in $modules; do
+	ko=$out/modules/lib/modules/$release/kernel/$m.ko
+	tail -c 28 "$ko" | grep -q '~Module signature appended~' ||
+		{ echo "$m.ko is not signed" >&2; exit 1; }
+	install -m 0644 "$ko" "$work/root/luma/modules/"
+done
 k -j"$(nproc)" Image
 
 # --- boot image (devices/google/husky/boot.toml) ------------------------------
