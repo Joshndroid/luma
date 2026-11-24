@@ -64,7 +64,8 @@ for k in drivers/soc/google/aoc drivers/soc/google/aoc-channel \
     drivers/bluetooth/hci_aoc \
     drivers/input/touchscreen/touch_bus_negotiator drivers/input/misc/aoc-gesture-wake \
     drivers/usb/typec/tcpm/tcpci_maxim drivers/power/supply/max77759_charger \
-    drivers/cpufreq/cpufreq-touch-boost; do
+    drivers/cpufreq/cpufreq-touch-boost \
+    net/nfc/nfc net/nfc/nci/nci drivers/nfc/st-nci/st-nci drivers/nfc/st-nci/st-nci_i2c; do
   test -f $m/kernel/$k.ko
 done
 # Stripped (INSTALL_MOD_STRIP=1) and signed (CONFIG_MODULE_SIG_ALL).

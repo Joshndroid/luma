@@ -124,6 +124,17 @@ class HuskyProfile(unittest.TestCase):
                                 "sleep-inactive-battery-timeout=120",
                                 "sleep-inactive-ac-type='nothing'"])
 
+    def test_nfc_driver_loads_in_dependency_order(self):
+        init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
+        build = (ROOT / "scripts/mobile/husky/build-boot.sh").read_text()
+        loaded = re.search(r'^modules="(.*?)"', build, re.S | re.M).group(1).split()
+        self.assertEqual(loaded[-4:], ["net/nfc/nfc", "net/nfc/nci/nci",
+                                       "drivers/nfc/st-nci/st-nci",
+                                       "drivers/nfc/st-nci/st-nci_i2c"])
+        self.assertIn("for m in nfc nci st-nci st-nci_i2c; do", init)
+        self.assertIn("ConditionPathExists=!/var/lib/luma-husky/nfc-off", init)
+        self.assertIn("ln -sf ../luma-husky-nfc.service", init)
+
     def test_unused_vendor_module_requests_are_masked(self):
         init = (ROOT / "scripts/mobile/husky/initramfs/init").read_text()
         self.assertIn("for name in fuse-overlayfs open-vm-tools fwupd-i2c i2c-tools", init)

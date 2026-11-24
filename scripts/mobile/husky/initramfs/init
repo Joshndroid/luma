@@ -600,6 +600,23 @@ ExecStart=/usr/sbin/insmod /run/luma-husky-modules/cpufreq-touch-boost.ko freqs=
 EOF
 ln -sf ../luma-husky-touch-boost.service /run/systemd/system/multi-user.target.wants/
 
+# --- 8c. NFC ----------------------------------------------------------------------
+# The ST54L NFC controller (reader, NCI over I2C). Loading the driver only
+# registers nfc0, powered off; the RF field comes on only when something asks
+# it to poll. Off with /var/lib/luma-husky/nfc-off.
+cat > /run/systemd/system/luma-husky-nfc.service <<'EOF'
+[Unit]
+Description=Luma husky: NFC controller
+ConditionPathExists=!/var/lib/luma-husky/nfc-off
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/bin/chcon -R -t modules_object_t /run/luma-husky-modules
+ExecStart=/bin/sh -c 'cd /run/luma-husky-modules && for m in nfc nci st-nci st-nci_i2c; do /usr/sbin/insmod $m.ko || exit 1; done'
+EOF
+ln -sf ../luma-husky-nfc.service /run/systemd/system/multi-user.target.wants/
+
 # --- 9. Wi-Fi ----------------------------------------------------------------------
 # bcmdhd also registers wlan1 (a second interface for Android's concurrency
 # HAL) and aware_nmi0 (Wi-Fi Aware); NetworkManager would list them as extra
